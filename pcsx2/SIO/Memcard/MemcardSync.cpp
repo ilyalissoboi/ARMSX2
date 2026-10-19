@@ -420,6 +420,9 @@ namespace MemcardSync
 			if (error)
 				*error = fmt::format("Could not open the sync data in {}: {}", config.data_dir, es_status_str(st));
 			s_client = nullptr;
+			// Stop() returns early without a client, so this is the only place the copied keys can go.
+			std::lock_guard lock(s_state_lock);
+			s_config = {};
 			return false;
 		}
 
