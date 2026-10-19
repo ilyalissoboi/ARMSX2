@@ -61,6 +61,9 @@ class DiscordService : Service() {
         const val TAG = "ARMSX2DiscordSvc"
         // The SDK's callback queue wants draining often; the pump is cheap when idle.
         const val PUMP_INTERVAL_MS = 50L
+        // While the app is out of sight (MSG_IDLE). Nothing waits on a callback then, and twenty
+        // wakeups a second otherwise ran on for as long as a locked device stayed locked.
+        const val IDLE_PUMP_INTERVAL_MS = 1000L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -68,6 +71,7 @@ class DiscordService : Service() {
 
     private var started = false
     private var loaded = false
+    private var idle = false
 
     private val pump = object : Runnable {
         override fun run() {
@@ -75,7 +79,7 @@ class DiscordService : Service() {
                 runCatching { DiscordNative.pump() }
                     .onFailure { Log.w(TAG, "pump failed: ${it.message}") }
             }
-            handler.postDelayed(this, PUMP_INTERVAL_MS)
+            handler.postDelayed(this, if (idle) IDLE_PUMP_INTERVAL_MS else PUMP_INTERVAL_MS)
         }
     }
 
@@ -99,7 +103,10 @@ class DiscordService : Service() {
         when (msg.what) {
             DiscordIpc.MSG_START -> {
                 if (!loaded) return
-                startWhenEngineBound(msg.data?.getString(DiscordIpc.DATA_TOKEN).orEmpty())
+                startWhenEngineBound(
+                    msg.data?.getString(DiscordIpc.DATA_TOKEN).orEmpty(),
+                    msg.data?.getString(DiscordIpc.DATA_REFRESH).orEmpty(),
+                )
             }
 
             DiscordIpc.MSG_AUTHORIZE -> {
@@ -124,6 +131,7 @@ class DiscordService : Service() {
                         d.getString(DiscordIpc.DATA_TITLE).orEmpty(),
                         d.getString(DiscordIpc.DATA_COVER).orEmpty(),
                         d.getString(DiscordIpc.DATA_RA).orEmpty(),
+                        d.getString(DiscordIpc.DATA_PARTY).orEmpty(),
                     )
                 }
             }
@@ -135,6 +143,16 @@ class DiscordService : Service() {
             }
 
             DiscordIpc.MSG_QUERY -> reply(msg.replyTo)
+
+            DiscordIpc.MSG_IDLE -> {
+                val wasIdle = idle
+                idle = msg.data?.getBoolean(DiscordIpc.DATA_IDLE, false) ?: false
+                // Back in sight: drain what queued meanwhile now, not at the end of a slow wait.
+                if (wasIdle && !idle) {
+                    handler.removeCallbacks(pump)
+                    handler.post(pump)
+                }
+            }
         }
     }
 
@@ -153,12 +171,12 @@ class DiscordService : Service() {
      * SDK's statics are per-process and Android restarts :discord whenever it likes, so the
      * binding has to be re-established on demand rather than assumed.
      */
-    private fun startWhenEngineBound(token: String) {
+    private fun startWhenEngineBound(token: String, refresh: String) {
         if (DiscordAuthActivity.engineBound) {
-            doStart(token)
+            doStart(token, refresh)
             return
         }
-        DiscordAuthActivity.onEngineBound = { handler.post { doStart(token) } }
+        DiscordAuthActivity.onEngineBound = { handler.post { doStart(token, refresh) } }
         runCatching {
             startActivity(
                 Intent(this, DiscordAuthActivity::class.java)
@@ -171,8 +189,8 @@ class DiscordService : Service() {
         }
     }
 
-    private fun doStart(token: String) {
-        runCatching { DiscordNative.start(token) }
+    private fun doStart(token: String, refresh: String) {
+        runCatching { DiscordNative.start(token, refresh) }
             .onSuccess { started = true }
             .onFailure { Log.w(TAG, "start failed: ${it.message}") }
     }
@@ -193,6 +211,10 @@ class DiscordService : Service() {
                 // Surfaces exactly once, right after a successful sign-in; the app persists it so
                 // the browser is a one-time cost rather than a per-launch one.
                 putString(DiscordIpc.DATA_FRESH_TOKEN, runCatching { DiscordNative.takeToken() }.getOrDefault(""))
+                // With it, the refresh token that renews it; and once, the news that Discord refused
+                // the sign-in and it could not be renewed.
+                putString(DiscordIpc.DATA_FRESH_REFRESH, runCatching { DiscordNative.takeRefreshToken() }.getOrDefault(""))
+                putBoolean(DiscordIpc.DATA_AUTH_EXPIRED, runCatching { DiscordNative.takeAuthExpired() }.getOrDefault(false))
             }
         }
         runCatching {

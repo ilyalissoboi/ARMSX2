@@ -7,7 +7,10 @@
 #include "Common.h"
 #include "R3000A.h"
 #include "Counters.h"
+#include "EECycleRateSampler.h"
 #include "IopCounters.h"
+#include "IopThread/IopBridge.h"
+#include "IopThread/SharedWord.h"
 
 #include "GS.h"
 #include "GS/GS.h"
@@ -202,7 +205,7 @@ void rcntInit()
 
 static void vSyncInfoCalc(vSyncTimingInfo* info, double framesPerSecond, u32 scansPerFrame)
 {
-	constexpr double clock = static_cast<double>(PS2CLK);
+	const double clock = static_cast<double>(PS2CLK); // faster on an arcade System 256 (Common.h)
 
 	const u64 Frame = clock * 10000ULL / framesPerSecond;
 	const u64 Scanline = Frame / scansPerFrame;
@@ -215,7 +218,7 @@ static void vSyncInfoCalc(vSyncTimingInfo* info, double framesPerSecond, u32 sca
 	// Dynasty Warriors 3 Xtreme Legends - fake save corruption when loading save
 	// Jak II - random speedups
 	// Shadow of Rome - FMV audio issues
-	const bool ntsc_hblank = gsVideoMode != GS_VideoMode::PAL && gsVideoMode != GS_VideoMode::DVD_PAL;
+	const bool ntsc_hblank = gsVideoMode != GS_VideoMode::PAL && gsVideoMode != GS_VideoMode::DVD_PAL && (gsVideoMode != GS_VideoMode::Uninitialized || framesPerSecond != (Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_PAL / 2));
 	const u64 HalfFrame = Frame / 2;
 	const float extra_scanlines = static_cast<float>(IsProgressiveVideoMode()) * (ntsc_hblank ? 0.5f : 1.5f);
 	const u64 Blank = Scanline * ((ntsc_hblank ? 22.5f : 24.5f) + extra_scanlines);
@@ -307,10 +310,13 @@ double GetVerticalFrequency()
 	// https://web.archive.org/web/20120629231826fw_/http://ntsc-tv.com/index.html
 	// https://web.archive.org/web/20200831051302/https://www.hdretrovision.com/240p/
 
-	switch (gsVideoMode)
+	std::string cur_region = VMManager::Internal::GetCurrentRegion();
+
+	// Called from threads other than the one that sets the video mode (see gsSetVideoMode).
+	switch (SharedWord::LoadRelaxed(gsVideoMode))
 	{
 		case GS_VideoMode::Uninitialized: // SetGsCrt hasn't executed yet, give some temporary values.
-			return 60.00;
+			return (cur_region == "PAL") ? Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_PAL : Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_NTSC;
 		case GS_VideoMode::PAL:
 		case GS_VideoMode::DVD_PAL:
 			return (IsProgressiveVideoMode() == false) ? EmuConfig.GS.FrameratePAL : EmuConfig.GS.FrameratePAL - 0.24f;
@@ -352,9 +358,9 @@ void UpdateVSyncRate(bool force)
 		{
 			case GS_VideoMode::Uninitialized: // SYSCALL instruction hasn't executed yet, give some temporary values.
 				if (gsIsInterlaced)
-					total_scanlines = SCANLINES_TOTAL_NTSC_I;
+					total_scanlines = (vertical_frequency == Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_PAL) ? SCANLINES_TOTAL_PAL_I : SCANLINES_TOTAL_NTSC_I;
 				else
-					total_scanlines = SCANLINES_TOTAL_NTSC_NI;
+					total_scanlines = (vertical_frequency == Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_PAL) ? SCANLINES_TOTAL_PAL_NI : SCANLINES_TOTAL_NTSC_NI;
 				break;
 			case GS_VideoMode::PAL:
 			case GS_VideoMode::DVD_PAL:
@@ -496,6 +502,7 @@ static __fi void DoFMVSwitch()
 	}
 }
 
+template <IopThreadMode M>
 static __fi void VSyncStart(u64 sCycle)
 {
 	// End-of-frame tasks.
@@ -504,11 +511,21 @@ static __fi void VSyncStart(u64 sCycle)
 
 	// Don't bother throttling if we're going to pause.
 	if (!VMManager::Internal::IsExecutionInterrupted())
-		VMManager::Internal::Throttle();
+	{
+		VMManager::Internal::Throttle(true);
+	}
 	else
-		PerformanceMetrics::AdpfPauseFrameWork(); // interrupted → no Throttle → drop the ADPF period so the resume report excludes the pause
+	{
+		// Interrupted → no Throttle → drop the work period so the resume measurement excludes
+		// the pause, and mark the governor's window unmeasurable for the same reason.
+		PerformanceMetrics::OnFrameWorkPaused();
+		EECycleRateSampler::OnFrameNotThrottled();
+	}
 
-	gsPostVsyncStart(); // MUST be after framelimit; doing so before causes funk with frame times!
+	if (!EmuConfig.GS.AdvancedFrameDisplay)
+	{
+		gsPostVsyncStart(); // MUST be after framelimit; doing so before causes funk with frame times!
+	}
 
 	// Poll input after MTGS frame push, just in case it has to stall to catch up.
 	VMManager::Internal::PollInputOnCPUThread();
@@ -516,15 +533,15 @@ static __fi void VSyncStart(u64 sCycle)
 	EECNT_LOG("    ================  EE COUNTER VSYNC START (frame: %d)  ================", g_FrameCount);
 
 	// Memcard auto ejection - Uses a tick system timed off of real time, decrementing one tick per frame.
-	AutoEject::CountDownTicks();
+	IopBridge::AutoEjectTick<M>();
 	// Memcard IO detection - Uses a tick system to determine when memcards are no longer being written.
-	MemcardBusy::Decrement();
+	IopBridge::MemcardBusyTick<M>();
 
 	if (!GSSMODE1reg.SINT)
 	{
 		hwIntcIrq(INTC_VBLANK_S);
 		rcntStartGate(true, sCycle); // Counters Start Gate code
-		psxVBlankStart();
+		IopBridge::VBlankStart<M>();
 	}
 
 	// INTC - VB Blank Start Hack --
@@ -575,15 +592,30 @@ static __fi void GSVSync()
 	}
 }
 
+template <IopThreadMode M>
 static __fi void VSyncEnd(u64 sCycle)
 {
 	EECNT_LOG("    ================  EE COUNTER VSYNC END (frame: %d)  ================", g_FrameCount);
+	if (!VMManager::Internal::IsExecutionInterrupted())
+	{
+		VMManager::Internal::Throttle(false);
+	}
+	else
+	{
+		PerformanceMetrics::OnFrameWorkPaused();
+		EECycleRateSampler::OnFrameNotThrottled();
+	}
+
+	if (EmuConfig.GS.AdvancedFrameDisplay)
+	{
+		gsPostVsyncStart();
+	}
 
 	g_FrameCount++;
 	if (!GSSMODE1reg.SINT)
 	{
 		hwIntcIrq(INTC_VBLANK_E); // HW Irq
-		psxVBlankEnd(); // psxCounters vBlank End
+		IopBridge::VBlankEnd<M>(); // psxCounters vBlank End
 		rcntEndGate(true, sCycle); // Counters End Gate Code
 	}
 
@@ -598,6 +630,7 @@ static u32 hsc = 0;
 static int vblankinc = 0;
 #endif
 
+template <IopThreadMode M>
 __fi void rcntUpdate_vSync()
 {
 	if (!cpuTestCycle(vsyncCounter.startCycle, vsyncCounter.deltaCycles))
@@ -608,7 +641,7 @@ __fi void rcntUpdate_vSync()
 		vsyncCounter.startCycle += vSyncInfo.Blank;
 		vsyncCounter.deltaCycles = vSyncInfo.Render;
 
-		VSyncEnd(vsyncCounter.startCycle);
+		VSyncEnd<M>(vsyncCounter.startCycle);
 
 		vsyncCounter.Mode = MODE_VRENDER; // VSYNC END - Render begin
 	}
@@ -625,7 +658,7 @@ __fi void rcntUpdate_vSync()
 		vsyncCounter.startCycle += vSyncInfo.Render;
 		vsyncCounter.deltaCycles = vSyncInfo.GSBlank;
 
-		VSyncStart(vsyncCounter.startCycle);
+		VSyncStart<M>(vsyncCounter.startCycle);
 
 		vsyncCounter.Mode = MODE_GSBLANK;
 
@@ -645,6 +678,7 @@ __fi void rcntUpdate_vSync()
 	}
 }
 
+template <IopThreadMode M>
 __fi void rcntUpdate_hScanline()
 {
 	if (!cpuTestCycle(hsyncCounter.startCycle, hsyncCounter.deltaCycles))
@@ -660,7 +694,7 @@ __fi void rcntUpdate_hScanline()
 		if (!GSSMODE1reg.SINT)
 		{
 			rcntEndGate(false, hsyncCounter.startCycle);
-			psxHBlankEnd();
+			IopBridge::HBlankEnd<M>();
 		}
 
 		hsyncCounter.Mode = MODE_HRENDER;
@@ -681,7 +715,7 @@ __fi void rcntUpdate_hScanline()
 			}
 
 			rcntStartGate(false, hsyncCounter.startCycle);
-			psxHBlankStart();
+			IopBridge::HBlankStart<M>();
 		}
 
 		hsyncCounter.Mode = MODE_HBLANK;
@@ -783,11 +817,12 @@ __fi void rcntSyncCounter(int i)
 // forceinline note: this method is called from two locations, but one
 // of them is the interpreter, which doesn't count. ;)  So might as
 // well forceinline it!
+template <IopThreadMode M>
 __fi void rcntUpdate()
 {
-	rcntUpdate_vSync();
+	rcntUpdate_vSync<M>();
 	// HBlank after as VSync can do error compensation
-	rcntUpdate_hScanline();
+	rcntUpdate_hScanline<M>();
 
 	// Update counters so that we can perform overflow and target tests.
 
@@ -804,6 +839,17 @@ __fi void rcntUpdate()
 
 	cpuRcntSet();
 }
+
+// One instance per IOP thread mode, called by the event test instance for the same mode.
+template void rcntUpdate_hScanline<IopThreadMode::Off>();
+template void rcntUpdate_hScanline<IopThreadMode::Lockstep>();
+template void rcntUpdate_hScanline<IopThreadMode::Threaded>();
+template void rcntUpdate_vSync<IopThreadMode::Off>();
+template void rcntUpdate_vSync<IopThreadMode::Lockstep>();
+template void rcntUpdate_vSync<IopThreadMode::Threaded>();
+template void rcntUpdate<IopThreadMode::Off>();
+template void rcntUpdate<IopThreadMode::Lockstep>();
+template void rcntUpdate<IopThreadMode::Threaded>();
 
 static __fi void _rcntSetGate(int index)
 {

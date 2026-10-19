@@ -226,10 +226,29 @@ target_link_libraries(savers log GLESv2 m)
 
 add_subdirectory(3rdparty/adrenotools)
 
+# miniupnpc, for remote play's online hosting: asks the host's router to open the stream's port
+# (remote_play_upnp.cpp). The static library only: the Android Gradle plugin packages every shared
+# library and builds every executable it finds, so the samples, tests and shared build stay off.
+set(UPNPC_BUILD_STATIC ON)
+set(UPNPC_BUILD_SHARED OFF)
+set(UPNPC_BUILD_TESTS OFF)
+set(UPNPC_BUILD_SAMPLE OFF)
+set(UPNPC_NO_INSTALL ON)
+add_subdirectory(3rdparty/miniupnpc EXCLUDE_FROM_ALL)
+
 # pcsx2-gsrunner as an on-demand NDK executable for adb-shell replay runs on Android
 # devices. EXCLUDE_FROM_ALL keeps every APK build unchanged; build it explicitly with
 # --target pcsx2-gsrunner.
 add_subdirectory("${ARMSX2_ROOT}/pcsx2-gsrunner" "${CMAKE_BINARY_DIR}/pcsx2-gsrunner" EXCLUDE_FROM_ALL)
+
+# armsx2-driverdiag, the driver report as an adb-shell tool. Behind an option, not only
+# EXCLUDE_FROM_ALL: the Android Gradle plugin builds every executable target it finds, whatever
+# EXCLUDE_FROM_ALL says, so an app build must not see this target at all. It is never packaged.
+# Build it with -DARMSX2_BUILD_DRIVERDIAG=ON and --target armsx2-driverdiag.
+option(ARMSX2_BUILD_DRIVERDIAG "Add the armsx2-driverdiag command-line tool (never part of the app)" OFF)
+if(ARMSX2_BUILD_DRIVERDIAG)
+	add_subdirectory("${ARMSX2_ROOT}/pcsx2-driverdiag" "${CMAKE_BINARY_DIR}/pcsx2-driverdiag" EXCLUDE_FROM_ALL)
+endif()
 
 # librashader: RetroArch (.slangp) shader chains for the GS post-process path, for BOTH
 # the Vulkan and OpenGL(ES) renderers. Rust-built and fetched at configure time from a
@@ -237,6 +256,11 @@ add_subdirectory("${ARMSX2_ROOT}/pcsx2-gsrunner" "${CMAKE_BINARY_DIR}/pcsx2-gsru
 # with no cargo installed this leaves ARMSX2_HAVE_LIBRASHADER off and the feature simply
 # compiles out, so a missing Rust toolchain can never break the build.
 add_subdirectory(3rdparty/librashader)
+
+# emusync: memory card sync through the cloud, so saves follow the player between ARMSX2 and
+# PCSX2 on other devices. Rust-built from a pinned commit and OPTIONAL in the same way as
+# librashader: no cargo leaves ARMSX2_HAVE_EMUSYNC off and the feature compiles out.
+add_subdirectory(3rdparty/emusync)
 
 # LSFG: Lossless Scaling frame generation, github flavour only — ARMSX2_ENABLE_LSFG defaults
 # OFF and only the github flavour turns it on, so a play build compiles the feature out.
@@ -293,6 +317,8 @@ set(ARMSX2_EMUCORE_LIBRARY_NAME "emucore_4k" CACHE STRING "Android emucore share
 
 add_library(${ARMSX2_EMUCORE_LIBRARY_NAME} SHARED
 	native-lib.cpp
+	remote_play.cpp
+	remote_play_upnp.cpp
 )
 
 # The Discord bridge is its OWN shared library, and emucore must never link it.
@@ -328,7 +354,10 @@ target_link_libraries(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE
 	vixl
 	adrenotools
 	Zstd::Zstd
+	libminiupnpc-static
 	android
+	EGL
+	GLESv2
 	log
 )
 
@@ -372,7 +401,16 @@ if(ARMSX2_HAVE_LIBRASHADER)
 	target_link_libraries(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE librashader)
 endif()
 
-# Same PCSX2_FLAGS reasoning as librashader directly above, and for the same reason: the
+# emusync, with the same PCSX2_FLAGS reasoning as librashader directly above: the memory card
+# hooks live in core sources (VMManager.cpp, SIO/Memcard), which release builds compile into the
+# separate PCSX2_LTO target, so a define on PCSX2 would silently compile the sync out.
+if(ARMSX2_HAVE_EMUSYNC)
+	target_link_libraries(PCSX2_FLAGS INTERFACE emusync::emusync)
+	target_compile_definitions(PCSX2_FLAGS INTERFACE ARMSX2_HAS_EMUSYNC=1)
+	target_link_libraries(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE emusync::emusync)
+endif()
+
+# Same PCSX2_FLAGS reasoning as librashader above, and for the same reason: the
 # frame-generation hook lives in GS/Renderers/Vulkan/GSDeviceVK.cpp, which release builds
 # compile into the separate PCSX2_LTO target. A define placed on PCSX2 would never reach it,
 # the code behind #ifdef ARMSX2_HAS_LSFG would vanish, and the build would succeed anyway —

@@ -14,6 +14,7 @@
 #include "GS.h"
 #include "GS/GS.h"
 #include "Host.h"
+#include "IopThread/IopThreadVm.h"
 #include "MTGS.h"
 #include "MTVU.h"
 #include "Patch.h"
@@ -25,6 +26,10 @@
 #include "SIO/Sio2.h"
 #include "SPU2/spu2.h"
 #include "SaveState.h"
+#include "DEV9/ACJV.h"
+#include "DEV9/ACRAM.h"
+#include "DEV9/ACSRAM.h"
+#include "common/ARCADE.h"
 #include "SaveStateLegacy.h"
 #include "StateWrapper.h"
 #include "USB/USB.h"
@@ -83,6 +88,13 @@ static void PostLoadPrep()
 	CBreakPoints::SetSkipFirst(BREAKPOINT_IOP, 0);
 
 	UpdateVSyncRate(true);
+
+	// The recent VI writes behind the VU branch hazard are not in the state.
+	std::memset(VU0.VIWrites, 0, sizeof(VU0.VIWrites));
+	std::memset(VU1.VIWrites, 0, sizeof(VU1.VIWrites));
+
+	// The state brought its own EE cycle counter and IOP slice books.
+	IopThread::ResyncClocks();
 
 	if (VMManager::Internal::HasBootedELF())
 		R5900SymbolImporter.OnElfLoadedInMemory();
@@ -495,6 +507,10 @@ public:
 	// state it booted with, and the entry is not required to be present.
 	virtual bool SupportsLegacy() const { return true; }
 
+	// Whether this entry is written at all. A component that exists only some of the time (the arcade
+	// board) leaves no entry behind when it isn't there, so other states keep their layout.
+	virtual bool IsInUse() const { return true; }
+
 	// Loads the entry from a legacy-format state. `size` is the entry's actual
 	// size, which for components whose block changed size is not today's.
 	virtual bool FreezeInLegacy(zip_file_t* zf, u32 size) const { return FreezeIn(zf); }
@@ -567,6 +583,84 @@ public:
 	const char* GetFilename() const override { return "iopMemory.bin"; }
 	u8* GetDataPtr() const override { return iopMem->Main; }
 	uint GetDataSize() const override { return Ps2MemSize::ExposedIopRam; }
+};
+
+// --------------------------------------------------------------------------------------
+//  Namco System 246/256 arcade board (PCSX2x6)
+// --------------------------------------------------------------------------------------
+// Written only in an arcade session, so a console's savestates have none of these entries, and read only
+// in one: a state missing them (an older arcade one) resets the board's memory instead.
+class ArcadeSavestateEntry : public BaseSavestateEntry
+{
+public:
+	bool IsRequired() const override { return false; }
+	bool SupportsLegacy() const override { return false; }
+	bool IsInUse() const override { return Arcade::IsActive(); }
+
+	bool FreezeIn(zip_file_t* zf) const override
+	{
+		u8* const data = GetDataPtr();
+		const u32 size = GetDataSize();
+		if (!Arcade::IsActive() || !data || size == 0)
+			return true;
+		if (!zf)
+		{
+			Reset();
+			return true;
+		}
+		const s64 bytes_read = zip_fread(zf, data, size);
+		if (bytes_read != static_cast<s64>(size))
+		{
+			Console.WriteLn(Color_Yellow, " '%s' is incomplete (expected 0x%x bytes, loading only 0x%x bytes)",
+				GetFilename(), size, static_cast<u32>(bytes_read));
+		}
+		return true;
+	}
+
+	bool FreezeOut(SaveStateBase& writer) const override
+	{
+		u8* const data = GetDataPtr();
+		const u32 size = GetDataSize();
+		if (data && size != 0)
+			writer.FreezeMem(data, size);
+		return writer.IsOkay();
+	}
+
+protected:
+	virtual u8* GetDataPtr() const = 0;
+	virtual u32 GetDataSize() const = 0;
+	virtual void Reset() const { std::memset(GetDataPtr(), 0, GetDataSize()); }
+};
+
+class SavestateEntry_ACRAM final : public ArcadeSavestateEntry
+{
+public:
+	const char* GetFilename() const override { return "ACRAM.bin"; }
+
+protected:
+	u8* GetDataPtr() const override { return ACRAM::GetBuffer(); }
+	u32 GetDataSize() const override { return static_cast<u32>(ACRAM_MAX_SIZE); }
+	void Reset() const override { ACRAM::Clear(); } // a fresh allocation, not 128MB of memset
+};
+
+class SavestateEntry_ACSRAM final : public ArcadeSavestateEntry
+{
+public:
+	const char* GetFilename() const override { return "ACSRAM.bin"; }
+
+protected:
+	u8* GetDataPtr() const override { return ACSRAM::buffer; }
+	u32 GetDataSize() const override { return static_cast<u32>(ACSRAM_MAX_SIZE); }
+};
+
+class SavestateEntry_JVSState final : public ArcadeSavestateEntry
+{
+public:
+	const char* GetFilename() const override { return "jvs_state.bin"; } // the coin counters (PCSX2x6)
+
+protected:
+	u8* GetDataPtr() const override { return reinterpret_cast<u8*>(ACJV::coin); }
+	u32 GetDataSize() const override { return static_cast<u32>(sizeof(ACJV::coin)); }
 };
 
 class SavestateEntry_HwRegs final : public MemorySavestateEntry
@@ -753,6 +847,9 @@ class SaveStateEntry_Achievements final : public BaseSavestateEntry
 static const std::unique_ptr<BaseSavestateEntry> SavestateEntries[] = {
 	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_EmotionMemory),
 	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_IopMemory),
+	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_ACRAM),
+	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_ACSRAM),
+	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_JVSState),
 	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_HwRegs),
 	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_IopHwRegs),
 	std::unique_ptr<BaseSavestateEntry>(new SavestateEntry_Scratchpad),
@@ -795,6 +892,9 @@ std::unique_ptr<ArchiveEntryList> SaveState_DownloadState(Error* error)
 
 	for (const std::unique_ptr<BaseSavestateEntry>& entry : SavestateEntries)
 	{
+		if (!entry->IsInUse())
+			continue;
+
 		uint startpos = saveme.GetCurrentPos();
 		if (!entry->FreezeOut(saveme))
 		{
@@ -1366,6 +1466,10 @@ static bool SaveState_UnzipFromZip(zip_t* zf_raw, const std::string& filename, E
 		Error::SetString(error, "Some required components were not found or are incomplete.");
 		return false;
 	}
+
+	// Held from before the state starts overwriting anything until after PostLoadPrep has moved the
+	// IOP thread's clocks to the loaded ones.
+	IopThread::VmHold iop_hold;
 
 	PreLoadPrep();
 

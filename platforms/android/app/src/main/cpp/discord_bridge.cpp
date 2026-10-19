@@ -165,6 +165,16 @@ namespace
 		// read: it is a credential, and there is no reason for it to sit in native memory after the
 		// one consumer has it.
 		std::string fresh_token;
+		// The refresh token from the same sign-in: handed to Kotlin the same way (fresh_refresh) and
+		// kept for this session (refresh_token). Discord's access tokens run out after about a
+		// week, and this renews one without sending the player through the sign-in again.
+		std::string fresh_refresh;
+		std::string refresh_token;
+		// One renewal per refusal: a renewed token that is refused too means signing in again.
+		bool renew_tried = false;
+		// Discord refused the sign-in and it could not be renewed. Kotlin takes it once, drops the
+		// saved tokens and offers Connect again, instead of retrying a dead token forever.
+		bool auth_expired = false;
 		std::string error;
 		std::vector<Friend> friends;
 		// The signed-in account, so the UI can show whose Discord this is.
@@ -181,6 +191,8 @@ namespace
 		// updates as you play ("Exploring Ivalice, Lv 34"). Empty when RA is off or the game has
 		// no set. Suggested by Tanos.
 		std::string want_ra;
+		// A remote play session's party id, while both players are in one; empty otherwise.
+		std::string want_party;
 	};
 
 	State& S()
@@ -230,7 +242,7 @@ namespace
 	void PushPresence()
 	{
 		std::shared_ptr<discordpp::Client> client;
-		std::string serial, title, cover, ra;
+		std::string serial, title, cover, ra, party;
 		{
 			std::lock_guard<std::mutex> lock(S().mutex);
 			client = S().client;
@@ -238,6 +250,7 @@ namespace
 			title = S().want_title;
 			cover = S().want_cover;
 			ra = S().want_ra;
+			party = S().want_party;
 		}
 		if (!client)
 			return;
@@ -256,6 +269,17 @@ namespace
 			// the in-a-game marker: a friend's client decides "library or game" purely from whether
 			// State is set, so a game with no serial AND no RA still has to set something.
 			activity.SetState(!ra.empty() ? ra : (serial.empty() ? std::string("-") : serial));
+			if (!party.empty())
+			{
+				// Remote play with both players in. The second line says so instead, and the party,
+				// the same id on both devices, is what makes Discord add "(2 of 2)" after it.
+				activity.SetState(std::string("Playing remote play"));
+				discordpp::ActivityParty group;
+				group.SetId(party);
+				group.SetCurrentSize(2);
+				group.SetMaxSize(2);
+				activity.SetParty(std::move(group));
+			}
 		}
 		else
 		{
@@ -401,6 +425,23 @@ namespace
 			S().pump.join();
 	}
 
+	// Discord's gateway closes with this when it refuses the token: an expired or revoked sign-in.
+	constexpr int32_t kAuthenticationFailed = 4004;
+
+	void ConnectWithToken(const std::string& token);
+	bool RenewSignIn();
+
+	/// A sign-in, new or renewed: both tokens go to Kotlin to keep, and the refresh token is kept
+	/// here for the rest of the session.
+	void StoreSignIn(const std::string& token, const std::string& refresh)
+	{
+		std::lock_guard<std::mutex> lock(S().mutex);
+		S().fresh_token = token;
+		S().fresh_refresh = refresh;
+		S().refresh_token = refresh;
+		S().auth_expired = false;
+	}
+
 	void WireCallbacks(const std::shared_ptr<discordpp::Client>& client)
 	{
 		client->SetStatusChangedCallback([](discordpp::Client::Status status,
@@ -408,6 +449,10 @@ namespace
 			DLOGI("sdk status=%d error=%d code=%d", static_cast<int>(status), static_cast<int>(error), code);
 			if (status == discordpp::Client::Status::Ready)
 			{
+				{
+					std::lock_guard<std::mutex> lock(S().mutex);
+					S().renew_tried = false;
+				}
 				SetStatus(BridgeStatus::Connected);
 				// Both of these are only meaningful once Ready, and the presence in particular is
 				// wiped by the connect, so this is the earliest correct moment for either.
@@ -417,6 +462,11 @@ namespace
 			}
 			else if (status == discordpp::Client::Status::Disconnected)
 			{
+				// Discord refused the token, which it does once one runs out (about a week). Renew it
+				// from the refresh token and stay Connecting meanwhile; only when that cannot work is
+				// this a real disconnect, and then the sign-in is over (RenewSignIn tells Kotlin).
+				if (code == kAuthenticationFailed && RenewSignIn())
+					return;
 				SetStatus(BridgeStatus::Disconnected);
 				if (error != discordpp::Client::Error::None)
 				{
@@ -464,6 +514,49 @@ namespace
 			});
 	}
 
+	/// Discord refused the token: renew it once from the refresh token and reconnect. True while that
+	/// is under way. False when there is nothing to renew with, or the renewed token was refused as
+	/// well: the sign-in is over, and Kotlin is told, so it can offer Connect again.
+	bool RenewSignIn()
+	{
+		std::shared_ptr<discordpp::Client> client;
+		std::string refresh;
+		{
+			std::lock_guard<std::mutex> lock(S().mutex);
+			client = S().client;
+			if (!client || S().refresh_token.empty() || S().renew_tried)
+			{
+				S().auth_expired = true;
+				S().refresh_token.clear();
+				return false;
+			}
+			S().renew_tried = true;
+			refresh = S().refresh_token;
+		}
+		DLOGI("Discord refused the sign-in: renewing it");
+		SetStatus(BridgeStatus::Connecting);
+		// Renewing invalidates the old pair at once, so the new one is handed straight to Kotlin.
+		client->RefreshToken(kApplicationId, refresh,
+			[](discordpp::ClientResult result, std::string token, std::string new_refresh,
+				discordpp::AuthorizationTokenType, int32_t, std::string) {
+				if (!result.Successful() || token.empty())
+				{
+					DLOGW("renewing the sign-in failed: %s", result.Error().c_str());
+					{
+						std::lock_guard<std::mutex> lock(S().mutex);
+						S().auth_expired = true;
+						S().refresh_token.clear();
+					}
+					SetStatus(BridgeStatus::Disconnected);
+					return;
+				}
+				DLOGI("sign-in renewed");
+				StoreSignIn(token, new_refresh);
+				ConnectWithToken(token);
+			});
+		return true;
+	}
+
 	std::string JStr(JNIEnv* env, jstring s)
 	{
 		if (!s)
@@ -486,9 +579,10 @@ Java_com_armsx2_discord_DiscordNative_available(JNIEnv*, jclass)
 
 /// Create the client and, when a saved token is passed, go straight to connecting. Idempotent.
 JNIEXPORT void JNICALL
-Java_com_armsx2_discord_DiscordNative_start(JNIEnv* env, jclass, jstring saved_token)
+Java_com_armsx2_discord_DiscordNative_start(JNIEnv* env, jclass, jstring saved_token, jstring saved_refresh)
 {
-	const std::string token = JStr(env, saved_token);
+	std::string token = JStr(env, saved_token);
+	const std::string refresh = JStr(env, saved_refresh);
 	{
 		std::lock_guard<std::mutex> lock(S().mutex);
 		if (!S().client)
@@ -503,6 +597,12 @@ Java_com_armsx2_discord_DiscordNative_start(JNIEnv* env, jclass, jstring saved_t
 			}, discordpp::LoggingSeverity::Verbose);
 			DLOGI("client created for application %llu", (unsigned long long)kApplicationId);
 		}
+		// A sign-in renewed since Kotlin last asked is newer than the pair it saved, and the old
+		// pair no longer works, so it wins until Kotlin has taken it.
+		if (!S().fresh_token.empty())
+			token = S().fresh_token;
+		if (S().fresh_refresh.empty() && !refresh.empty())
+			S().refresh_token = refresh;
 	}
 	if (!token.empty())
 		ConnectWithToken(token);
@@ -558,7 +658,7 @@ Java_com_armsx2_discord_DiscordNative_authorize(JNIEnv*, jclass)
 		}
 
 		client->GetToken(kApplicationId, code, verifier, kRedirectUri,
-			[client](discordpp::ClientResult token_result, std::string token, std::string /*refresh*/,
+			[client](discordpp::ClientResult token_result, std::string token, std::string refresh,
 				discordpp::AuthorizationTokenType, int32_t, std::string) {
 				DLOGI("token callback: ok=%d token_len=%zu", token_result.Successful() ? 1 : 0, token.size());
 				if (!token_result.Successful() || token.empty())
@@ -573,8 +673,9 @@ Java_com_armsx2_discord_DiscordNative_authorize(JNIEnv*, jclass)
 				}
 				{
 					std::lock_guard<std::mutex> lock(S().mutex);
-					S().fresh_token = token;
+					S().renew_tried = false;
 				}
+				StoreSignIn(token, refresh);
 				ConnectWithToken(token);
 			});
 	});
@@ -590,6 +691,28 @@ Java_com_armsx2_discord_DiscordNative_takeToken(JNIEnv* env, jclass)
 		token.swap(S().fresh_token);
 	}
 	return token.empty() ? nullptr : env->NewStringUTF(token.c_str());
+}
+
+/// The refresh token from the same sign-in or renewal as takeToken's, exactly once. Cleared on read.
+JNIEXPORT jstring JNICALL
+Java_com_armsx2_discord_DiscordNative_takeRefreshToken(JNIEnv* env, jclass)
+{
+	std::string refresh;
+	{
+		std::lock_guard<std::mutex> lock(S().mutex);
+		refresh.swap(S().fresh_refresh);
+	}
+	return refresh.empty() ? nullptr : env->NewStringUTF(refresh.c_str());
+}
+
+/// True once after Discord refused the sign-in and it could not be renewed.
+JNIEXPORT jboolean JNICALL
+Java_com_armsx2_discord_DiscordNative_takeAuthExpired(JNIEnv*, jclass)
+{
+	std::lock_guard<std::mutex> lock(S().mutex);
+	const bool expired = S().auth_expired;
+	S().auth_expired = false;
+	return expired ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jint JNICALL
@@ -608,7 +731,7 @@ Java_com_armsx2_discord_DiscordNative_error(JNIEnv* env, jclass)
 /// Remember and publish what is being played. Empty title = back in the library.
 JNIEXPORT void JNICALL
 Java_com_armsx2_discord_DiscordNative_setPlaying(
-	JNIEnv* env, jclass, jstring serial, jstring title, jstring cover, jstring ra)
+	JNIEnv* env, jclass, jstring serial, jstring title, jstring cover, jstring ra, jstring party)
 {
 	{
 		std::lock_guard<std::mutex> lock(S().mutex);
@@ -616,6 +739,7 @@ Java_com_armsx2_discord_DiscordNative_setPlaying(
 		S().want_title = JStr(env, title);
 		S().want_cover = JStr(env, cover);
 		S().want_ra = JStr(env, ra);
+		S().want_party = JStr(env, party);
 	}
 	if (S().status.load(std::memory_order_acquire) == static_cast<int>(BridgeStatus::Connected))
 		PushPresence();
@@ -684,6 +808,10 @@ Java_com_armsx2_discord_DiscordNative_stop(JNIEnv*, jclass)
 		S().client.reset();
 		S().friends.clear();
 		S().fresh_token.clear();
+		S().fresh_refresh.clear();
+		S().refresh_token.clear();
+		S().renew_tried = false;
+		S().auth_expired = false;
 		S().error.clear();
 	}
 	SetStatus(BridgeStatus::Disconnected);
@@ -697,12 +825,14 @@ Java_com_armsx2_discord_DiscordNative_stop(JNIEnv*, jclass)
 // simply reports Disabled and does nothing.
 extern "C" {
 JNIEXPORT jboolean JNICALL Java_com_armsx2_discord_DiscordNative_available(JNIEnv*, jclass) { return JNI_FALSE; }
-JNIEXPORT void JNICALL Java_com_armsx2_discord_DiscordNative_start(JNIEnv*, jclass, jstring) {}
+JNIEXPORT void JNICALL Java_com_armsx2_discord_DiscordNative_start(JNIEnv*, jclass, jstring, jstring) {}
 JNIEXPORT void JNICALL Java_com_armsx2_discord_DiscordNative_authorize(JNIEnv*, jclass) {}
 JNIEXPORT jstring JNICALL Java_com_armsx2_discord_DiscordNative_takeToken(JNIEnv*, jclass) { return nullptr; }
+JNIEXPORT jstring JNICALL Java_com_armsx2_discord_DiscordNative_takeRefreshToken(JNIEnv*, jclass) { return nullptr; }
+JNIEXPORT jboolean JNICALL Java_com_armsx2_discord_DiscordNative_takeAuthExpired(JNIEnv*, jclass) { return JNI_FALSE; }
 JNIEXPORT jint JNICALL Java_com_armsx2_discord_DiscordNative_status(JNIEnv*, jclass) { return 0; }
 JNIEXPORT jstring JNICALL Java_com_armsx2_discord_DiscordNative_error(JNIEnv*, jclass) { return nullptr; }
-JNIEXPORT void JNICALL Java_com_armsx2_discord_DiscordNative_setPlaying(JNIEnv*, jclass, jstring, jstring, jstring, jstring) {}
+JNIEXPORT void JNICALL Java_com_armsx2_discord_DiscordNative_setPlaying(JNIEnv*, jclass, jstring, jstring, jstring, jstring, jstring) {}
 JNIEXPORT jstring JNICALL Java_com_armsx2_discord_DiscordNative_friends(JNIEnv* env, jclass) { return env->NewStringUTF(""); }
 JNIEXPORT jstring JNICALL Java_com_armsx2_discord_DiscordNative_self(JNIEnv* env, jclass) { return env->NewStringUTF(""); }
 JNIEXPORT void JNICALL Java_com_armsx2_discord_DiscordNative_pump(JNIEnv*, jclass) {}

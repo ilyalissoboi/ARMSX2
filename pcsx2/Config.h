@@ -187,6 +187,14 @@ enum class SpeedHack
 	InstantVU1,
 	MTVU,
 	EECycleRate,
+	IOPThread,
+	// The dynamic EE cycle-rate governor. It is in this enum because that is what
+	// gives it a bit in PerGameOverrides::speedhacks, which is how "the player wrote
+	// this key in the per-game file" is asked — and the governor has to know that,
+	// because a per-game key is an opt-in it must obey. It is NOT a game database
+	// key: gamedb-schema.json's speedHacks object is closed (additionalProperties
+	// false), so no entry can carry it until someone deliberately opens it.
+	DynamicEECycleRate,
 	MaxCount,
 };
 
@@ -316,6 +324,15 @@ enum class GSRendererType : s8
 	VK = 14,
 	Metal = 17,
 	DX12 = 15,
+
+	// GSRendererHW paired with the deviceless GSDeviceNone: the hardware renderer's CPU-side
+	// path (GIF decode, vertex kick, texture cache, everything Draw() does to build a
+	// submission) with no GPU behind it. Distinct from Null, which pairs GSDeviceNone with
+	// GSRendererNull and draws nothing at all -- reusing Null here would make GSIsHardwareRenderer(),
+	// UseHardwareRenderer() and every "renderer == Null" check in GS.cpp/GSState.cpp answer as if
+	// nothing were running, when GSRendererHW's real CPU logic is. pcsx2-gsrunner only
+	// (`-renderer nullhw`); deliberately not added to any Qt/ImGui renderer picker.
+	NullHW = 18,
 };
 
 enum class GSVSyncMode : u8
@@ -486,6 +503,17 @@ enum class GSUpscaler : u8
 	SGSREdge,      ///< SGSR's edge-direction variant: same pass, directional Lanczos, dearer.
 };
 
+/// Generates larger copies of game textures on the CPU, in the background, and feeds them to the
+/// renderer the way a texture pack would. Persisted as an integer under the INI key
+/// TextureUpscale (the first key was TextureUpscaleMode, whose values meant something else, so
+/// it is not read); append, never renumber.
+enum class GSTextureUpscaleMode : u8
+{
+	Off,
+	Raisr2x, ///< One RAISR pass with the PS2-trained filters.
+	Raisr4x, ///< The same filters twice on textures up to 512 pixels per side; larger ones get one pass (2x).
+};
+
 enum class GSHWAutoFlushLevel : u8
 {
 	Disabled,
@@ -587,17 +615,6 @@ enum class GSDepthFeedbackMode : u8
 	DepthAsRT = 3,
 };
 
-// GV-7 GS front/back split. Off = today's single-threaded path with no record
-// round-trip; InlineRecords = build + execute every record on the calling
-// thread (the GV7-0 shape — validation / bisect rung); Lockstep = back thread
-// runs but the front drains after every record; Pipelined = the real thing.
-enum class GSBackThreadMode : u8
-{
-	Off           = 0,
-	InlineRecords = 1,
-	Lockstep      = 2,
-	Pipelined     = 3,
-};
 
 enum class AchievementOverlayPosition : u8
 {
@@ -784,10 +801,27 @@ struct Pcsx2Config
 
 		// Cache compiled VU micro-programs to disk and reload them across
 		// sessions to cut recompilation stutter on later runs. arm64-only;
-		// no-op on x86.
+		// no-op on x86. Read through UseVUProgramCache(), not directly: the
+		// cache is also on whenever EnableVUAot is.
 		bool
 			EnableVUProgramCache : 1;
+
+		// vu-aot, the whole-program VU1 compiler (pcsx2/arm64/vuaot/): programs
+		// that run often enough are recompiled above microVU, which stays the
+		// fallback at every block boundary. arm64-only; no-op on x86. Default
+		// on. It turns the VU program cache on (UseVUProgramCache()), which
+		// keeps the compiled code on disk for the next session.
+		bool
+			EnableVUAot : 1;
 		BITFIELD_END
+
+		// Whether the on-disk VU program cache runs: EnableVUProgramCache, or
+		// EnableVUAot (owner decision 2026-10-15: vu-aot is bound to the cache,
+		// there is no separate switch). Every reader of the cache setting goes
+		// through this. Both bits are part of the CPU options, so changing
+		// either one resets the VU recompilers (VMManager::CheckForCPUConfigChanges),
+		// and the reset re-reads this.
+		bool UseVUProgramCache() const { return EnableVUProgramCache || EnableVUAot; }
 
 		RecompilerOptions();
 		void ApplySanityCheck();
@@ -897,17 +931,14 @@ struct Pcsx2Config
 					DumpDrawLog : 1,
 					UseBlitSwapChain : 1,
 					DisableShaderCache : 1,
+					// Record the TFX pipelines each game uses and build them on worker threads
+					// when the game starts, ahead of their first draw. Needs the shader cache.
+					PrecompilePipelines : 1,
 					DisableFramebufferFetch : 1,
-					// Pretend the device has no dual-source blend unit, the way every Mali
-					// Vulkan blob reports it. GSRendererHW then takes the SRC1 substitution
-					// and SW-blend fallbacks, so a Mali-only blending bug reproduces on a
-					// desktop GPU instead of needing a device round-trip to see.
-					DisableDualSourceBlend : 1,
-					EnableAdrenoFramebufferFetch : 1,
 					ForceMaliFramebufferFetch : 1,
-					DisablePS2DepthQuantization : 1,
 					DisableVertexShaderExpand : 1,
 					SkipDuplicateFrames : 1,
+					AdvancedFrameDisplay : 1,
 					OsdShowSpeed : 1,
 					OsdShowFPS : 1,
 					OsdShowVPS : 1,
@@ -957,7 +988,7 @@ struct Pcsx2Config
 					UserHacks_NativePaletteDraw : 1,
 					UserHacks_EstimateTextureRegion : 1,
 					UserHacks_DrawBuffering : 1,
-					UserHacks_RewriteLargeST : 1,
+					UserHacks_RewriteLargeSTCoords : 1,
 					FXAA : 1,
 					ShadeBoost : 1,
 					DumpGSData : 1,
@@ -1013,8 +1044,16 @@ struct Pcsx2Config
 		float UpscaleMultiplier = DEFAULT_UPSCALE_MULTIPLIER;
 
 		AccBlendLevel AccurateBlendingUnit = DEFAULT_BLENDING_ACCURACY;
+		/// The highest blending accuracy this title may run at while the device pays for its
+		/// destination read on every draw that takes one -- a copy of the render target, or a
+		/// barrier -- as AccBlendLevel's integer; -1 when the title asks for nothing, which is
+		/// every title but Splashdown. Written only by the game database
+		/// (copyRoadMaximumBlendingLevel) and read only by the GS, which is the side that knows
+		/// which road the device took. See GS/Renderers/Common/GSCopyRoadBlendingPolicy.h.
+		s8 CopyRoadMaximumBlendingLevel = -1;
 		BiFiltering TextureFiltering = DEFAULT_TEXTURE_FILTERING_MODE;
 		TexturePreloadingLevel TexturePreloading = TexturePreloadingLevel::Full;
+		GSTextureUpscaleMode TextureUpscale = GSTextureUpscaleMode::Off;
 		GSDumpCompressionMethod GSDumpCompression = GSDumpCompressionMethod::Zstandard;
 		GSHardwareDownloadMode HWDownloadMode = GSHardwareDownloadMode::Enabled;
 		GSCASMode CASMode = DEFAULT_CAS_MODE;
@@ -1044,7 +1083,14 @@ struct Pcsx2Config
 		TriFiltering TriFilter = DEFAULT_TRILINEAR_FILTERING_MODE;
 		s8 OverrideTextureBarriers = -1;
 		GSDepthFeedbackMode DepthFeedbackMode = GSDepthFeedbackMode::Auto;
-		GSBackThreadMode BackThreadMode = GSBackThreadMode::Off;
+		/// GS multi-threading: a front thread parses GIF data while a back thread draws. The setting,
+		/// as the user or the game database asked for it; stored as the integer "GSBackThreadMode",
+		/// where 0 is off and any other value on (older builds wrote 3).
+		bool BackThread = false;
+		/// What BackThread resolved to for the open renderer (GSBackThreadPolicy.h). Derived, not
+		/// loaded or saved, and not compared -- set by OpenGSRenderer on GSConfig only, and read by
+		/// the renderer's constructor.
+		bool BackThreadResolved = false;
 
 		// RetroArch (.slangp) shader chain, applied at present after ShadeBoost/FXAA via
 		// librashader. Disabled or an empty preset skips the chain entirely (zero cost),
@@ -1064,6 +1110,10 @@ struct Pcsx2Config
 		// that is already presenting the game, and the cheaper pipeline is what makes the
 		// feature pay for itself there. Falls back to 3.1 when the user's DLL predates 3.1p.
 		bool LsfgPerformance = true;
+		// LSFG's half-precision shader family. Off by default: phone GPUs run fp16 about twice as
+		// fast, but it needs shaderFloat16 on the device, which is asked for only while this is on
+		// (so turning it on takes effect when the next game starts), and drivers vary with fp16.
+		bool LsfgFp16 = false;
 		// Optical-flow resolution, as a percentage of the presented image (25..100). Lower is
 		// cheaper and blurrier. Handed to the library as a DIVISOR — see GSLsfg.cpp.
 		u8 LsfgFlowScale = 100;
@@ -1362,17 +1412,45 @@ struct Pcsx2Config
 			WaitLoop : 1, // enables constant loop detection and fast-forwarding
 			vuFlagHack : 1, // microVU specific flag hack
 			vuThread : 1, // Enable Threaded VU1
-			vu1Instant : 1; // Enable Instant VU1 (Without MTVU only)
+			vu1Instant : 1, // Enable Instant VU1 (Without MTVU only)
+			// JIT code tests vuThread by its bit position in this word (microVU-arm64.cpp), so the
+			// flags below stay after every older one.
+			iopThread : 1, // Run the IOP on its own thread (IopThread::ResolveMode decides whether it can)
+			iopThreadLockstep : 1, // With iopThread: strict turns with the EE instead of concurrent. Testing only, no UI.
+			// Let the governor lower the EE cycle rate below EECycleRate, by up to two
+			// steps, when the host cannot hold the frame deadline. Never above it, and
+			// never written back — EECycleRate stays the player's baseline.
+			DynamicEECycleRate : 1;
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)
 		u8 EECycleSkip; // EE Cycle skip factor (0, 1, 2, or 3)
+
+		// The IOP thread's lag bound L, in EE cycles. Clamped by IopThread::ClampLag when it is read
+		// from the settings file. An advanced setting: INI only, never in a simple settings view.
+		int iopThreadLag;
+
+		// Development trace for the governor: one CSV row per sampling window, written
+		// to this path. Empty means no trace, which is the shipped state.
+		//
+		// ⚠️ Deliberately outside operator==, so CheckForCPUConfigChanges() cannot see
+		// it. Where a trace file goes has nothing to do with generated code, and that
+		// comparison is what decides whether the EE and microVU code caches are thrown
+		// away — turning the trace on mid-session must not cost a recompile of
+		// everything, or the first windows it records are measuring the reset.
+		std::string DynamicEECycleRateTrace;
 
 		SpeedhackOptions();
 		void LoadSave(SettingsWrapper& conf);
 		SpeedhackOptions& DisableAll();
 
 		void Set(SpeedHack id, int value);
+
+		/// RetroAchievements hardcore mode. Overclocking stays allowed; underclocking
+		/// does not, because it slows the game down and makes it easier. That rules out
+		/// cycle skip and the dynamic governor outright — the governor exists to
+		/// underclock, and it does it without being asked.
+		void ClampForHardcoreMode();
 
 		bool operator==(const SpeedhackOptions& right) const;
 		bool operator!=(const SpeedhackOptions& right) const;
@@ -1513,12 +1591,31 @@ struct Pcsx2Config
 
 	// ------------------------------------------------------------------------
 
+	// Namco System 246/256 arcade board logging (PCSX2x6). Off unless set by hand in the ini.
+	struct ArcadeOptions
+	{
+		bool SRAMVerboseReads = false;
+		bool RAMVerboseReads = false;
+		bool ATAVerboseReads = false;
+		bool UARTVerbose = false;
+
+		void LoadSave(SettingsWrapper& wrap);
+
+		bool operator==(const ArcadeOptions& right) const;
+		bool operator!=(const ArcadeOptions& right) const;
+	};
+
 	struct AchievementsOptions
 	{
 		static constexpr u32 MINIMUM_NOTIFICATION_DURATION = 3;
 		static constexpr u32 MAXIMUM_NOTIFICATION_DURATION = 30;
 		static constexpr u32 DEFAULT_NOTIFICATION_DURATION = 5;
 		static constexpr u32 DEFAULT_LEADERBOARD_DURATION = 10;
+		// Size of the achievement popups and in-game indicators, as a percentage of the normal
+		// layout. ARMSX2: on a handheld the stock size was hard to read.
+		static constexpr u32 MINIMUM_NOTIFICATION_SCALE = 50;
+		static constexpr u32 MAXIMUM_NOTIFICATION_SCALE = 250;
+		static constexpr u32 DEFAULT_NOTIFICATION_SCALE = 100;
 
 		static const char* OverlayPositionNames[(size_t)AchievementOverlayPosition::MaxCount + 1];
 
@@ -1541,6 +1638,7 @@ struct Pcsx2Config
 
 		u32 NotificationsDuration = DEFAULT_NOTIFICATION_DURATION;
 		u32 LeaderboardsDuration = DEFAULT_LEADERBOARD_DURATION;
+		u32 NotificationScale = DEFAULT_NOTIFICATION_SCALE;
 		AchievementOverlayPosition OverlayPosition = AchievementOverlayPosition::BottomRight;
 		OsdOverlayPos NotificationPosition = OsdOverlayPos::TopLeft;
 
@@ -1586,14 +1684,21 @@ struct Pcsx2Config
 		EnableRecordingTools : 1,
 		EnableGameFixes : 1, // enables automatic game fixes
 		SaveStateOnShutdown : 1, // default value for saving state on shutdown
+		AutosaveOnShutdown : 1, // also write a rotating autosave when the game is closed
 		EnableDiscordPresence : 1, // enables discord rich presence integration
 		UseSavestateSelector : 1,
 		InhibitScreensaver : 1,
 		BackupSavestate : 1,
+		McdAutoBackup : 1, // [MemoryCards] AutoBackup: snapshot the memory cards at boot
 		ManuallySetRealTimeClock : 1, // passes user-set real-time clock information to cdvd at startup
 		UseSystemLocaleFormat : 1, // presents OS time format instead of yyyy-MM-dd HH:mm:ss for manual RTC
 
 		HostFs : 1,
+
+		// Auto-tune (pcsx2/AutoTune): tries one slowdown countermeasure at a time and keeps what helped.
+		// Kept out of Cpu/Speedhacks on purpose: those are compared in CheckForCPUConfigChanges, and
+		// flipping this switch must not flush the recompiler caches.
+		AutoTune : 1,
 
 		WarnAboutUnsafeSettings : 1;
 	BITFIELD_END
@@ -1617,12 +1722,18 @@ struct Pcsx2Config
 
 	AchievementsOptions Achievements;
 
+	ArcadeOptions Arcade;
+
 	// Memorycard options - first 2 are default slots, last 6 are multitap 1 and 2
 	// slots (3 each)
 	McdOptions Mcd[8];
 	std::string GzipIsoIndexTemplate; // for quick-access index with gzipped ISO
+	std::string AutoTuneTrace; // developer only: CSV path, one row per auto-tune window; empty = off
 
 	int PINESlot;
+
+	int AutosaveIntervalMinutes; // 0 = off
+	int AutosaveKeep; // 1-5
 
 	int RtcYear;
 	int RtcMonth;
@@ -1640,6 +1751,21 @@ struct Pcsx2Config
 	// Fall back aspect ratio for games that have patches (when AspectRatioType::RAuto4_3_3_2) is active.
 	float CurrentCustomAspectRatio = 0.f;
 	bool IsPortableMode = false;
+
+	// Where the resolved EE cycle rate came from, which is not something the resolved
+	// integer can answer: the same -1 can be the global default, a game database entry,
+	// or a key the player wrote for this game, and only the first of those is a value
+	// nobody has staked a compatibility claim on. Comparing the final value against the
+	// global one gets this wrong every time the two happen to agree.
+	//
+	// The dynamic governor is the consumer: it may only move a rate nobody claimed.
+	//
+	// Re-derived on every settings apply and never loaded, saved or copied — see the
+	// deliberate absence from CopyRuntimeConfig(), which would otherwise carry a stale
+	// answer across the config rebuild that ApplySettings() does.
+	bool GameDBSetEECycleRate = false;
+	bool PerGameClaimsEECycleRate = false;
+	bool PerGameClaimsDynamicEECycleRate = false;
 
 	Pcsx2Config();
 	void LoadSave(SettingsWrapper& wrap);

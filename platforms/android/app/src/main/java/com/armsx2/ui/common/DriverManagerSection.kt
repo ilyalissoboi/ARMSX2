@@ -15,11 +15,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -44,7 +44,8 @@ import kotlinx.coroutines.withContext
 
 /**
  * Vulkan custom-driver manager: pick the system driver or an installed one, download
- * fresh builds from the bundled sources (K11MCH1 / MrPurple / StevenMXZ / crueter),
+ * fresh builds from the bundled sources (ARMSX2 / K11MCH1 / MrPurple / StevenMXZ / crueter;
+ * the ARMSX2 MaliSX2 packs only on Mali Valhall v9 and v11: G57/G68/G77/G78, G615/G715),
  * import a local .zip, or delete an installed driver. Self-contained (plain Material3)
  * so it drops into both the full Settings renderer tab and the in-game renderer pane.
  * Selecting a driver only takes effect on the next renderer init — the caller shows an
@@ -54,7 +55,7 @@ import kotlinx.coroutines.withContext
 fun DriverManagerSection() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val installed = remember { mutableStateListOf<CustomDriver.InstalledDriver>() }
+    val installed = remember { mutableStateListOf<CustomDriver.InstalledDriver>().apply { addAll(CustomDriver.listInstalled(context)) } }
     var remote by remember { mutableStateOf<List<CustomDriver.RemoteDriver>?>(null) }
     var loadingRemote by remember { mutableStateOf(false) }
     var showRemote by remember { mutableStateOf(false) }
@@ -74,7 +75,6 @@ fun DriverManagerSection() {
         installed.clear()
         installed.addAll(CustomDriver.listInstalled(context))
     }
-    LaunchedEffect(Unit) { refreshInstalled() }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) scope.launch {
@@ -112,11 +112,17 @@ fun DriverManagerSection() {
             }
         }
 
+        // The driver this scope actually runs with. A per-game pick that has since been deleted
+        // follows the global driver at boot (CustomDriver.effectiveId), so show that one.
+        // Re-read whenever the settings change: in global scope a save here changes the global id.
+        val globalDriverId = remember(InGameOverlay.settingsState.value) { com.armsx2.config.ConfigStore.loadGlobal().output.customDriverId }
+        val effectiveId = CustomDriver.effectiveId(
+            InGameOverlay.settingsState.value.output.customDriverId, globalDriverId, installed.map { it.id })
         DriverRow(
             controllerId = "driver.system",
             title = str("backend.driver.systemVulkan"),
             subtitle = str("renderer.orientation.device"),
-            selected = InGameOverlay.settingsState.value.customDriverId.isBlank(),
+            selected = effectiveId == null,
             onClick = { selectDriver(null) },
         )
         installed.forEach { driver ->
@@ -125,12 +131,10 @@ fun DriverManagerSection() {
                 title = driver.name,
                 subtitle = listOf(driver.vendor, driver.version).filter(String::isNotBlank).joinToString(" · ")
                     .ifBlank { str("backend.driver.installed") },
-                selected = InGameOverlay.settingsState.value.customDriverId == driver.id,
+                selected = effectiveId == driver.id,
                 onClick = { selectDriver(driver.id) },
                 onDelete = {
-                    val wasSelected = InGameOverlay.settingsState.value.customDriverId == driver.id
                     CustomDriver.delete(driver)
-                    if (wasSelected) selectDriver(null)
                     refreshInstalled()
                 },
             )
@@ -147,7 +151,7 @@ fun DriverManagerSection() {
                         if (showRemote && remote == null && !loadingRemote) {
                             loadingRemote = true
                             scope.launch {
-                                val r = withContext(Dispatchers.IO) { CustomDriver.fetchRemote() }
+                                val r = withContext(Dispatchers.IO) { CustomDriver.fetchRemote(gpuModel) }
                                 remote = r; loadingRemote = false
                             }
                         }
@@ -158,7 +162,7 @@ fun DriverManagerSection() {
                     if (showRemote && remote == null && !loadingRemote) {
                         loadingRemote = true
                         scope.launch {
-                            val r = withContext(Dispatchers.IO) { CustomDriver.fetchRemote() }
+                            val r = withContext(Dispatchers.IO) { CustomDriver.fetchRemote(gpuModel) }
                             remote = r; loadingRemote = false
                         }
                     }
@@ -219,6 +223,39 @@ fun DriverManagerSection() {
 
         if (busyId == "import") Text(str("backend.driver.installing"), color = MaterialTheme.colorScheme.onSurfaceVariant)
         message?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
+
+        // Only an installed driver reads these, so they appear once there is one.
+        if (installed.isNotEmpty()) TurnipOptions()
+    }
+}
+
+/**
+ * Turnip's environment options (#719), after Eden's Freedreno settings page: the UBWC flag hint
+ * recent builds need on Snapdragon 8 Gen 2, and free NAME=value lines for anything else. Global
+ * rather than per game, since they describe the device's driver, not a title. Applied by
+ * [CustomDriver.applyDriverEnv] at the next game start.
+ */
+@Composable
+private fun TurnipOptions() {
+    var ubwcHint by remember { mutableStateOf(CustomDriver.ubwcFlagHint()) }
+    var envText by remember { mutableStateOf(CustomDriver.driverEnvText()) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionTitle(str("backend.turnip.label"), str("backend.turnip.description"))
+        SettingSwitchRow(
+            title = str("backend.turnip.ubwcHint"),
+            description = str("backend.turnip.ubwcHint.desc"),
+            checked = ubwcHint,
+            onCheckedChange = { ubwcHint = it; CustomDriver.setUbwcFlagHint(it) },
+        )
+        OutlinedTextField(
+            value = envText,
+            onValueChange = { envText = it; CustomDriver.setDriverEnvText(it) },
+            label = { Text(str("backend.turnip.env")) },
+            placeholder = { Text("TU_DEBUG=sysmem") },
+            supportingText = { Text(str("backend.turnip.env.desc")) },
+            minLines = 2,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 
@@ -335,5 +372,5 @@ private fun selectDriver(id: String?) {
     // renderer (re)start via applyRendererPrefs. Persist scope-aware (per-game when the
     // settings scope is Game) so a title can pin the driver it needs.
     MainActivityRuntime.customDriverId.value = id
-    InGameOverlay.saveSettings(InGameOverlay.settingsState.value.copy(customDriverId = id ?: ""))
+    InGameOverlay.saveSettings(InGameOverlay.settingsState.value.copy(output = InGameOverlay.settingsState.value.output.copy(customDriverId = id ?: "")))
 }

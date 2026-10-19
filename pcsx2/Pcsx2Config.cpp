@@ -15,6 +15,8 @@
 #include "GameDatabase.h"
 #include "Host.h"
 #include "Host/AudioStream.h"
+#include "IopThread/IopThreadMode.h"
+#include "SIO/Memcard/MemcardBackup.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Pad/Pad.h"
 #include "USB/USB.h"
@@ -325,6 +327,11 @@ static constexpr const char* s_speed_hack_names[] = {
 	"instantVU1",
 	"mtvu",
 	"eeCycleRate",
+	"iopThread",
+	// Not a game database name. gamedb-schema.json's speedHacks object is closed, so
+	// no entry can carry this one; it is here because GetSpeedHackName() is also the
+	// log and diagnostic spelling, and the table has to stay the length of the enum.
+	"dynamicEECycleRate",
 };
 
 const char* Pcsx2Config::SpeedhackOptions::GetSpeedHackName(SpeedHack id)
@@ -362,13 +369,29 @@ void Pcsx2Config::SpeedhackOptions::Set(SpeedHack id, int value)
 		case SpeedHack::EECycleRate:
 			EECycleRate = static_cast<int>(std::clamp<int>(value, MIN_EE_CYCLE_RATE, MAX_EE_CYCLE_RATE));
 			break;
+		case SpeedHack::IOPThread:
+			iopThread = (value != 0);
+			break;
+		case SpeedHack::DynamicEECycleRate:
+			DynamicEECycleRate = (value != 0);
+			break;
 			jNO_DEFAULT
 	}
 }
 
+void Pcsx2Config::SpeedhackOptions::ClampForHardcoreMode()
+{
+	EECycleRate = std::max<s8>(EECycleRate, 0);
+	EECycleSkip = 0;
+	DynamicEECycleRate = false;
+}
+
+// DynamicEECycleRateTrace is not compared, on purpose. This operator is what
+// CheckForCPUConfigChanges() asks before throwing the EE and microVU code caches
+// away, and a trace file path changes no generated code. Everything else here does.
 bool Pcsx2Config::SpeedhackOptions::operator==(const SpeedhackOptions& right) const
 {
-	return OpEqu(bitset) && OpEqu(EECycleRate) && OpEqu(EECycleSkip);
+	return OpEqu(bitset) && OpEqu(EECycleRate) && OpEqu(EECycleSkip) && OpEqu(iopThreadLag);
 }
 
 bool Pcsx2Config::SpeedhackOptions::operator!=(const SpeedhackOptions& right) const
@@ -389,9 +412,12 @@ Pcsx2Config::SpeedhackOptions::SpeedhackOptions()
 
 Pcsx2Config::SpeedhackOptions& Pcsx2Config::SpeedhackOptions::DisableAll()
 {
+	// bitset covers DynamicEECycleRate along with the rest. DynamicEECycleRateTrace is
+	// left alone: where a development trace goes is not a speedhack to turn off.
 	bitset = 0;
 	EECycleRate = 0;
 	EECycleSkip = 0;
+	iopThreadLag = IopThread::kDefaultLag;
 
 	return *this;
 }
@@ -408,9 +434,15 @@ void Pcsx2Config::SpeedhackOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(vuFlagHack);
 	SettingsWrapBitBool(vuThread);
 	SettingsWrapBitBool(vu1Instant);
+	SettingsWrapBitBool(iopThread);
+	SettingsWrapBitBool(iopThreadLockstep);
+	SettingsWrapEntry(iopThreadLag);
+	SettingsWrapBitBool(DynamicEECycleRate);
+	SettingsWrapEntry(DynamicEECycleRateTrace);
 
 	EECycleRate = std::clamp(EECycleRate, MIN_EE_CYCLE_RATE, MAX_EE_CYCLE_RATE);
 	EECycleSkip = std::min(EECycleSkip, MAX_EE_CYCLE_SKIP);
+	iopThreadLag = IopThread::ClampLag(iopThreadLag);
 }
 
 Pcsx2Config::ProfilerOptions::ProfilerOptions()
@@ -460,6 +492,7 @@ Pcsx2Config::RecompilerOptions::RecompilerOptions()
 	EnableFastmem = true;
 	PauseOnTLBMiss = false;
 	EnableVUProgramCache = false; // default off; opt-in until the on-disk cache is validated on the target hardware
+	EnableVUAot = true; // default on (arm64 builds; the setting is ignored elsewhere); it also turns the VU program cache on
 
 	// vu and fpu clamping default to standard overflow.
 	vu0Overflow = true;
@@ -549,6 +582,7 @@ void Pcsx2Config::RecompilerOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(EnableFastmem);
 	SettingsWrapBitBool(PauseOnTLBMiss);
 	SettingsWrapBitBool(EnableVUProgramCache);
+	SettingsWrapBitBool(EnableVUAot);
 
 	SettingsWrapBitBool(vu0Overflow);
 	SettingsWrapBitBool(vu0ExtraOverflow);
@@ -714,15 +748,16 @@ const char* Pcsx2Config::GSOptions::GetRendererName(GSRendererType type)
 	switch (type)
 	{
 			// clang-format off
-		case GSRendererType::Auto:  return "Auto";
-		case GSRendererType::DX11:  return "Direct3D 11";
-		case GSRendererType::DX12:  return "Direct3D 12";
-		case GSRendererType::Metal: return "Metal";
-		case GSRendererType::OGL:   return "OpenGL";
-		case GSRendererType::VK:    return "Vulkan";
-		case GSRendererType::SW:    return "Software";
-		case GSRendererType::Null:  return "Null";
-		default:                    return "";
+		case GSRendererType::Auto:   return "Auto";
+		case GSRendererType::DX11:   return "Direct3D 11";
+		case GSRendererType::DX12:   return "Direct3D 12";
+		case GSRendererType::Metal:  return "Metal";
+		case GSRendererType::OGL:    return "OpenGL";
+		case GSRendererType::VK:     return "Vulkan";
+		case GSRendererType::SW:     return "Software";
+		case GSRendererType::Null:   return "Null";
+		case GSRendererType::NullHW: return "Null (HW)";
+		default:                     return "";
 			// clang-format on
 	}
 }
@@ -746,13 +781,12 @@ Pcsx2Config::GSOptions::GSOptions()
 	UseDebugDevice = false;
 	UseBlitSwapChain = false;
 	DisableShaderCache = false;
+	PrecompilePipelines = true;
 	DisableFramebufferFetch = false;
-	DisableDualSourceBlend = false;
-	DisablePS2DepthQuantization = false;
 	DisableVertexShaderExpand = false;
-	EnableAdrenoFramebufferFetch = false;
 	ForceMaliFramebufferFetch = false;
 	SkipDuplicateFrames = true;
+	AdvancedFrameDisplay = false;
 	OsdMessagesPos = OsdOverlayPos::TopLeft;
 	OsdPerformancePos = OsdOverlayPos::TopRight;
 	OsdShowSpeed = false;
@@ -862,8 +896,10 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(UpscaleMultiplier) &&
 
 		OpEqu(AccurateBlendingUnit) &&
+		OpEqu(CopyRoadMaximumBlendingLevel) &&
 		OpEqu(TextureFiltering) &&
 		OpEqu(TexturePreloading) &&
+		OpEqu(TextureUpscale) &&
 		OpEqu(GSDumpCompression) &&
 		OpEqu(HWDownloadMode) &&
 		OpEqu(CASMode) &&
@@ -895,7 +931,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(UserHacks_BilinearHack) &&
 		OpEqu(OverrideTextureBarriers) &&
 		OpEqu(DepthFeedbackMode) &&
-		OpEqu(BackThreadMode) &&
+		OpEqu(BackThread) &&
 
 		OpEqu(CAS_Sharpness) &&
 		OpEqu(FSR_Sharpness) &&
@@ -924,6 +960,7 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
 		OpEqu(LsfgMultiplier) &&
 		OpEqu(LsfgDllPath) &&
 		OpEqu(LsfgPerformance) &&
+		OpEqu(LsfgFp16) &&
 		OpEqu(LsfgFlowScale) &&
 		OpEqu(LsfgTargetRate) &&
 
@@ -943,7 +980,7 @@ bool Pcsx2Config::GSOptions::operator!=(const GSOptions& right) const
 bool Pcsx2Config::GSOptions::IsRestartOption(const char* ini_key)
 {
 	// INI key names for the fields compared in RestartOptionsAreEqual below; keep the
-	// two in sync. Names match the field names except BackThreadMode, which is stored
+	// two in sync. Names match the field names except BackThread, which is stored
 	// as "GSBackThreadMode".
 	static constexpr const char* keys[] = {
 		"Renderer",
@@ -952,11 +989,9 @@ bool Pcsx2Config::GSOptions::IsRestartOption(const char* ini_key)
 		"DebugLabels",
 		"UseBlitSwapChain",
 		"DisableShaderCache",
+		"PrecompilePipelines",
 		"DisableFramebufferFetch",
-		"DisableDualSourceBlend",
-		"DisablePS2DepthQuantization",
 		"DisableVertexShaderExpand",
-		"EnableAdrenoFramebufferFetch",
 		"ForceMaliFramebufferFetch",
 		"OverrideTextureBarriers",
 		"DepthFeedbackMode",
@@ -983,15 +1018,13 @@ bool Pcsx2Config::GSOptions::RestartOptionsAreEqual(const GSOptions& right) cons
 		   OpEqu(DebugLabels) &&
 		   OpEqu(UseBlitSwapChain) &&
 		   OpEqu(DisableShaderCache) &&
+		   OpEqu(PrecompilePipelines) &&
 		   OpEqu(DisableFramebufferFetch) &&
-		   OpEqu(DisableDualSourceBlend) &&
-		   OpEqu(DisablePS2DepthQuantization) &&
 		   OpEqu(DisableVertexShaderExpand) &&
-		   OpEqu(EnableAdrenoFramebufferFetch) &&
 		   OpEqu(ForceMaliFramebufferFetch) &&
 		   OpEqu(OverrideTextureBarriers) &&
 		   OpEqu(DepthFeedbackMode) &&
-		   OpEqu(BackThreadMode) &&
+		   OpEqu(BackThread) &&
 		   OpEqu(HWAA1) &&
 		   OpEqu(ExclusiveFullscreenControl);
 }
@@ -1039,13 +1072,12 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(DumpDrawLog);
 	SettingsWrapBitBool(UseBlitSwapChain);
 	SettingsWrapBitBool(DisableShaderCache);
+	SettingsWrapBitBool(PrecompilePipelines);
 	SettingsWrapBitBool(DisableFramebufferFetch);
-	SettingsWrapBitBool(DisableDualSourceBlend);
-	SettingsWrapBitBool(DisablePS2DepthQuantization);
 	SettingsWrapBitBool(DisableVertexShaderExpand);
-	SettingsWrapBitBool(EnableAdrenoFramebufferFetch);
 	SettingsWrapBitBool(ForceMaliFramebufferFetch);
 	SettingsWrapBitBool(SkipDuplicateFrames);
+	SettingsWrapBitBool(AdvancedFrameDisplay);
 	SettingsWrapBitBool(OsdShowSpeed);
 	SettingsWrapBitBool(OsdShowFPS);
 	SettingsWrapBitBool(OsdShowVPS);
@@ -1092,7 +1124,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapIntEnumEx(UserHacks_Limit24BitDepth, "UserHacks_Limit24BitDepth");
 	SettingsWrapBitBoolEx(UserHacks_EstimateTextureRegion, "UserHacks_EstimateTextureRegion");
 	SettingsWrapBitBoolEx(UserHacks_DrawBuffering, "UserHacks_DrawBuffering");
-	SettingsWrapBitBoolEx(UserHacks_RewriteLargeST, "UserHacks_RewriteLargeST");
+	SettingsWrapBitBoolEx(UserHacks_RewriteLargeSTCoords, "UserHacks_RewriteLargeST");
 	SettingsWrapBitBoolEx(FXAA, "fxaa");
 	SettingsWrapBitBool(ShadeBoost);
 	SettingsWrapBitBoolEx(DumpGSData, "DumpGSData");
@@ -1139,6 +1171,16 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapIntEnumEx(AccurateBlendingUnit, "accurate_blending_unit");
 	SettingsWrapIntEnumEx(TextureFiltering, "filter");
 	SettingsWrapIntEnumEx(TexturePreloading, "texture_preloading");
+	{
+		// Persisted as an integer, so a hand-edited or newer value must not become an invalid
+		// enumerator. Read as an int: the enum is a u8, and a stored 257 would wrap onto 1.
+		int texture_upscale = static_cast<int>(TextureUpscale);
+		SettingsWrapEntryEx(texture_upscale, "TextureUpscale");
+		if (texture_upscale < static_cast<int>(GSTextureUpscaleMode::Off) ||
+			texture_upscale > static_cast<int>(GSTextureUpscaleMode::Raisr4x))
+			texture_upscale = static_cast<int>(GSTextureUpscaleMode::Off);
+		TextureUpscale = static_cast<GSTextureUpscaleMode>(texture_upscale);
+	}
 	SettingsWrapIntEnumEx(GSDumpCompression, "GSDumpCompression");
 	SettingsWrapIntEnumEx(HWDownloadMode, "HWDownloadMode");
 	SettingsWrapIntEnumEx(CASMode, "CASMode");
@@ -1169,7 +1211,9 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapIntEnumEx(TriFilter, "TriFilter");
 	SettingsWrapBitfieldEx(OverrideTextureBarriers, "OverrideTextureBarriers");
 	SettingsWrapIntEnumEx(DepthFeedbackMode, "DepthFeedbackMode");
-	SettingsWrapIntEnumEx(BackThreadMode, "GSBackThreadMode");
+	// An integer on disk: 0 is off, any other value on. Older builds stored a four-way mode whose
+	// "on" value was 3, and the settings UIs bind the key as an integer.
+	BackThread = wrap.EntryBitfield(CURRENT_SETTINGS_SECTION, "GSBackThreadMode", BackThread ? 1 : 0, BackThread ? 1 : 0) != 0;
 
 	SettingsWrapBitfield(ShadeBoost_Brightness);
 	SettingsWrapBitfield(ShadeBoost_Contrast);
@@ -1193,6 +1237,7 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitfieldEx(LsfgMultiplier, "LsfgMultiplier");
 	SettingsWrapEntryEx(LsfgDllPath, "LsfgDllPath");
 	SettingsWrapEntryEx(LsfgPerformance, "LsfgPerformance");
+	SettingsWrapEntryEx(LsfgFp16, "LsfgFp16");
 	SettingsWrapBitfieldEx(LsfgFlowScale, "LsfgFlowScale");
 	SettingsWrapBitfieldEx(LsfgTargetRate, "LsfgTargetRate");
 
@@ -1282,7 +1327,7 @@ void Pcsx2Config::GSOptions::MaskUserHacks(bool respect_claims)
 	if (!keep(GSUserHackOverride::GPUTargetCLUT))
 		UserHacks_GPUTargetCLUTMode = GSGPUTargetCLUTMode::Disabled;
 	if (!keep(GSUserHackOverride::RewriteLargeST))
-		UserHacks_RewriteLargeST = false;
+		UserHacks_RewriteLargeSTCoords = false;
 
 	// No UI reaches these two, so there is nothing for a player to claim.
 	UserHacks_DisableSafeFeatures = false;
@@ -2082,6 +2127,25 @@ Pcsx2Config::AchievementsOptions::AchievementsOptions()
 	LBOverlays = true;
 }
 
+void Pcsx2Config::ArcadeOptions::LoadSave(SettingsWrapper& wrap)
+{
+	SettingsWrapSection("Arcade");
+	SettingsWrapEntry(ATAVerboseReads);
+	SettingsWrapEntry(RAMVerboseReads);
+	SettingsWrapEntry(SRAMVerboseReads);
+	SettingsWrapEntry(UARTVerbose);
+}
+
+bool Pcsx2Config::ArcadeOptions::operator==(const ArcadeOptions& right) const
+{
+	return OpEqu(ATAVerboseReads) && OpEqu(RAMVerboseReads) && OpEqu(SRAMVerboseReads) && OpEqu(UARTVerbose);
+}
+
+bool Pcsx2Config::ArcadeOptions::operator!=(const ArcadeOptions& right) const
+{
+	return !this->operator==(right);
+}
+
 void Pcsx2Config::AchievementsOptions::LoadSave(SettingsWrapper& wrap)
 {
 	SettingsWrapSection("Achievements");
@@ -2101,6 +2165,7 @@ void Pcsx2Config::AchievementsOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(LBOverlays);
 	SettingsWrapEntry(NotificationsDuration);
 	SettingsWrapEntry(LeaderboardsDuration);
+	SettingsWrapEntry(NotificationScale);
 	SettingsWrapIntEnumEx(OverlayPosition, "OverlayPosition");
 	SettingsWrapIntEnumEx(NotificationPosition, "NotificationPosition");
 	SettingsWrapEntry(InfoSoundName);
@@ -2112,13 +2177,14 @@ void Pcsx2Config::AchievementsOptions::LoadSave(SettingsWrapper& wrap)
 		//Clamp in case setting was updated manually using the INI
 		NotificationsDuration = std::clamp(NotificationsDuration, MINIMUM_NOTIFICATION_DURATION, MAXIMUM_NOTIFICATION_DURATION);
 		LeaderboardsDuration = std::clamp(LeaderboardsDuration, MINIMUM_NOTIFICATION_DURATION, MAXIMUM_NOTIFICATION_DURATION);
+		NotificationScale = std::clamp(NotificationScale, MINIMUM_NOTIFICATION_SCALE, MAXIMUM_NOTIFICATION_SCALE);
 	}
 }
 
 bool Pcsx2Config::AchievementsOptions::operator==(const AchievementsOptions& right) const
 {
 	return OpEqu(bitset) && OpEqu(NotificationsDuration) && OpEqu(LeaderboardsDuration) &&
-		   OpEqu(OverlayPosition) && OpEqu(NotificationPosition);
+		   OpEqu(NotificationScale) && OpEqu(OverlayPosition) && OpEqu(NotificationPosition);
 }
 
 bool Pcsx2Config::AchievementsOptions::operator!=(const AchievementsOptions& right) const
@@ -2137,7 +2203,9 @@ Pcsx2Config::Pcsx2Config()
 	InhibitScreensaver = true;
 	UseSavestateSelector = true;
 	BackupSavestate = true;
+	McdAutoBackup = MemcardBackup::AutoBackupDefault(); // off where the front end has no backup screen of the shared kind
 	WarnAboutUnsafeSettings = true;
+	AutoTune = true;
 	EnableDiscordPresence = false;
 	ManuallySetRealTimeClock = false;
 	UseSystemLocaleFormat = false;
@@ -2153,6 +2221,8 @@ Pcsx2Config::Pcsx2Config()
 
 	GzipIsoIndexTemplate = "$(f).pindex.tmp";
 	PINESlot = 28011;
+	AutosaveIntervalMinutes = 0;
+	AutosaveKeep = 3;
 	RtcYear = 0;
 	RtcMonth = 1;
 	RtcDay = 1;
@@ -2179,10 +2249,13 @@ void Pcsx2Config::LoadSaveCore(SettingsWrapper& wrap)
 	SettingsWrapBitBool(EnableRecordingTools);
 	SettingsWrapBitBool(EnableGameFixes);
 	SettingsWrapBitBool(SaveStateOnShutdown);
+	SettingsWrapBitBool(AutosaveOnShutdown);
 	SettingsWrapBitBool(UseSavestateSelector);
 	SettingsWrapBitBool(EnableDiscordPresence);
 	SettingsWrapBitBool(InhibitScreensaver);
 	SettingsWrapBitBool(HostFs);
+	SettingsWrapBitBool(AutoTune);
+	SettingsWrapEntry(AutoTuneTrace);
 
 	SettingsWrapBitBool(BackupSavestate);
 
@@ -2206,9 +2279,12 @@ void Pcsx2Config::LoadSaveCore(SettingsWrapper& wrap)
 	Trace.LoadSave(wrap);
 
 	Achievements.LoadSave(wrap);
+	Arcade.LoadSave(wrap);
 
 	SettingsWrapEntry(GzipIsoIndexTemplate);
 	SettingsWrapEntry(PINESlot);
+	SettingsWrapEntry(AutosaveIntervalMinutes);
+	SettingsWrapEntry(AutosaveKeep);
 	SettingsWrapEntry(RtcYear);
 	SettingsWrapEntry(RtcMonth);
 	SettingsWrapEntry(RtcDay);
@@ -2243,6 +2319,8 @@ void Pcsx2Config::LoadSave(SettingsWrapper& wrap)
 
 void Pcsx2Config::LoadSaveMemcards(SettingsWrapper& wrap)
 {
+	McdAutoBackup = wrap.EntryBitBool("MemoryCards", "AutoBackup", !!McdAutoBackup, McdAutoBackup);
+
 	for (uint slot = 0; slot < 2; ++slot)
 	{
 		wrap.Entry("MemoryCards", StringUtil::StdStringFromFormat("Slot%u_Enable", slot + 1).c_str(),

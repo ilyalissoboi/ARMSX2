@@ -3,6 +3,8 @@
 
 #include "SIO/Memcard/MemoryCardFile.h"
 
+#include "SIO/Memcard/MemcardBackup.h"
+#include "SIO/Memcard/MemcardSync.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 #include "SIO/Sio.h"
 #include <SIO/SioTypes.h>
@@ -16,9 +18,11 @@
 
 #include <array>
 #include <chrono>
+#include <cstring>
 
 #include "Config.h"
 #include "Host.h"
+#include "IopThread/OwnerAsserts.h"
 #include "VMManager.h"
 #include "IconsPromptFont.h"
 
@@ -150,6 +154,18 @@ static bool ConvertRAWtoNoECC(const char* file_in, const char* file_out)
 	return true;
 }
 
+// Soul Calibur II's arcade Conquest card (SC2MAKER's format), told by its header. Rebuilding its
+// player data after ALL CLEAR in the test menu, the game writes each page straight over the old one,
+// with no erase command first, then reads it back. A card that ANDs writes into unerased flash gave
+// back something else, so the game wrote the same pages over and over and never finished.
+static bool IsConquestCard(std::FILE* fp)
+{
+	static constexpr char header[] = "Memory Card for SoulCalibur";
+	char head[sizeof(header) - 1];
+	return FileSystem::FSeek64(fp, 0, SEEK_SET) == 0 && std::fread(head, sizeof(head), 1, fp) == 1 &&
+		std::memcmp(head, header, sizeof(head)) == 0;
+}
+
 // --------------------------------------------------------------------------------------
 //  FileMemoryCard
 // --------------------------------------------------------------------------------------
@@ -164,6 +180,10 @@ protected:
 	std::vector<u8> m_currentdata;
 	u64 m_chksum[8] = {};
 	bool m_ispsx[8] = {};
+	// Writes replace what is there, and no checksum of ours goes into the card: a PS1 card, or Soul
+	// Calibur II's arcade Conquest card (IsConquestCard), whose pages the game writes over unerased.
+	// At m_chkaddr our checksum would land in that card's own pages.
+	bool m_overwrite[8] = {};
 	u32 m_chkaddr = 0;
 
 public:
@@ -332,9 +352,10 @@ void FileMemoryCard::Open()
 
 			m_filenames[slot] = std::move(fname);
 			m_ispsx[slot] = m_fileSize[slot] == 0x20000;
+			m_overwrite[slot] = m_ispsx[slot] || IsConquestCard(m_file[slot]);
 			m_chkaddr = 0x210;
 
-			if (!m_ispsx[slot] && FileSystem::FSeek64(m_file[slot], m_chkaddr, SEEK_SET) == 0)
+			if (!m_overwrite[slot] && FileSystem::FSeek64(m_file[slot], m_chkaddr, SEEK_SET) == 0)
 			{
 				const size_t read_result = std::fread(&m_chksum[slot], sizeof(m_chksum[slot]), 1, m_file[slot]);
 				if (read_result == 0)
@@ -373,7 +394,7 @@ void FileMemoryCard::Close()
 			continue;
 
 		// Store checksum
-		if (!m_ispsx[slot] && FileSystem::FSeek64(m_file[slot], m_chkaddr, SEEK_SET) == 0)
+		if (!m_overwrite[slot] && FileSystem::FSeek64(m_file[slot], m_chkaddr, SEEK_SET) == 0)
 			std::fwrite(&m_chksum[slot], sizeof(m_chksum[slot]), 1, m_file[slot]);
 
 		std::fclose(m_file[slot]);
@@ -469,7 +490,7 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 		return 1;
 	}
 
-	if (m_ispsx[slot])
+	if (m_overwrite[slot])
 	{
 		if (static_cast<int>(m_currentdata.size()) < size)
 			m_currentdata.resize(size);
@@ -494,12 +515,17 @@ s32 FileMemoryCard::Save(uint slot, const u8* src, u32 adr, int size)
 			return 0;
 		}
 
+		// Once per write, not once per byte: a game writing over unerased pages (Soul Calibur II
+		// rebuilding its Conquest card, before m_overwrite) logged thousands of lines a second.
+		int uncleared = 0;
 		for (int i = 0; i < size; i++)
 		{
 			if ((m_currentdata[i] & src[i]) != src[i])
-				Console.Warning("(FileMcd) Warning: writing to uncleared data. (%d) [%08X]", slot, adr);
+				uncleared++;
 			m_currentdata[i] &= src[i];
 		}
+		if (uncleared)
+			Console.Warning("(FileMcd) Warning: writing to uncleared data. (%d) [%08X] %d of %d bytes", slot, adr, uncleared, size);
 
 		// Checksumness
 		{
@@ -569,7 +595,7 @@ u64 FileMemoryCard::GetCRC(uint slot)
 
 	u64 retval = 0;
 
-	if (m_ispsx[slot])
+	if (m_overwrite[slot])
 	{
 		if (!Seek(mcfp, 0))
 			return 0;
@@ -659,6 +685,7 @@ void FileMcd_EmuClose()
 	FileMcd_Open = false;
 	Mcd::implFolder.Close();
 	Mcd::impl.Close();
+	MemcardSync::OnCardsFlushed(); // closed: the cards on disk are complete
 }
 
 void FileMcd_Flush()
@@ -667,23 +694,32 @@ void FileMcd_Flush()
 		return;
 	Mcd::implFolder.Flush();
 	Mcd::impl.Flush();
+	MemcardSync::OnCardsFlushed();
 }
 
 void FileMcd_CancelEject()
 {
+	// Clears the eject ticks the IOP's SIO2 code counts down (IOP thread design 8.4).
+	IOP_SIDE_ASSERT();
 	AutoEject::ClearAll();
 }
 
 void FileMcd_Reopen(std::string new_serial)
 {
+	// Closes and reopens the cards the IOP's SIO2 code reads and writes.
+	IOP_SIDE_ASSERT();
 	Console.WriteLn("Reopening memory cards...");
 	FileMcd_EmuClose();
 	FileMcd_SetType();
 	sioSetGameSerial(new_serial);
+	// Sync first, then the backup: the backup then holds the card the game is about to see, while the
+	// app's own pre-boot snapshot holds the card from before sync changed it (MemcardSync.h).
+	MemcardSync::OnCardsReopening(); // newer saves from other devices, while no card is open
+	MemcardBackup::OnCardsReopening(); // snapshot while no card is open
 	FileMcd_EmuOpen();
 }
 
-static bool FileMcd_IsAutoEjecting()
+bool FileMcd_IsAutoEjecting()
 {
 	for (size_t port = 0; port < SIO::PORTS; ++port)
 	{
@@ -700,6 +736,7 @@ static bool FileMcd_IsAutoEjecting()
 
 void FileMcd_Swap()
 {
+	IOP_SIDE_ASSERT();
 	if (MemcardBusy::IsBusy())
 	{
 		Host::AddIconOSDMessage("MemoryCardSwap_Busy", ICON_PF_MEMORY_CARD, TRANSLATE_SV("MemoryCardSwap_Busy", "Memory cards are busy. Can't swap right now."));
@@ -803,6 +840,7 @@ s32 FileMcd_Read(uint port, uint slot, u8* dest, u32 adr, int size)
 s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
+	MemcardSync::OnCardWritten(combinedSlot);
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:
@@ -817,6 +855,7 @@ s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
 s32 FileMcd_EraseBlock(uint port, uint slot, u32 adr)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
+	MemcardSync::OnCardWritten(combinedSlot);
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:
@@ -963,7 +1002,7 @@ std::vector<AvailableMcdInfo> FileMcd_GetAvailableCards(bool include_in_use_card
 		// We only want relevant file types.
 		if (!(fd.FileName.ends_with(".ps2") || fd.FileName.ends_with(".mcr") ||
 				fd.FileName.ends_with(".mcd") || fd.FileName.ends_with(".bin") ||
-				fd.FileName.ends_with(".mc2")))
+				fd.FileName.ends_with(".mc2") || fd.FileName.ends_with(".conquestcard"))) // Soul Calibur II arcade card
 			continue;
 
 		if (fd.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)

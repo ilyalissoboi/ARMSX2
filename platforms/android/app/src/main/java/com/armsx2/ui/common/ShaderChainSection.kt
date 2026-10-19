@@ -15,15 +15,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -39,6 +38,7 @@ import androidx.compose.ui.unit.sp
 import com.armsx2.R
 import com.armsx2.ShaderParam
 import com.armsx2.ShaderParams
+import com.armsx2.ShaderIndex
 import com.armsx2.ShaderRepo
 import com.armsx2.i18n.str
 import com.armsx2.ui.settings.HelpText
@@ -54,15 +54,11 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /** One `.slangp` on disk. [label] is the bare filename shown inside its directory;
- *  [path] is the absolute filesystem path stored in EmuCore/GS/ShaderChainPreset.
+ *  [path] is the absolute filesystem path stored in
+ *  EmuCore/GS/ShaderChainPreset; [passes] is the resolved pass count — null when the file
+ *  never yields one (see [ShaderIndex]).
  *
- *  Pass count is NOT stored here. It is resolved LAZILY, per visible folder, into the
- *  picker's `passCounts` map — reading + following the #reference chains of all ~2542 stock
- *  presets during the scan cost minutes on device storage, and the number is only ever a
- *  per-row label. See [resolvePasses] for the resolution and the picker's per-folder
- *  LaunchedEffect for where it is driven.
- *
- *  The pass count is reported as a FACT on the row, never used to rank or classify. It is
+ *  [passes] is reported as a FACT on the row, never used to rank or classify. Pass count is
  *  not a cost proxy and we're not going to pretend it is: xBRZ does enormous per-pixel
  *  neighbourhood comparison in ~5 passes and runs heavy, while koko-aio's ambilight chain
  *  runs ~19 passes at tiny scale and runs great. Cost is dominated by per-pass resolution
@@ -70,7 +66,7 @@ import java.io.File
  *  shown and the judgement is left to the user. Do NOT resurrect a Lightweight/Heavy split
  *  on top of it: a wrong "Lightweight" badge misleads exactly the user who picked that tier
  *  because they wanted cheap. */
-private data class ShaderPreset(val label: String, val path: String)
+private data class ShaderPreset(val label: String, val path: String, val passes: Int?)
 
 /** One directory in the on-disk shader tree. Only this directory's immediate [folders] and
  *  [presets] are composed at a time; navigating into a child replaces the visible rows
@@ -86,36 +82,16 @@ private data class ShaderDirectory(
 /** Result of one scan, including the filesystem path used by the empty-state message. */
 private data class ShaderScan(val dir: String, val root: ShaderDirectory)
 
-/** A preset plus the path segments of its folder, relative to the shaders root. */
-private class FoundPreset(val preset: ShaderPreset, val segments: List<String>)
-
 /** Mutable construction node used only on the scan's IO thread, then frozen for Compose. */
 private class ShaderDirectoryBuilder(val key: String, val name: String) {
     val folders = linkedMapOf<String, ShaderDirectoryBuilder>()
     val presets = mutableListOf<ShaderPreset>()
 }
 
-/** Depth cap for #reference chains. The deepest real chain in the stock pack is 7 hops
- *  (bezel/koko-aio/Presets-4.1/FXAA-bloom-immersive.slangp), so this is pure headroom for a
- *  future pack; the actual loop guard is the visited set in [resolvePasses]. */
-private const val MAX_REFERENCE_DEPTH = 16
-
-/** How many presets the scan finds between progress ticks. ~2542 in the stock pack, so this
- *  is ~50 recompositions over the whole walk instead of one per file. */
-private const val SCAN_PROGRESS_STEP = 50
-
 /** Download directory used by ShaderRepo's standard RetroArch pack. It is an installation
  *  wrapper, not a useful category, so [promoteDefaultPackContents] hides this one level
  *  while preserving the real paths stored in every preset. */
 private const val DEFAULT_SHADER_PACK_DIR = "shaders_slang"
-
-/** `shaders = 12` or `shaders = "12"` — 423 presets in the stock pack quote the value, so
- *  the quotes are not optional to handle. */
-private val SHADERS_RE = Regex("""^\s*shaders\s*=\s*"?(\d+)"?""", RegexOption.IGNORE_CASE)
-
-/** `#reference "../../Root_Presets/MBZ__3__STD__GDV.slangp"` — a preset that inherits its
- *  whole chain from another file and only overrides parameters. */
-private val REFERENCE_RE = Regex("""^\s*#reference\s+(.+?)\s*$""", RegexOption.IGNORE_CASE)
 
 /** Folder-name tokens that are initialisms, so [folderLabel] renders "CRT" not "Crt". */
 private val FOLDER_ACRONYMS = setOf(
@@ -172,6 +148,7 @@ fun ShaderChainSection(
         str("renderer.shaderChain.label"),
         enabled,
         description = str("renderer.shaderChain.description"),
+        field = "shaderChainEnabled",
     ) {
         onEnabledChange(it)
     }
@@ -285,23 +262,10 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
     val expanded = remember { mutableStateOf(false) }
     val scan = remember { mutableStateOf<ShaderScan?>(null) }
     val scanning = remember { mutableStateOf(false) }
-    // Presets found so far in the in-progress walk. There is no total to divide by without a
-    // second full traversal of the tree — the very cost the lazy scan removed — so this drives
-    // a live count beside an indeterminate bar rather than a percentage.
-    val scanProgress = remember { mutableStateOf(0) }
     val pickerBringIntoView = remember { BringIntoViewRequester() }
     // The path relative to the shader root. An empty key is the root itself. Keeping one
     // current location is what makes this a browser rather than a set of nested accordions.
     val currentFolderKey = remember { mutableStateOf("") }
-
-    // Pass counts, resolved lazily per visible folder rather than for the whole pack up front
-    // (see [scanShaderPresets]). [passCounts] holds path -> resolved count; a PRESENT key means
-    // resolved (its value may still be null = undeterminable), an ABSENT key means "not costed
-    // yet". It outlives collapse, so reopening or revisiting a folder reuses what was costed.
-    // [passResolveMemo] shares parsed #reference roots between folders so a root feeding dozens
-    // of thin wrappers (Mega Bezel, koko-aio) is read once, not once per referrer.
-    val passCounts = remember { mutableStateMapOf<String, Int?>() }
-    val passResolveMemo = remember { HashMap<String, Int?>() }
 
     // Rescan on every open: packs get dropped in with a file manager (or the Shader Packs
     // downloader) while the app is alive, so a one-shot scan at first composition goes
@@ -311,14 +275,8 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
     LaunchedEffect(expanded.value) {
         if (!expanded.value) return@LaunchedEffect
         scanning.value = true
-        scanProgress.value = 0
         try {
-            // The count callback fires on the IO thread; a Compose MutableState write from off
-            // the main thread is safe (snapshot state), the same pattern the Shader Packs
-            // download rows use for their byte/entry progress.
-            val result = withContext(Dispatchers.IO) {
-                scanShaderPresets(context) { found -> scanProgress.value = found }
-            }
+            val result = withContext(Dispatchers.IO) { scanShaderPresets(context) }
             scan.value = result
             // Always reopen at the root. This gives both hosts a predictable first screen:
             // top-level shader packs only, regardless of where the last preset lives.
@@ -337,21 +295,6 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
     // A folder is marked Active when it is the selected preset's directory or one of its
     // ancestors. Users can therefore follow the marker down without expanding everything.
     val activeFolderKey = remember(root, preset) { root?.findPresetDirectory(preset) }
-
-    // Cost only the folder the user is actually looking at, and only its as-yet-uncosted
-    // presets. One IO hop per folder-open (dozens of files at most), off the UI thread, then
-    // the results land in the observable map and the rows fill their counts in. Cheap folders
-    // finish before the next frame; deep ones (Mega Bezel) fill in shortly after — either way
-    // the browser is interactive immediately instead of blocking on the whole pack.
-    LaunchedEffect(currentFolder, expanded.value) {
-        if (!expanded.value) return@LaunchedEffect
-        val pending = currentFolder?.presets.orEmpty().filterNot { passCounts.containsKey(it.path) }
-        if (pending.isEmpty()) return@LaunchedEffect
-        val resolved = withContext(Dispatchers.IO) {
-            pending.associate { it.path to resolvePasses(File(it.path), passResolveMemo, HashSet(), 0) }
-        }
-        passCounts.putAll(resolved)
-    }
 
     fun navigateTo(folderKey: String) {
         // A controller-confirmed folder is about to dispose its own selected row. ARMSX2's
@@ -446,12 +389,6 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
                 selected = preset.isBlank(),
                 onClick = { onPresetChange("") },
             )
-            // A visible sign the tree walk is running: a slang-shaders pack is thousands of
-            // files, so on device storage the scan is a beat of otherwise-empty list. No
-            // percentage — the total is unknown until the one walk finishes (see [scanProgress]).
-            if (scanning.value) {
-                ShaderScanProgress(scanProgress.value)
-            }
             if (currentFolder?.key?.isNotEmpty() == true) {
                 ShaderFolderRow(
                     controllerId = "shaderChain:folder:up:${currentFolder.key}",
@@ -473,13 +410,31 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
                     onClick = { navigateTo(folder.key) },
                 )
             }
-            currentFolder?.presets.orEmpty().forEach { p ->
-                PresetRow(p, preset, onPresetChange, passCounts)
-            }
+            currentFolder?.presets.orEmpty().forEach { p -> PresetRow(p, preset, onPresetChange) }
+            // Without this the list is just the None row until the scan returns, which reads
+            // as "the list is broken". A first scan (no index yet) walks the whole tree.
+            if (scanning.value && scan.value == null) ScanningRow()
             if (root?.count == 0 && !scanning.value) {
                 HelpText(str("renderer.shaderChain.empty") + "\n\n" + scan.value?.dir.orEmpty())
             }
         }
+    }
+}
+
+/** Not controller-focusable: there is nothing to do with it but wait. */
+@Composable
+private fun ScanningRow() {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+        Spacer(Modifier.width(10.dp))
+        Text(
+            str("renderer.shaderChain.scanning"),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -488,42 +443,14 @@ private fun ShaderPresetPicker(preset: String, onPresetChange: (String) -> Unit)
  *  tab — throwing a controller user back to the top of Renderer. Same as
  *  DriverManagerSection: the list stays open and only the chip moves. */
 @Composable
-private fun PresetRow(
-    p: ShaderPreset,
-    preset: String,
-    onPresetChange: (String) -> Unit,
-    passCounts: Map<String, Int?>,
-) {
+private fun PresetRow(p: ShaderPreset, preset: String, onPresetChange: (String) -> Unit) {
     ShaderPresetRow(
         controllerId = "shaderChain:preset:${p.path}",
         label = p.label,
-        // Present key = costed (value may be null = undeterminable); absent = still costing,
-        // so the row shows no count yet rather than flashing "cost unknown" then a number.
-        passes = passCounts[p.path],
-        passesResolved = passCounts.containsKey(p.path),
+        passes = p.passes,
         selected = p.path == preset,
         onClick = { onPresetChange(p.path) },
     )
-}
-
-/** Live scan feedback: a count that ticks up as `.slangp` files are found, over an
- *  indeterminate bar. Deliberately not a percentage — see [scanShaderPresets] for why the
- *  total is not known until the single walk that produces the count has finished. */
-@Composable
-private fun ShaderScanProgress(found: Int) {
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        Text(
-            if (found > 0) str("renderer.shaderChain.scanningCount").format(found)
-            else str("renderer.shaderChain.scanning"),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 14.sp,
-            lineHeight = 19.sp,
-        )
-        LinearProgressIndicator(Modifier.fillMaxWidth())
-    }
 }
 
 @Composable
@@ -598,9 +525,6 @@ private fun ShaderPresetRow(
     selected: Boolean,
     onClick: () -> Unit,
     showPasses: Boolean = true,
-    // False while this preset's cost is still being resolved off-thread — the count column is
-    // simply omitted until it lands, so the row never flickers a wrong "cost unknown" first.
-    passesResolved: Boolean = true,
 ) {
     Surface(
         onClick = onClick,
@@ -636,7 +560,7 @@ private fun ShaderPresetRow(
             // A fact the user can read, not a verdict we assign — see [ShaderPreset]. str()
             // takes no format args (see I18n.kt), so the count is concatenated the same way
             // renderer.shaderPack.presets already does it.
-            if (showPasses && passesResolved) {
+            if (showPasses) {
                 Text(
                     when {
                         passes == null -> str("renderer.shaderChain.passesUnknown")
@@ -653,56 +577,33 @@ private fun ShaderPresetRow(
     }
 }
 
-/** Scan `<DataRoot>/shaders/` recursively for `*.slangp`. The folder is
+/** The presets under `<DataRoot>/shaders/`, as a folder tree. The folder is
  *  [ShaderRepo.shadersRoot] — the same one the Shader Packs downloader extracts into (and
  *  it creates the dir on demand, so the empty state can name a folder the user will
  *  actually find in a file manager). That helper resolves through assetCopyRoot, like the
  *  texture / cache / memcard folders, so this follows a moved data folder.
  *
- *  Blocking I/O — call it off the UI thread. It only LISTS presets (name + path + folder);
- *  it does NOT read them or follow #reference chains. Pass counts are resolved lazily per
- *  visible folder by the picker (see [resolvePasses]), because costing all ~2542 stock
- *  presets up front — a file read plus a canonicalPath stat plus reference-chain resolution
- *  each — took minutes on device storage for a number that is only ever a per-row label. */
-private fun scanShaderPresets(context: Context, onProgress: (Int) -> Unit = {}): ShaderScan {
+ *  Blocking I/O — call it off the UI thread. Usually one small file read: the list and the
+ *  pass counts come from [ShaderIndex], which only walks and reads the whole tree when its
+ *  index is missing or out of date. */
+private fun scanShaderPresets(context: Context): ShaderScan {
     val root = ShaderRepo.shadersRoot(context)
     if (!root.isDirectory) return ShaderScan(root.absolutePath, emptyShaderDirectory())
-    var count = 0
-    val found = try {
-        root.walkTopDown()
-            .filter { it.isFile && it.extension.equals("slangp", ignoreCase = true) }
-            .map { file ->
-                val dir = file.parentFile?.relativeToOrNull(root)?.invariantSeparatorsPath.orEmpty()
-                    .let { if (it == ".") "" else it }
-                // Report as presets are discovered, throttled so a big pack drives ~tens of
-                // recompositions rather than thousands. This is the only pass over the tree.
-                if (++count % SCAN_PROGRESS_STEP == 0) onProgress(count)
-                FoundPreset(
-                    preset = ShaderPreset(
-                        label = file.nameWithoutExtension,
-                        path = file.absolutePath,
-                    ),
-                    segments = if (dir.isEmpty()) emptyList() else dir.split('/'),
-                )
-            }
-            .toList()
-            .also { onProgress(it.size) }
-    } catch (_: Exception) {
-        // A pack can be replaced from a file manager while this background walk is active.
-        // Treat that one scan as empty; reopening immediately rescans the completed tree.
-        emptyList()
-    }
-
     val builder = ShaderDirectoryBuilder("", "")
-    found.forEach { foundPreset ->
+    ShaderIndex.load(root).forEach { entry ->
+        val segments = entry.relPath.split('/')
         var directory = builder
-        foundPreset.segments.forEach { segment ->
+        segments.dropLast(1).forEach { segment ->
             val childKey = if (directory.key.isEmpty()) segment else "${directory.key}/$segment"
             directory = directory.folders.getOrPut(segment) {
                 ShaderDirectoryBuilder(childKey, segment)
             }
         }
-        directory.presets += foundPreset.preset
+        directory.presets += ShaderPreset(
+            label = segments.last().substringBeforeLast('.'),
+            path = File(root, entry.relPath).absolutePath,
+            passes = entry.passes,
+        )
     }
     return ShaderScan(root.absolutePath, builder.freeze().promoteDefaultPackContents())
 }
@@ -781,70 +682,4 @@ private fun folderLabel(leaf: String): String {
             else token.replaceFirstChar { it.uppercase() }
         }
         .ifEmpty { leaf }
-}
-
-/** What one `.slangp` says about its own cost: its pass count, or the presets it inherits
- *  one from. Never both in the stock pack — a `#reference` preset overrides parameters
- *  only — but [resolvePasses] prefers a local count anyway, which is the RetroArch rule. */
-private class PresetFacts(val shaders: Int?, val references: List<String>)
-
-private fun readPreset(file: File): PresetFacts {
-    var shaders: Int? = null
-    val references = ArrayList<String>(2)
-    try {
-        file.bufferedReader().useLines { lines ->
-            for (line in lines) {
-                val hit = SHADERS_RE.find(line)
-                if (hit != null) {
-                    shaders = hit.groupValues[1].toIntOrNull()
-                    // A local count wins outright, so the references can't change the
-                    // answer — stop reading. Bails on line 1 for most of the pack.
-                    if (shaders != null) return@useLines
-                }
-                REFERENCE_RE.find(line)?.let {
-                    references.add(it.groupValues[1].trim().trim('"', '\''))
-                }
-            }
-        }
-    } catch (_: Exception) {
-        // Unreadable / vanished mid-scan: the row says "cost unknown" rather than
-        // inventing a number.
-    }
-    return PresetFacts(shaders, references)
-}
-
-/**
- * The preset's pass count, following `#reference` chains. null = undeterminable, which the
- * row reports honestly as "cost unknown".
- *
- * The reference hop is the whole reason this function exists rather than a one-line regex.
- * 691 of the stock pack's 2542 presets — essentially all of Mega Bezel and koko-aio — carry
- * no `shaders` key at all; they are thin files whose entire body is `#reference
- * "../some/root.slangp"` plus parameter overrides. Reading `shaders` naively finds nothing
- * for exactly those files, so without this the headline number would be blank on precisely
- * the biggest chains in the pack.
- *
- * Targets resolve against the REFERENCING file's directory (they are written `../../…`).
- * [seen] is the loop guard (canonical paths, so a symlinked pack can't dodge it); [cache]
- * memoises across the whole scan.
- */
-private fun resolvePasses(
-    file: File,
-    cache: MutableMap<String, Int?>,
-    seen: MutableSet<String>,
-    depth: Int,
-): Int? {
-    val canonical = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
-    if (depth > MAX_REFERENCE_DEPTH || !seen.add(canonical)) return null
-    if (cache.containsKey(canonical)) return cache[canonical]
-    val facts = readPreset(file)
-    val result = facts.shaders ?: facts.references.firstNotNullOfOrNull { ref ->
-        val target = File(file.parentFile, ref)
-        // Multi-reference presets (324 of them) list the .slangp first and .params after;
-        // taking the first target that actually yields a count skips the parameter files
-        // without having to sniff extensions.
-        if (target.isFile) resolvePasses(target, cache, seen, depth + 1) else null
-    }
-    cache[canonical] = result
-    return result
 }

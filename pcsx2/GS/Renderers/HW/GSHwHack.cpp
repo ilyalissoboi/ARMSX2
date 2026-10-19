@@ -626,20 +626,6 @@ bool GSHwHack::GSC_TalesOfLegendia(GSRendererHW& r, int& skip)
 	return true;
 }
 
-bool GSHwHack::GSC_UltramanFightingEvolution(GSRendererHW& r, int& skip)
-{
-	if (skip == 0)
-	{
-		if (!s_nativeres && RTME && RFBP == 0x2a00 && RFPSM == PSMZ24 && RTBP0 == 0x1c00 && RTPSM == PSMZ24)
-		{
-			// Don't enable hack on native res if crc is below aggressive.
-			skip = 5; // blur
-		}
-	}
-
-	return true;
-}
-
 bool GSHwHack::GSC_TalesofSymphonia(GSRendererHW& r, int& skip)
 {
 	if (skip == 0)
@@ -1037,6 +1023,8 @@ bool GSHwHack::OI_PointListPalette(GSRendererHW& r, GSTexture* rt, GSTexture* ds
 			const u32 c = vi.RGBAQ.U32[0];
 			r.m_mem.WritePixel32(x, y, c, FBP, FBW);
 		}
+		// The loop above takes x == m_r.z and y == m_r.w, so the pixels written reach one past m_r.
+		r.m_mem.MarkPagesWritten(r.m_mem.GetOffset(FBP, FBW, PSMCT32), GSVector4i(r.m_r.x, r.m_r.y, r.m_r.z + 1, r.m_r.w + 1));
 		g_texture_cache->InvalidateVideoMem(r.m_context->offset.fb, r.m_r);
 		return false;
 	}
@@ -1490,9 +1478,6 @@ const GSHwHack::Entry<GSRendererHW::GSC_Ptr> GSHwHack::s_get_skip_count_function
 
 	// Depth Issue
 	CRC_F(GSC_BurnoutGames),
-
-	// Upscaling hacks
-	CRC_F(GSC_UltramanFightingEvolution),
 };
 
 const GSHwHack::Entry<GSRendererHW::OI_Ptr> GSHwHack::s_before_draw_functions[] = {
@@ -1550,6 +1535,7 @@ void GSRendererHW::UpdateRenderFixes()
 
 	m_nativeres = (GSConfig.UpscaleMultiplier == 1.0f);
 	s_nativeres = m_nativeres;
+	SetCullGrid(EngineCullGrid());
 
 	m_gsc = nullptr;
 	m_oi = nullptr;
@@ -1575,6 +1561,11 @@ void GSRendererHW::UpdateRenderFixes()
 			m_mv = GSHwHack::s_move_handler_functions[GSConfig.MoveHandlerFunctionId].ptr;
 		}
 	}
+}
+
+bool GSRendererHW::DrawClearsScanMask() const
+{
+	return m_gsc == &GSHwHack::GSC_IRem;
 }
 
 bool GSRendererHW::IsBadFrame()

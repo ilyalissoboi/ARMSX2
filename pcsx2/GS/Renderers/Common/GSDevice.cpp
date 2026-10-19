@@ -5,6 +5,7 @@
 #ifdef ARMSX2_EMBEDDED_RESOURCES
 #include "EmbeddedResources.h"
 #endif
+#include "GS/Renderers/Common/GSHeadlessPresent.h"
 #include "GS/Renderers/Common/GSPassScheduler.h"
 #include "GS/GSGL.h"
 #include "GS/GS.h"
@@ -38,6 +39,10 @@ namespace
 	std::string s_shader_param_preset;
 	std::vector<std::pair<std::string, float>> s_shader_params;
 	std::atomic<u64> s_shader_param_generation{0};
+	std::atomic<u64> s_shader_chain_retry{0};
+	std::mutex s_shader_chain_error_mutex;
+	std::string s_shader_chain_error_preset;
+	std::string s_shader_chain_error;
 } // namespace
 
 void GSDevice::SetShaderChainParams(std::string preset, std::vector<std::pair<std::string, float>> params)
@@ -56,6 +61,36 @@ void GSDevice::SetShaderChainParams(std::string preset, std::vector<std::pair<st
 u64 GSDevice::GetShaderChainParamGeneration()
 {
 	return s_shader_param_generation.load(std::memory_order_acquire);
+}
+
+void GSDevice::RetryShaderChain()
+{
+	{
+		std::unique_lock lock(s_shader_chain_error_mutex);
+		s_shader_chain_error_preset.clear();
+	}
+	s_shader_chain_retry.fetch_add(1, std::memory_order_release);
+}
+
+u64 GSDevice::GetShaderChainRetry()
+{
+	return s_shader_chain_retry.load(std::memory_order_acquire);
+}
+
+void GSDevice::SetShaderChainError(std::string preset, std::string message)
+{
+	std::unique_lock lock(s_shader_chain_error_mutex);
+	s_shader_chain_error_preset = std::move(preset);
+	s_shader_chain_error = std::move(message);
+}
+
+bool GSDevice::GetShaderChainError(const std::string& preset, std::string* message)
+{
+	std::unique_lock lock(s_shader_chain_error_mutex);
+	if (preset.empty() || s_shader_chain_error_preset != preset)
+		return false;
+	*message = s_shader_chain_error;
+	return true;
 }
 
 bool GSDevice::GetShaderChainParams(const std::string& preset, std::vector<std::pair<std::string, float>>* out)
@@ -95,6 +130,7 @@ const char* ShaderEntryPoint(ShaderConvert value)
 		case ShaderConvert::RGB5A1_TO_DEPTH16:      return "ps_convert_rgb5a1_depth16";
 		case ShaderConvert::DEPTH32_TO_DEPTH24:     return "ps_convert_depth32_depth24";
 		case ShaderConvert::DEPTH_COPY:             return "ps_depth_copy";
+		case ShaderConvert::PRIMID_TO_RGBA8:        return "ps_convert_primid_rgba8";
 		case ShaderConvert::DOWNSAMPLE_COPY:        return "ps_downsample_copy";
 		case ShaderConvert::RGBA_TO_8I:             return "ps_convert_rgba_8i";
 		case ShaderConvert::RGB5A1_TO_8I:           return "ps_convert_rgb5a1_8i";
@@ -155,6 +191,7 @@ const char* ShaderConvertName(ShaderConvert shader)
 		ENTRY(RGBA8_TO_DEPTH16);
 		ENTRY(RGB5A1_TO_DEPTH16);
 		ENTRY(DEPTH32_TO_DEPTH24);
+		ENTRY(PRIMID_TO_RGBA8);
 		ENTRY(DOWNSAMPLE_COPY);
 		ENTRY(RGBA_TO_8I);
 		ENTRY(RGB5A1_TO_8I);
@@ -422,6 +459,73 @@ GSVector4i GSDevice::ProcessCopyArea(const GSVector4i& rtsize, const GSVector4i&
 	return snapped_drawarea;
 }
 
+#ifdef BAKE_SHADERS_IN_CPP
+#include "common_fxaa.cpp"
+#include "common_ffx_a.cpp"
+#include "common_ffx_cas.cpp"
+#include "vulkan_cas.cpp"
+#include "vulkan_convert.cpp"
+#include "vulkan_imgui.cpp"
+#include "vulkan_interlace.cpp"
+#include "vulkan_merge.cpp"
+#include "vulkan_present.cpp"
+#include "vulkan_shadeboost.cpp"
+#include "vulkan_tfx.cpp"
+#include "opengl_cas.cpp"
+#include "opengl_convert.cpp"
+#include "opengl_imgui.cpp"
+#include "opengl_interlace.cpp"
+#include "opengl_merge.cpp"
+#include "opengl_present.cpp"
+#include "opengl_shadeboost.cpp"
+#include "opengl_tfx_fs.cpp"
+#include "opengl_tfx_vgs.cpp"
+#ifdef _WIN32
+#include "dx11_cas.cpp"
+#include "dx11_convert.cpp"
+#include "dx11_imgui.cpp"
+#include "dx11_interlace.cpp"
+#include "dx11_merge.cpp"
+#include "dx11_present.cpp"
+#include "dx11_shadeboost.cpp"
+#include "dx11_tfx.cpp"
+#endif
+
+static const std::map<std::string, const unsigned char*> s_baked_shaders = {
+	{ "shaders/common/fxaa.fx"         , common_fxaa},
+	{ "shaders/common/fxaa.fx"         , common_fxaa },
+	{ "shaders/common/ffx_a.h"         , common_ffx_a },
+	{ "shaders/common/ffx_cas.h"       , common_ffx_cas },
+	{ "shaders/vulkan/cas.glsl"        , vulkan_cas },
+	{ "shaders/vulkan/convert.glsl"    , vulkan_convert},
+	{ "shaders/vulkan/imgui.glsl"      , vulkan_imgui},
+	{ "shaders/vulkan/interlace.glsl"  , vulkan_interlace},
+	{ "shaders/vulkan/merge.glsl"      , vulkan_merge },
+	{ "shaders/vulkan/present.glsl"    , vulkan_present },
+	{ "shaders/vulkan/shadeboost.glsl" , vulkan_shadeboost },
+	{ "shaders/vulkan/tfx.glsl"        , vulkan_tfx },
+	{ "shaders/opengl/cas.glsl"        , opengl_cas },
+	{ "shaders/opengl/convert.glsl"    , opengl_convert },
+	{ "shaders/opengl/imgui.glsl"      , opengl_imgui },
+	{ "shaders/opengl/interlace.glsl"  , opengl_interlace },
+	{ "shaders/opengl/merge.glsl"      , opengl_merge },
+	{ "shaders/opengl/present.glsl"    , opengl_present },
+	{ "shaders/opengl/shadeboost.glsl" , opengl_shadeboost },
+	{ "shaders/opengl/tfx_fs.glsl"     , opengl_tfx_fs },
+	{ "shaders/opengl/tfx_vgs.glsl"    , opengl_tfx_vgs },
+#ifdef _WIN32
+	{ "shaders/dx11/cas.hlsl"          , dx11_cas },
+	{ "shaders/dx11/convert.fx"        , dx11_convert },
+	{ "shaders/dx11/imgui.fx"          , dx11_imgui },
+	{ "shaders/dx11/interlace.fx"      , dx11_interlace },
+	{ "shaders/dx11/merge.fx"          , dx11_merge },
+	{ "shaders/dx11/present.fx"        , dx11_present },
+	{ "shaders/dx11/shadeboost.fx"     , dx11_shadeboost },
+	{ "shaders/dx11/tfx.fx"            , dx11_tfx },
+#endif
+};
+#endif
+
 std::optional<std::string> GSDevice::ReadShaderSource(const char* filename)
 {
 	std::optional<std::string> source =
@@ -434,6 +538,18 @@ std::optional<std::string> GSDevice::ReadShaderSource(const char* filename)
 	// create the device and leaving the frontend with a black screen.
 	if (!source.has_value())
 		source = EmbeddedResources::Read(filename);
+#endif
+
+#ifdef BAKE_SHADERS_IN_CPP
+	// Checked after the resources directory, unlike upstream: the rig links the
+	// resources directory to the source tree so a shader edit can never be
+	// stale, and a baked copy consulted first would silently defeat that.
+	if (!source.has_value())
+	{
+		const auto it = s_baked_shaders.find(filename);
+		if (it != s_baked_shaders.end())
+			source = reinterpret_cast<const char*>(it->second);
+	}
 #endif
 
 	return source;
@@ -465,6 +581,7 @@ void GSDevice::Destroy()
 	for (GSTexture* tex : pending)
 		Recycle(tex);
 
+	GSHeadless::ForgetPresented();
 	ClearCurrent();
 	PurgePool();
 }
@@ -531,11 +648,6 @@ void GSDevice::ClearDepth(GSTexture* t, float d)
 {
 	FlushDeferredDrawsFor(t);
 	t->SetClearDepth(d);
-}
-
-void GSDevice::DoHintReadbackSource(GSTexture* tex)
-{
-	// Default: no scheduling hint. See GSDeviceVK for a backend that uses it.
 }
 
 bool GSDevice::ProcessClearsBeforeCopy(GSTexture* sTex, GSTexture* dTex, const bool full_copy)
@@ -1263,23 +1375,23 @@ void GSDevice::ClearCurrent()
 	m_shader_chain_target = nullptr;
 }
 
-void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c)
+void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const MergeTopBand* top_band, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c)
 {
 	FlushDeferredDraws();
 	if (ResizeRenderTarget(&m_merge, fs.x, fs.y, false, false))
-		DoMerge(sTex, sRect, m_merge, dRect, PMODE, EXTBUF, c, BilnIf(GSConfig.PCRTCOffsets));
+		DoMerge(sTex, sRect, m_merge, dRect, top_band, PMODE, EXTBUF, c, BilnIf(GSConfig.PCRTCOffsets));
 
 	m_current = m_merge;
 }
 
-void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffset)
+void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffset, const GSFieldPadRows& top_pad)
 {
 	FlushDeferredDraws();
 	static int bufIdx = 0;
 	float offset = yoffset * static_cast<float>(field);
 	offset = GSConfig.DisableInterlaceOffset ? 0.0f : offset;
 
-	auto do_interlace = [this](GSTexture* sTex, GSTexture* dTex, ShaderInterlace shader, Filter filter, float yoffset, int bufIdx) {
+	auto do_interlace = [this, top_pad](GSTexture* sTex, GSTexture* dTex, ShaderInterlace shader, Filter filter, float yoffset, int bufIdx) {
 		const GSVector2i ds_i = dTex->GetSize();
 		const GSVector2 ds = GSVector2(static_cast<float>(ds_i.x), static_cast<float>(ds_i.y));
 
@@ -1297,7 +1409,8 @@ void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffse
 		}
 
 		const InterlaceConstantBuffer cb = {
-			GSVector4(static_cast<float>(bufIdx), 1.0f / ds.y, ds.y, MAD_SENSITIVITY)
+			GSVector4(static_cast<float>(bufIdx), 1.0f / ds.y, ds.y, MAD_SENSITIVITY),
+			GSVector4(top_pad.first, top_pad.end, 0.0f, 0.0f)
 		};
 
 		GL_PUSH("DoInterlace %dx%d Shader:%d Filter:%d", ds_i.x, ds_i.y, static_cast<int>(shader), filter);
@@ -1359,8 +1472,8 @@ bool GSDevice::ApplyShaderChain(const GSVector2i& output_size, const GSVector2i&
 	// Guarded here rather than in the backends so a device that never overrides
 	// DoApplyShaderChain (software, or a build without librashader) costs nothing.
 	const bool wanted = GSConfig.ShaderChainEnabled && !GSConfig.ShaderChainPreset.empty();
-	// On the edge, not every frame: turning the chain off used to leave every pass's target
-	// and pipeline resident until the preset changed or the device died.
+	// Frees a chain that is no longer wanted. GSRenderer::Merge only calls this while one is,
+	// so the release doesn't run from there.
 	if (!wanted && m_shader_chain_loaded)
 	{
 		ReleaseShaderChain();
@@ -2235,6 +2348,7 @@ static void DumpPSSelector(DrawConfigWriter& out, const GSHWDrawConfig::PSSelect
 	out.WriteLn("colclip_hw: {}", ps.colclip_hw);
 	out.WriteLn("rta_correction: {}", ps.rta_correction);
 	out.WriteLn("rta_source_correction: {}", ps.rta_source_correction);
+	out.WriteLn("replacement_alpha_snap: {}", ps.replacement_alpha_snap);
 	out.WriteLn("colclip: {}", ps.colclip);
 	out.WriteLn("blend_mix: {}", ps.blend_mix);
 	out.WriteLn("round_inv: {}", ps.round_inv);
@@ -2255,6 +2369,7 @@ static void DumpPSSelector(DrawConfigWriter& out, const GSHWDrawConfig::PSSelect
 	out.WriteLn("manual_lod: {}", ps.manual_lod);
 	out.WriteLn("point_sampler: {}", ps.point_sampler);
 	out.WriteLn("region_rect: {}", ps.region_rect);
+	out.WriteLn("native_texel_grid: {}", ps.native_texel_grid);
 	out.WriteLn("scanmsk: {} ({})", GSUtil::GetSCANMSKName(ps.scanmsk), ps.scanmsk);
 	out.WriteLn("aa1: {} ({})", GetPSAA1Name(ps.aa1), static_cast<u32>(ps.aa1));
 	out.WriteLn("abe: {}", static_cast<u32>(ps.abe));
@@ -2316,7 +2431,7 @@ static void DumpAlphaPass(DrawConfigWriter& out, const GSHWDrawConfig::AlphaPass
 	out.WriteLn("enable: {}", ap.enable);
 	out.WriteLn("require_one_barrier: {}", ap.require_one_barrier);
 	out.WriteLn("require_full_barrier: {}", ap.require_full_barrier);
-	out.WriteLn("colormask: {:x}", ap.colormask.wrgba);
+	out.WriteLn("colormask: 0x{:x}", ap.colormask.wrgba);
 	out.WriteLn("ps_aref: {}", ap.ps_aref);
 
 	out.WriteLn("ps:");
@@ -2332,12 +2447,13 @@ static void DumpBlendMultipass(DrawConfigWriter& out, const GSHWDrawConfig::Blen
 	out.WriteLn("no_color1: {}", bmp.no_color1);
 	out.WriteLn("blend_hw: {} ({})", GetPSBlendHWName(static_cast<HWBlendType>(bmp.blend_hw)), bmp.blend_hw);
 	out.WriteLn("dither: {}", bmp.dither);
+	out.WriteLn("clear_sw_blend: {}", bmp.clear_sw_blend);
 
 	out.WriteLn("blend:");
 	DumpBlendState(out.WithIndent(), bmp.blend);
 }
 
-template<typename T, typename U = int>
+template<typename T>
 static void DumpVector4(DrawConfigWriter& out, const char* name, const T& val)
 {
 	out.WriteLn("{}: [{}, {}, {}, {}]", name, val.x, val.y, val.z, val.w);
@@ -2369,6 +2485,8 @@ static void DumpPSConstantBuffer(DrawConfigWriter& out, const GSHWDrawConfig::PS
 	DumpVector4(out, "DitherMatrix_3", cb.DitherMatrix[3]);
 	DumpVector4(out, "ScaleFactor", cb.ScaleFactor);
 	out.WriteLn("LineCovScale: {}", cb.LineCovScale);
+	out.WriteLn("DitherPhase: [{}, {}]", cb.DitherPhase & 3, (cb.DitherPhase >> 2) & 3);
+	DumpVector4(out, "NativeTexelGrid", cb.NativeTexelGrid);
 }
 
 static void DumpVSConstantBuffer(DrawConfigWriter& out, const GSHWDrawConfig::VSConstantBuffer& cb)
@@ -2395,7 +2513,13 @@ static void DumpConfig(DrawConfigWriter& out, const GSHWDrawConfig& conf,
 	out.WriteLn("destination_alpha: {} ({})", GSGetDestinationAlphaModeName(conf.destination_alpha), static_cast<u32>(conf.destination_alpha));
 	out.WriteLn("datm: {} ({})", GetSetDATMName(conf.datm), static_cast<u32>(conf.datm));
 	out.WriteLn("line_expand: {}", conf.line_expand);
-	out.WriteLn("colormask: {:x}", conf.colormask.wrgba);
+	out.WriteLn("colormask: 0x{:x}", conf.colormask.wrgba);
+
+	out.WriteLn("colclip_mode: {}", GetColClipModeName(conf.colclip_mode));
+	out.WriteLn("colclip_frame: {{ FBP: 0x{:04x}, FBW: {}, PSM: {}, FBMSK: 0x{:08x} }}",
+		conf.colclip_frame.FBP, conf.colclip_frame.FBW, GSUtil::GetPSMName(conf.colclip_frame.PSM),
+		conf.colclip_frame.FBMSK);
+	DumpVector4(out, "colclip_update_area", conf.colclip_update_area);
 
 	if (ps)
 	{

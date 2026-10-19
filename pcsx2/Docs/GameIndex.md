@@ -176,7 +176,7 @@ The clamp modes are also numerically based.
 * cpuSpriteRenderLevel        [`0` or `1` or `2`]    {Sprites only, Sprites/Triangles, Blended Sprites/Triangles}  Default: Off unless cpuSpriteRenderBW has value other than Off then it is 'Sprites only' (`0`)
 * estimateTextureRegion       [`0` or `1`]          {Off, On}                               Default: Off (`0`)
 * drawBuffering               [`0` or `1`]          {Off, On}                               Default: Off (`0`)
-* rewriteLargeST              [`0` or `1`]          {Off, On} Default: Off (`0`)
+* rewriteLargeSTCoords        [`0` or `1`]          {Off, On} Default: Off (`0`)
 * getSkipCount                {`GSC` with suffix }  {None unless specific game GSC}         Default: Disabled (`0`) unless valid variable name (ex. GSC_PolyphonyDigitalGames, GSC_UrbanReign, ...)
 * gpuPaletteConversion        [`0` or `1`]          {Off, On}                               Default: Off (`0`)
 * gpuTargetCLUT               [`0` or `1` or `2`]   {Disabled, Enabled (Exact Match), Enabled (Check Inside Target)}                     Default: Disabled (`0`)
@@ -275,6 +275,9 @@ These values are in a key-value format, where the value is assumed to be an inte
 * Games such as PaRappa the Rapper 2 need VU1 to sync, so you can force sync with this parameter.
 * `eeCycleRate`
 * Accepted Values - `-3` / `3`
+* `iopThread`
+* Accepted Values - `0` / `1`
+* Runs the IOP on its own thread. This is off unless the player turns it on. `0` keeps a title on the single-threaded IOP even when the player has it on, for a title that needs the IOP in step with the EE.
 
 ## Memory Card Filter Override
 

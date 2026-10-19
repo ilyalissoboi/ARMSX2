@@ -338,6 +338,10 @@ void PadGuitar::SetAxisScale(float deadzone, float scale)
 	this->whammyAxisScale = scale;
 }
 
+void PadGuitar::SetDiagonalScaleCorrection(bool enabled)
+{
+}
+
 float PadGuitar::GetVibrationScale(u32 motor) const
 {
 	return 0;
@@ -418,7 +422,11 @@ bool PadGuitar::Freeze(StateWrapper& sw)
 		return false;
 
 	// Private PadGuitar members
-	sw.Do(&whammy);
+	{
+		u8 whammy_value = whammy;
+		sw.Do(&whammy_value);
+		whammy = whammy_value;
+	}
 	sw.Do(&analogLight);
 	sw.Do(&analogLocked);
 	sw.Do(&commandStage);

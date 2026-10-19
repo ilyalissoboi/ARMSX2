@@ -467,13 +467,13 @@ static void cop2ApplyDestMaskACC(const a64::VRegister& result)
 
 alignas(16) static const u32 s_cop2MaxFloat[4] = {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff};
 
-// VCLIP positive per-lane clip-bit weights ([+x@bit0, +y@bit2, +z@bit4]; lane w
-// unused). The negative weights ([-x@bit1, -y@bit3, -z@bit5]) are these << 1, so
-// only one constant is needed. After Cmgt the positive/negative masks are
-// weighted per lane and a horizontal Addv collapses them into the 6-bit field
-// (the +/- bits per axis are mutually exclusive and the lane contributions
-// occupy disjoint bit ranges, so the add never carries between bits).
-alignas(16) static const u32 s_cop2ClipWeightPos[4] = {0x01, 0x04, 0x10, 0x00};
+// VCLIP clip-bit weights, one per comparison, in the halfword order the UZP1
+// in recCOP2_VCLIP leaves them: the four +component comparisons ([+x@bit0,
+// +y@bit2, +z@bit4]) and then the four -component ones ([-x@bit1, -y@bit3,
+// -z@bit5]). The w lane is not a clip result, so its weight is zero in both
+// halves. The six weights are distinct powers of two, so the horizontal Addv
+// that collapses them is the OR the bit layout wants.
+alignas(16) static const u16 s_cop2ClipWeights[8] = {1, 4, 16, 0, 2, 8, 32, 0};
 
 // The COP2 emitters reach the constants above — plus the denormalized
 // status-flag scratch — through _cpuRegistersPack.cop2Rec with single
@@ -499,7 +499,7 @@ void cop2RecWritePackConstants()
 	for (int i = 0; i < 4; i++)
 		st.minFloat[i] = s_cop2MaxFloat[i] | 0x80000000u;
 	memcpy(st.destMasks, s_cop2DestMasks, sizeof(st.destMasks));
-	memcpy(st.clipWeightPos, s_cop2ClipWeightPos, sizeof(st.clipWeightPos));
+	memcpy(st.clipWeights, s_cop2ClipWeights, sizeof(st.clipWeights));
 	st.denormStatusFlag = 0;
 }
 
@@ -740,6 +740,43 @@ static EEFPU_MODEL_CALL void cop2MulShortTailBand()
 	vuMulShortTailBandLanes(st.bandFs, st.bandFt, st.bandProduct);
 }
 
+// The model seam is the same at every site (EeFpuModelCall-arm64.h), so it is
+// emitted once with the dispatchers and each site is left with a bl.
+enum : int
+{
+	kCop2ModelStubDivide,
+	kCop2ModelStubSqrtBits,
+	kCop2ModelStubRecipSqrt,
+	kCop2ModelStubMulShortTailBand,
+	kCop2ModelStubCount
+};
+static const u8* s_cop2ModelStubs[kCop2ModelStubCount];
+
+static EeFpuModelCallee cop2ModelCallee(int kind)
+{
+	using namespace EeFpuModelFrame;
+	switch (kind)
+	{
+		case kCop2ModelStubDivide:
+			return {reinterpret_cast<const void*>(&EeFpuModel::Divide), kVecNone};
+		case kCop2ModelStubSqrtBits:
+			return {reinterpret_cast<const void*>(&EeFpuModel::SqrtBits), kVecSqrt};
+		case kCop2ModelStubRecipSqrt:
+			return {reinterpret_cast<const void*>(&EeFpuModel::RecipSqrt), kVecSqrt};
+		case kCop2ModelStubMulShortTailBand:
+			return {reinterpret_cast<const void*>(&cop2MulShortTailBand), kVecNone};
+		default: break;
+	}
+	pxFail("unknown model stub");
+	return {nullptr, 8};
+}
+
+void cop2DynGenModelStubs()
+{
+	for (int kind = 0; kind < kCop2ModelStubCount; kind++)
+		s_cop2ModelStubs[kind] = armDynGenEeFpuModelStub(cop2ModelCallee(kind));
+}
+
 static void cop2EmitDefectiveMul(const a64::VRegister& dst, const a64::VRegister& a,
 	const a64::VRegister& b, const a64::VRegister& u, bool uLive)
 {
@@ -811,7 +848,7 @@ static void cop2EmitDefectiveMul(const a64::VRegister& dst, const a64::VRegister
 	if (!aliasFt)
 		armAsm->Str(b, bandFt);
 	armAsm->Str(dst, bandProduct);
-	armEmitEeFpuModelCall(reinterpret_cast<const void*>(&cop2MulShortTailBand));
+	armEmitCall(s_cop2ModelStubs[kCop2ModelStubMulShortTailBand]);
 	armAsm->Ldr(dst, bandProduct);
 	armAsm->Bind(&done);
 
@@ -1441,16 +1478,93 @@ enum : int
 };
 static const u8* s_cop2SyncStubs[kCop2SyncStubCount];
 
-static const u8* cop2DynGenOneSyncStub(void (*syncFn)(), void (*finishFn)())
+// Parked-spin bounce, run-ahead stub only (the "parked" tail below).
+//
+// UYA's VU0 runs one program that never ends: between jobs it sits in a
+// NOP-only wait loop on a VI register the EE writes. About two thirds of the
+// run-ahead syncs it sees find it still there, and all recMicroVU0::Execute
+// does with them is mVUspinBounce: VU0.cycle += max(delta, 16). Reaching
+// that answer cost the pin flush and reload, the register saves and two C
+// calls. While mVU0ParkedSpin is armed, the stub answers it here instead,
+// before touching the stack or the pins.
+//
+// It has to leave behind exactly what the C++ path does, step for step:
+//   vu0SyncRunAheadThin: publishes cpuRegs.cycle (the slow path's
+//     armFlushCycleDelta) and does nothing more when the s32 delta is
+//     negative.
+//   recMicroVU0::Execute: clears VUFLAG_MFLAGSET, bounces (VU0.cycle +=
+//     the floored delta), raises the VU0 interrupt if flags bit 2 is set.
+// Arming guarantees the bounce's other preconditions (see mVU0ArmParkedSpin),
+// so what is left to test per sync is the loop condition, which reads the
+// two VI registers the EE writes, and the interrupt bit, which sends the
+// sync to C++. Neither cpuRegs.cycle nor nextEventCycle changes, so RECCYCLE
+// stays valid and the pins were never touched.
+//
+// In:  x8 = VPU_STAT (bit 0 set). Clobbers x8, x16, x17 and NZCV, as any BL
+// may. Branches to `slow` with nothing but cpuRegs.cycle written (the slow
+// path writes the same value again), and to `parked` with the verdict made.
+static void cop2EmitParkedSpinTest(a64::Label* slow, a64::Label* parked)
+{
+	a64::Label viBIsZero;
+	armMoveAddressToReg(a64::x17, &mVU0ParkedSpin);
+	armAsm->Ldr(a64::w16, a64::MemOperand(a64::x17));
+	armAsm->Cbz(a64::w16, slow);
+
+	// The loop condition, 16 bits per operand like the guest's IBEQ/IBNE (and
+	// mVUspinBounce's US[0] reads): CTC2 can leave an upper half dirty.
+	armAsm->And(a64::w17, a64::w16, 0xfffe);
+	armAsm->Ldrh(a64::w17, a64::MemOperand(RVU0, a64::x17));
+	armAsm->Lsr(a64::w8, a64::w16, 16);
+	armAsm->Cbz(a64::w8, &viBIsZero); // vi0 operand: w8 is already the 0 it reads
+	armAsm->Ldrh(a64::w8, a64::MemOperand(RVU0, a64::x8));
+	armAsm->Bind(&viBIsZero);
+	armAsm->Cmp(a64::w17, a64::w8);
+	armAsm->Cset(a64::w17, a64::eq);
+	// bit 0 = (equal) XOR (exits on equal): clear exactly when the exit
+	// condition holds, and the loop leaves — VU0 has real work to run.
+	armAsm->Eor(a64::w17, a64::w17, a64::w16);
+	armAsm->Tbz(a64::w17, 0, slow);
+
+	// A pending VU0 interrupt is raised by Execute; leave it to C++.
+	armAsm->Ldr(a64::w17, armVU0Mem(&VU0.flags));
+	static_assert(VUFLAG_INTCINTERRUPT == (1u << 2));
+	armAsm->Tbz(a64::w17, 2, parked);
+}
+
+// The verdict half: w17 = VU0.flags. Ends in Ret.
+static void cop2EmitParkedSpinBounce()
+{
+	a64::Label negative, floored;
+	armFlushCycleDelta(a64::x16); // x16 = cpuRegs.cycle, published
+	armAsm->Ldr(a64::x8, armVU0Mem(&VU0.cycle));
+	armAsm->Sub(a64::w16, a64::w16, a64::w8); // (s32)(cpuRegs.cycle - VU0.cycle)
+	armAsm->Tbnz(a64::w16, 31, &negative);
+	armAsm->Cmp(a64::w16, 16);
+	armAsm->B(&floored, a64::ge);
+	armAsm->Mov(a64::w16, 16);
+	armAsm->Bind(&floored);
+	armAsm->Add(a64::x8, a64::x8, a64::Operand(a64::w16, a64::UXTW));
+	armAsm->Str(a64::x8, armVU0Mem(&VU0.cycle));
+	armAsm->And(a64::w17, a64::w17, ~static_cast<u32>(VUFLAG_MFLAGSET));
+	armAsm->Str(a64::w17, armVU0Mem(&VU0.flags));
+	armAsm->Bind(&negative);
+	armAsm->Ret();
+}
+
+static const u8* cop2DynGenOneSyncStub(void (*syncFn)(), void (*finishFn)(), bool parkedSpin = false)
 {
 	const u8* start = armGetCurrentCodePointer();
 
-	a64::Label doSync;
+	a64::Label doSync, parked;
 	armAsm->Ldr(RWSCRATCH, armVU0Mem(&VU0.VI[REG_VPU_STAT]));
 	armAsm->Tbnz(RWSCRATCH, 0, &doSync);
 	armAsm->Ret();
 
 	armAsm->Bind(&doSync);
+	a64::Label slow;
+	if (parkedSpin)
+		cop2EmitParkedSpinTest(&slow, &parked);
+	armAsm->Bind(&slow);
 	armAsm->Stp(a64::x4, a64::x5, a64::MemOperand(a64::sp, -64, a64::PreIndex));
 	armAsm->Stp(a64::x6, a64::x7, a64::MemOperand(a64::sp, 16));
 	armAsm->Stp(a64::x14, a64::x15, a64::MemOperand(a64::sp, 32));
@@ -1490,6 +1604,14 @@ static const u8* cop2DynGenOneSyncStub(void (*syncFn)(), void (*finishFn)())
 	armAsm->Ldp(a64::x4, a64::x5, a64::MemOperand(a64::sp, 64, a64::PostIndex));
 	armAsm->Ret();
 
+	// Out of line, after the slow path's Ret, so the stub still reads as
+	// "idle Ret, then the sync path up to its Ret" (SyncStubsReDupClampConsts).
+	if (parkedSpin)
+	{
+		armAsm->Bind(&parked);
+		cop2EmitParkedSpinBounce();
+	}
+
 	return start;
 }
 
@@ -1498,7 +1620,7 @@ void cop2DynGenSyncStubs()
 	s_cop2SyncStubs[kCop2SyncStubSyncFinish] = cop2DynGenOneSyncStub(vu0SyncThin, _vu0FinishMicro);
 	s_cop2SyncStubs[kCop2SyncStubSyncWait] = cop2DynGenOneSyncStub(vu0SyncThin, _vu0WaitMicro);
 	s_cop2SyncStubs[kCop2SyncStubSyncExact] = cop2DynGenOneSyncStub(vu0SyncThin, nullptr);
-	s_cop2SyncStubs[kCop2SyncStubSyncRunAhead] = cop2DynGenOneSyncStub(vu0SyncRunAheadThin, nullptr);
+	s_cop2SyncStubs[kCop2SyncStubSyncRunAhead] = cop2DynGenOneSyncStub(vu0SyncRunAheadThin, nullptr, /*parkedSpin=*/true);
 	s_cop2SyncStubs[kCop2SyncStubFinish] = cop2DynGenOneSyncStub(nullptr, _vu0FinishMicro);
 }
 
@@ -1517,6 +1639,23 @@ int cop2TestGetSyncStubCount()
 const u8* cop2TestGetSyncStub(int kind)
 {
 	return (kind >= 0 && kind < kCop2SyncStubCount) ? s_cop2SyncStubs[kind] : nullptr;
+}
+
+int cop2TestGetModelStubCount()
+{
+	return kCop2ModelStubCount;
+}
+const u8* cop2TestGetModelStub(int kind)
+{
+	return (kind >= 0 && kind < kCop2ModelStubCount) ? s_cop2ModelStubs[kind] : nullptr;
+}
+const void* cop2TestGetModelStubTarget(int kind)
+{
+	return (kind >= 0 && kind < kCop2ModelStubCount) ? cop2ModelCallee(kind).fn : nullptr;
+}
+int cop2TestGetModelStubVecEnd(int kind)
+{
+	return (kind >= 0 && kind < kCop2ModelStubCount) ? cop2ModelCallee(kind).vecEnd : -1;
 }
 #endif
 
@@ -1542,9 +1681,10 @@ void cop2EmitConditionalSync(bool interlock, void (*finishFunc)())
 			cop2FlushForConditionalSync();
 
 			// Apply block cycles to RECCYCLE (the pinned cycle delta).
-			const u32 cycles = scaleblockcycles_clear();
+			const u32 cycles = scaleblockcycles_clear(EeChargeForm::AddImm12);
 			if (cycles != 0)
 				armAsm->Add(RECCYCLE, RECCYCLE, cycles);
+			recEeNoteChargeSite(EeChargeSite::Cop2SyncInterlock);
 
 			int stub = kCop2SyncStubSyncExact;
 			if (finishFunc == &_vu0FinishMicro)
@@ -1569,9 +1709,10 @@ void cop2EmitConditionalSync(bool interlock, void (*finishFunc)())
 	// SL-2 retain seam — see the interlock branch above.
 	cop2FlushForConditionalSync();
 
-	const u32 cycles = scaleblockcycles_clear();
+	const u32 cycles = scaleblockcycles_clear(EeChargeForm::AddImm12);
 	if (cycles != 0)
 		armAsm->Add(RECCYCLE, RECCYCLE, cycles);
+	recEeNoteChargeSite(EeChargeSite::Cop2SyncPlain);
 
 	if (needsSync)
 	{
@@ -2918,7 +3059,7 @@ static bool cop2NeedsSoftwareFlush()
 
 /*	vuClampMode 4 reads the divide unit's own arithmetic -- a digit recurrence
 	with no rounding step -- instead of the host's Fdiv and Fsqrt, out of line
-	through armEmitEeFpuModelCall, on the arm each op takes once it has answered
+	through s_cop2ModelStubs, on the arm each op takes once it has answered
 	the zero divisor for itself.
 
 	Two things stop below it: the ±FLT_MAX clamp, the model's range running a
@@ -2996,7 +3137,7 @@ void recCOP2_VDIV()
 	{
 		armAsm->Ldr(RWARG1, armVU0Mem(&VU0.VF[_Fs_cop2].UL[fsf]));
 		armAsm->Ldr(RWARG2, armVU0Mem(&VU0.VF[_Ft_cop2].UL[ftf]));
-		armEmitEeFpuModelCall(reinterpret_cast<const void*>(&EeFpuModel::Divide));
+		armEmitCall(s_cop2ModelStubs[kCop2ModelStubDivide]);
 		armAsm->Str(RWARG1, armVU0Mem(&VU0.q));
 	}
 	else
@@ -3054,7 +3195,7 @@ void recCOP2_VSQRT()
 		// eeSqrtBits never reads the sign bit, so the |ft| the host path needs
 		// has no counterpart here.
 		armAsm->Ldr(RWARG1, armVU0Mem(&VU0.VF[_Ft_cop2].UL[ftf]));
-		armEmitEeFpuModelCall(reinterpret_cast<const void*>(&EeFpuModel::SqrtBits));
+		armEmitCall(s_cop2ModelStubs[kCop2ModelStubSqrtBits]);
 		armAsm->Str(RWARG1, armVU0Mem(&VU0.q));
 	}
 	else
@@ -3157,7 +3298,7 @@ void recCOP2_VRSQRT()
 		// to live across a second, and RecipSqrt is the pair.
 		armAsm->Ldr(RWARG1, armVU0Mem(&VU0.VF[_Fs_cop2].UL[fsf]));
 		armAsm->Ldr(RWARG2, armVU0Mem(&VU0.VF[_Ft_cop2].UL[ftf]));
-		armEmitEeFpuModelCall(reinterpret_cast<const void*>(&EeFpuModel::RecipSqrt));
+		armEmitCall(s_cop2ModelStubs[kCop2ModelStubRecipSqrt]);
 		armAsm->Str(RWARG1, armVU0Mem(&VU0.q));
 	}
 	else
@@ -3239,18 +3380,16 @@ void recCOP2_VCLIP()
 	armAsm->Cmgt(posMask.V4S(), RQSCRATCH.V4S(), RQSCRATCH3.V4S());      // pos mask
 	armAsm->Cmgt(RQSCRATCH2.V4S(), RQSCRATCH2.V4S(), RQSCRATCH3.V4S());  // neg mask
 
-	// Weight each lane by its clip bit and fold to a 6-bit field. The negative
-	// weights are the positive ones << 1 ([1,4,16,0] -> [2,8,32,0]), so a single
-	// constant load plus a Shl covers both. +/- per axis are mutually exclusive
-	// and the weights are disjoint bits, so Add+Addv = OR (no carries).
+	// Weight each comparison by its clip bit and fold to a 6-bit field. A Cmgt
+	// leaves its lane all ones or all zero, so the low halfword of each carries
+	// the answer whole: UZP1 on the halfword view packs all eight comparisons
+	// into one register and one weight apiece moves each to its bit.
 	a64::VRegister weight = a64::VRegister(27, 128);
-	armAsm->Ldr(weight, armCpuRegMem(&_cpuRegistersPack.cop2Rec.clipWeightPos)); // [1,4,16,0]
+	armAsm->Ldr(weight, armCpuRegMem(&_cpuRegistersPack.cop2Rec.clipWeights));
+	armAsm->Uzp1(posMask.V8H(), posMask.V8H(), RQSCRATCH2.V8H()); // +xyzw then -xyzw
 	armAsm->And(posMask.V16B(), posMask.V16B(), weight.V16B());
-	armAsm->And(RQSCRATCH2.V16B(), RQSCRATCH2.V16B(), weight.V16B());
-	armAsm->Shl(RQSCRATCH2.V4S(), RQSCRATCH2.V4S(), 1);     // neg weights = pos << 1
-	armAsm->Add(posMask.V4S(), posMask.V4S(), RQSCRATCH2.V4S());
-	armAsm->Addv(posMask.S(), posMask.V4S());               // sum lanes → scalar
-	armAsm->Umov(a64::w2, posMask.V4S(), 0);                // 6-bit clip field
+	armAsm->Addv(posMask.H(), posMask.V8H());               // sum lanes → scalar
+	armAsm->Umov(a64::w2, posMask.V8H(), 0);                // 6-bit clip field
 
 	// Merge into clipflag and mask to 24 bits
 	armAsm->Orr(a64::w9, a64::w9, a64::w2);

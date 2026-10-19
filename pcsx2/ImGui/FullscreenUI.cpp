@@ -3,6 +3,7 @@
 
 #include "BuildVersion.h"
 #include "CDVD/CDVDcommon.h"
+#include "GS/GS.h"
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSTexture.h"
 #include "Achievements.h"
@@ -58,8 +59,15 @@ TinyString FullscreenUI::TimeToPrintableString(time_t t)
 #endif
 
 	TinyString ret;
+#ifdef _WIN32
+	wchar_t buf[65];
+	pxAssert(std::size(buf) == ret.buffer_size());
+	std::wcsftime(buf, std::size(buf), L"%c", &lt);
+	ret.assign(StringUtil::WideStringToUTF8String(buf));
+#else
 	std::strftime(ret.data(), ret.buffer_size(), "%c", &lt);
 	ret.update_size();
+#endif
 	return ret;
 }
 
@@ -331,6 +339,7 @@ bool FullscreenUI::Initialize()
 	s_initialized = true;
 	s_hotkey_list_cache = InputManager::GetHotkeyList();
 	MTGS::SetRunIdle(true);
+	RegisterMemcardRestorePrompt();
 
 	LoadCustomBackground();
 
@@ -452,7 +461,8 @@ void FullscreenUI::OnVMResumed()
 		if (s_current_main_window == MainWindowType::PauseMenu ||
 			s_current_main_window == MainWindowType::Settings ||
 			s_current_main_window == MainWindowType::Achievements ||
-			s_current_main_window == MainWindowType::Leaderboards)
+			s_current_main_window == MainWindowType::Leaderboards ||
+			s_current_main_window == MainWindowType::MemcardBackups)
 		{
 			s_current_main_window = MainWindowType::None;
 			s_current_pause_submenu = PauseSubMenu::None;
@@ -548,6 +558,11 @@ void FullscreenUI::Shutdown(bool clear_state)
 		CancelAllHddOperations();
 		CloseSaveStateSelector();
 		CloseCoverDownloaderWindow();
+		ShutdownAutoCovers();
+		ShutdownDriversPage();
+		ShutdownArcade();
+		ShutdownOnlinePatches();
+		ShutdownTexturePacks();
 		s_cover_image_map.clear();
 		s_game_list_sorted_entries = {};
 		s_last_unsorted_entries = {};
@@ -576,6 +591,7 @@ void FullscreenUI::Shutdown(bool clear_state)
 	s_custom_background_path.clear();
 	s_custom_background_enabled = false;
 
+	ShutdownSavesUI();
 	DestroyResources();
 	ImGuiFullscreen::Shutdown(clear_state);
 	s_initialized = false;
@@ -596,10 +612,14 @@ void FullscreenUI::Render()
 		LoadCustomBackground();
 	}
 
+	if (!s_cleanup_textures.empty())
+		GSDrainBackQueue();
 	for (std::unique_ptr<GSTexture>& tex : s_cleanup_textures)
 		g_gs_device->Recycle(tex.release());
 	s_cleanup_textures.clear();
 	ImGuiFullscreen::UploadAsyncTextures();
+	PollAutoCovers();
+	PollArcade();
 
 	ImGuiFullscreen::BeginLayout();
 
@@ -655,6 +675,9 @@ void FullscreenUI::Render()
 		case MainWindowType::Leaderboards:
 			Achievements::DrawLeaderboardsWindow();
 			break;
+		case MainWindowType::MemcardBackups:
+			DrawMemcardBackupsWindow();
+			break;
 		default:
 			break;
 	}
@@ -672,6 +695,8 @@ void FullscreenUI::Render()
 
 	if (s_cover_downloader_open)
 		DrawCoverDownloaderWindow();
+
+	DrawOnlinePatchesResults();
 
 	if (s_achievements_login_open || ImGui::IsPopupOpen("RetroAchievements"))
 		DrawAchievementsLoginWindow();
@@ -783,6 +808,9 @@ bool FullscreenUI::LoadSvgResources()
 
 void FullscreenUI::DestroyResources()
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
+
 	s_banner_texture.reset();
 	for (auto& tex : s_game_compatibility_textures)
 		tex.reset();
@@ -796,7 +824,7 @@ void FullscreenUI::DestroyResources()
 
 ImGuiFullscreen::FileSelectorFilters FullscreenUI::GetOpenFileFilters()
 {
-	return {"*.bin", "*.iso", "*.cue", "*.mdf", "*.chd", "*.cso", "*.zso", "*.gz", "*.elf", "*.irx", "*.gs", "*.gs.xz", "*.gs.zst", "*.dump"};
+	return {"*.bin", "*.iso", "*.cue", "*.mdf", "*.chd", "*.cso", "*.zso", "*.gz", "*.elf", "*.irx", "*.gs", "*.gs.xz", "*.gs.zst", "*.dump", "*.acgame"};
 }
 
 ImGuiFullscreen::FileSelectorFilters FullscreenUI::GetDiscImageFilters()
@@ -858,6 +886,9 @@ void FullscreenUI::DoVMInitialize(const VMBootParameters& boot_params, bool swit
 
 void FullscreenUI::DoStartPath(const std::string& path, std::optional<s32> state_index, std::optional<bool> fast_boot)
 {
+	if (StartArcadePath(path, state_index, fast_boot))
+		return;
+
 	VMBootParameters params;
 	params.filename = path;
 	params.state_index = state_index;
@@ -1318,9 +1349,16 @@ void FullscreenUI::DrawLandingTemplate(ImVec2* menu_pos, ImVec2* menu_size)
 #else
 			localtime_r(&utc_time_t, &tm_local);
 #endif
+
+#ifdef _WIN32
+			wchar_t buf[256];
+			std::wcsftime(buf, std::size(buf), L"%X", &tm_local);
+			heading_str.assign(StringUtil::WideStringToUTF8String(buf));
+#else
 			char buf[256];
-			std::strftime(buf, sizeof(buf), "%X", &tm_local);
+			std::strftime(buf, std::size(buf), "%X", &tm_local);
 			heading_str.assign(buf);
+#endif
 
 			const ImVec2 time_size = heading_font.first->CalcTextSizeA(heading_font.second, FLT_MAX, 0.0f, heading_str.c_str());
 			time_pos = ImVec2(heading_size.x - LayoutScale(LAYOUT_MENU_BUTTON_X_PADDING) - time_size.x,
@@ -1680,10 +1718,11 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 			11, // None
 			4, // Exit
 			3, // Achievements
+			5, // Arcade
 		};
 
 		const bool just_focused = ResetFocusHere();
-		BeginMenuButtons(submenu_item_count[static_cast<u32>(s_current_pause_submenu)], 1.0f, ImGuiFullscreen::LAYOUT_MENU_BUTTON_X_PADDING,
+		BeginMenuButtons(submenu_item_count[static_cast<u32>(s_current_pause_submenu)] + GetArcadePauseMenuItemCount(s_current_pause_submenu), 1.0f, ImGuiFullscreen::LAYOUT_MENU_BUTTON_X_PADDING,
 			ImGuiFullscreen::LAYOUT_MENU_BUTTON_Y_PADDING, ImGuiFullscreen::LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY);
 
 		if (!ImGui::IsPopupOpen(0u, ImGuiPopupFlags_AnyPopup))
@@ -1713,6 +1752,9 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 					case PauseSubMenu::Achievements:
 						first_id = ImGui::GetID(FSUI_ICONSTR(ICON_PF_BACKWARD, "Back To Pause Menu"));
 						last_id = ImGui::GetID(FSUI_ICONSTR(ICON_FA_STOPWATCH, "Leaderboards"));
+						break;
+					case PauseSubMenu::Arcade:
+						GetArcadePauseWrapIds(&first_id, &last_id);
 						break;
 				}
 
@@ -1758,10 +1800,12 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 						s_current_main_window = MainWindowType::None;
 				}
 
-				if (ActiveButton(FSUI_ICONSTR(ICON_FA_WRENCH, "Game Properties"), false, can_save_state))
+				if (ActiveButton(FSUI_ICONSTR(ICON_FA_WRENCH, "Game Properties"), false, can_save_state || IsArcadeSessionActive()))
 				{
 					SwitchToGameSettings();
 				}
+
+				DrawArcadePauseMenuEntry();
 
 				if (ActiveButton(FSUI_ICONSTR(ICON_FA_TROPHY, "Achievements"), false, Achievements::HasAchievementsOrLeaderboards()))
 				{
@@ -1844,6 +1888,10 @@ void FullscreenUI::DrawPauseMenu(MainWindowType type)
 					OpenLeaderboardsWindow();
 			}
 			break;
+
+			case PauseSubMenu::Arcade:
+				DrawArcadePauseSubMenu(just_focused);
+				break;
 		}
 
 		EndMenuButtons();
@@ -1902,6 +1950,8 @@ bool FullscreenUI::InitializeSaveStateListEntry(
 	li->timestamp = sd.ModificationTime;
 	li->path = std::move(filename);
 
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
 	li->preview_texture.reset();
 
 	u32 screenshot_width, screenshot_height;
@@ -1950,6 +2000,7 @@ u32 FullscreenUI::PopulateSaveStateListEntries(const std::string& title, const s
 		}
 	}
 
+	AppendAutosaveListEntries(serial, crc);
 	return static_cast<u32>(s_save_state_selector_slots.size());
 }
 
@@ -2136,7 +2187,7 @@ void FullscreenUI::DrawSaveStateSelector(bool is_loading)
 						closed = true;
 					}
 
-					if (ActiveButton(FSUI_ICONSTR(ICON_FA_TRASH, "Delete Save"), false, true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+					if (ActiveButton(FSUI_ICONSTR(ICON_FA_TRASH, "Delete Save"), false, !IsAutosaveSlot(entry.slot), LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
 					{
 						if (!FileSystem::FileExists(entry.path.c_str()))
 						{
@@ -2426,6 +2477,11 @@ void FullscreenUI::DrawResumeStateSelector()
 void FullscreenUI::DoLoadState(std::string path, std::optional<s32> slot, bool backup)
 {
 	std::string boot_path = s_save_state_selector_game_path;
+
+	// An arcade game has to be prepared before it boots; the state loads once it has.
+	if (!boot_path.empty() && !VMManager::HasValidVM() && StartArcadePath(boot_path, std::nullopt, std::nullopt, path))
+		return;
+
 	Host::RunOnCPUThread([boot_path = std::move(boot_path), path = std::move(path), slot, backup]() {
 		if (VMManager::HasValidVM())
 		{
@@ -3219,9 +3275,11 @@ void FullscreenUI::DrawSetupWindow()
 		FSUI_NSTR("BIOS"),
 		FSUI_NSTR("Game Directories"),
 		FSUI_NSTR("RetroAchievements"),
+		FSUI_NSTR("Performance"),
 		FSUI_NSTR("Finished"),
 	};
 	static constexpr u32 STEP_COUNT = std::size(step_titles);
+	static constexpr u32 STEP_PERFORMANCE = 4;
 
 	const u32 step = std::min(s_setup_wizard_step, STEP_COUNT - 1);
 	const bool last_step = (step == STEP_COUNT - 1);
@@ -3239,6 +3297,13 @@ void FullscreenUI::DrawSetupWindow()
 		}
 	};
 	const auto go_next = [&step, last_step]() {
+		if (step == STEP_PERFORMANCE)
+		{
+			// Saves the answer even when it was left as it was, so the settings file shows the player was asked.
+			Host::SetBaseBoolSettingValue("EmuCore", "AutoTune", Host::GetBaseBoolSettingValue("EmuCore", "AutoTune", true));
+			Host::CommitBaseSettingChanges();
+		}
+
 		if (last_step)
 		{
 			CompleteSetupWizard();
@@ -3341,11 +3406,25 @@ void FullscreenUI::DrawSetupWindow()
 		case 3: // RetroAchievements
 		{
 			auto lock = Host::GetSettingsLock();
-			DrawAchievementsSettingsPage(lock);
+			DrawAchievementsSettingsPage();
 		}
 		break;
 
-		case 4: // Finished
+		case STEP_PERFORMANCE:
+		{
+			auto lock = Host::GetSettingsLock();
+			SettingsInterface* bsi = GetEditingSettingsInterface();
+			BeginMenuButtons();
+			MenuHeading(FSUI_CSTR("Performance"));
+			DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_WAND_MAGIC, "Automatic Performance Tuning"),
+				FSUI_CSTR("When a game can't keep full speed, ARMSX2 tries lighter settings for that game one at a time and keeps the ones "
+						  "that help. You can reset it for any game from the game's settings."),
+				"EmuCore", "AutoTune", true);
+			EndMenuButtons();
+		}
+		break;
+
+		case 5: // Finished
 		default:
 		{
 			BeginMenuButtons();
@@ -3441,6 +3520,8 @@ void FullscreenUI::DrawGameListSettingsWindow()
 			FSUI_CSTR("Shows Titles for Games when in Game Grid View Mode"), "UI",
 			"FullscreenUIShowGameGridTitles", true);
 	}
+
+	DrawAutoCoverSettings(bsi);
 
 	MenuHeading(FSUI_CSTR("Operations"));
 	{
@@ -4149,7 +4230,7 @@ void FullscreenUI::ReportStateLoadError(const std::string& message, std::optiona
 		}
 
 		std::string title;
-		if (slot.has_value())
+		if (slot.has_value() && *slot > 0)
 		{
 			if (backup)
 				title = fmt::format(FSUI_FSTR("Failed to Load State From Backup Slot {}"), *slot);
@@ -4266,6 +4347,8 @@ TRANSLATE_NOOP("FullscreenUI", "Welcome to ARMSX2!");
 TRANSLATE_NOOP("FullscreenUI", "Navigate with the D-Pad, and use the shoulder buttons to move between steps.");
 TRANSLATE_NOOP("FullscreenUI", "Choose a BIOS, add your game directories, and optionally sign in to RetroAchievements.");
 TRANSLATE_NOOP("FullscreenUI", "Go straight to the main menu. You can configure everything later from Settings.");
+TRANSLATE_NOOP("FullscreenUI", "Automatic Performance Tuning");
+TRANSLATE_NOOP("FullscreenUI", "When a game can't keep full speed, ARMSX2 tries lighter settings for that game one at a time and keeps the ones that help. You can reset it for any game from the game's settings.");
 TRANSLATE_NOOP("FullscreenUI", "Setup Complete!");
 TRANSLATE_NOOP("FullscreenUI", "You're all set. These options can be changed at any time from the Settings menu.");
 TRANSLATE_NOOP("FullscreenUI", "Completes setup and opens the main menu.");
@@ -4315,6 +4398,7 @@ TRANSLATE_NOOP("FullscreenUI", "Welcome");
 TRANSLATE_NOOP("FullscreenUI", "BIOS");
 TRANSLATE_NOOP("FullscreenUI", "Game Directories");
 TRANSLATE_NOOP("FullscreenUI", "RetroAchievements");
+TRANSLATE_NOOP("FullscreenUI", "Performance");
 TRANSLATE_NOOP("FullscreenUI", "Finished");
 TRANSLATE_NOOP("FullscreenUI", "Type");
 TRANSLATE_NOOP("FullscreenUI", "Serial");
@@ -4355,6 +4439,8 @@ TRANSLATE_NOOP("FullscreenUI", "Toggle Frame Limit");
 TRANSLATE_NOOP("FullscreenUI", "Game Properties");
 TRANSLATE_NOOP("FullscreenUI", "Achievements");
 TRANSLATE_NOOP("FullscreenUI", "Save Screenshot");
+TRANSLATE_NOOP("FullscreenUI", "Stop Recording");
+TRANSLATE_NOOP("FullscreenUI", "Start Recording");
 TRANSLATE_NOOP("FullscreenUI", "Switch To Software Renderer");
 TRANSLATE_NOOP("FullscreenUI", "Switch To Hardware Renderer");
 TRANSLATE_NOOP("FullscreenUI", "Change Disc");

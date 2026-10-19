@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "AboutDialog.h"
+#include "ArcadeLaunch.h"
+#include "ArcadeMenu.h"
+#include "AutoCoversController.h"
 #include "AutoUpdaterDialog.h"
 #include "CoverDownloadDialog.h"
 #include "DisplayWidget.h"
@@ -9,6 +12,7 @@
 #include "GameList/GameListWidget.h"
 #include "LogWindow.h"
 #include "MainWindow.h"
+#include "MemcardRestorePrompt.h"
 #include "QtHost.h"
 #include "QtUtils.h"
 #include "SettingWidgetBinder.h"
@@ -22,12 +26,14 @@
 #include "Settings/MemoryCardCreateDialog.h"
 #include "Tools/InputRecording/InputRecordingViewer.h"
 #include "Tools/InputRecording/NewInputRecordingDlg.h"
+#include "ToolbarCustomizationDialog.h"
 
 #if !defined(__APPLE__)
 #include "ShortcutCreationDialog.h"
 #endif
 
 #include "pcsx2/Achievements.h"
+#include "pcsx2/Autosave.h"
 #include "pcsx2/CDVD/CDVDcommon.h"
 #include "pcsx2/CDVD/CDVDdiscReader.h"
 #include "pcsx2/GS.h"
@@ -36,6 +42,7 @@
 #include "pcsx2/GameList.h"
 #include "pcsx2/Host.h"
 #include "pcsx2/ImGui/FullscreenUI.h"
+#include "pcsx2/IopThread/IopThreadVm.h"
 #include "pcsx2/MTGS.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/VMManager.h"
@@ -71,7 +78,7 @@
 #endif
 
 const char* MainWindow::OPEN_FILE_FILTER =
-	QT_TRANSLATE_NOOP("MainWindow", "All File Types (*.bin *.iso *.cue *.mdf *.chd *.cso *.zso *.gz *.elf *.irx *.gs *.gs.xz *.gs.zst *.dump);;"
+	QT_TRANSLATE_NOOP("MainWindow", "All File Types (*.bin *.iso *.cue *.mdf *.chd *.cso *.zso *.gz *.elf *.irx *.gs *.gs.xz *.gs.zst *.dump *.acgame);;"
 									"Single-Track Raw Images (*.bin *.iso);;"
 									"Cue Sheets (*.cue);;"
 									"Media Descriptor File (*.mdf);;"
@@ -82,7 +89,8 @@ const char* MainWindow::OPEN_FILE_FILTER =
 									"ELF Executables (*.elf);;"
 									"IRX Executables (*.irx);;"
 									"GS Dumps (*.gs *.gs.xz *.gs.zst);;"
-									"Block Dumps (*.dump)");
+									"Block Dumps (*.dump);;"
+									"Arcade Games (*.acgame)");
 
 const char* MainWindow::DISC_IMAGE_FILTER = QT_TRANSLATE_NOOP("MainWindow", "All File Types (*.bin *.iso *.cue *.mdf *.chd *.cso *.zso *.gz *.dump);;"
 																			"Single-Track Raw Images (*.bin *.iso);;"
@@ -93,6 +101,14 @@ const char* MainWindow::DISC_IMAGE_FILTER = QT_TRANSLATE_NOOP("MainWindow", "All
 																			"ZSO Images (*.zso);;"
 																			"GZ Images (*.gz);;"
 																			"Block Dumps (*.dump)");
+
+const char* MainWindow::DEFAULT_TOOLBAR_LAYOUT =
+	"start_file,start_disc,start_bios,fullscreen_ui,,"
+	"power_off,reset,pause,change_disc,,"
+	"screenshot,,"
+	"load_state,save_state,,"
+	"fullscreen,,"
+	"settings,controller_settings,hotkey_settings";
 
 MainWindow* g_main_window = nullptr;
 
@@ -106,6 +122,8 @@ static QString s_current_disc_serial;
 static quint32 s_current_disc_crc;
 static quint32 s_current_running_crc;
 
+static constexpr const char* CONTROLLER_TESTER_URL =
+	"https://github.com/PCSX2/tools/releases/download/tests%2Fpad/padtest_ps2.elf";
 
 // DX cannot fullscreen when the display surface is in a container.
 // QWindow, however, seems to lack CSD under wayland, so needs the container.
@@ -118,6 +136,7 @@ MainWindow::MainWindow()
 {
 	pxAssert(!g_main_window);
 	g_main_window = this;
+	MemcardRestorePrompt::Register(this);
 }
 
 MainWindow::~MainWindow()
@@ -127,6 +146,7 @@ MainWindow::~MainWindow()
 	destroySubWindows();
 
 	Common::DetachMousePositionCb();
+	MemcardRestorePrompt::Unregister(this);
 
 	// we compare here, since recreate destroys the window later
 	if (g_main_window == this)
@@ -208,7 +228,8 @@ void MainWindow::setupAdditionalUi()
 	const bool toolbars_locked = Host::GetBaseBoolSettingValue("UI", "LockToolbar", false);
 	m_ui.actionViewLockToolbar->setChecked(toolbars_locked);
 	m_ui.toolBar->setMovable(!toolbars_locked);
-	m_ui.toolBar->setContextMenuPolicy(Qt::PreventContextMenu);
+	m_ui.toolBar->setContextMenuPolicy(Qt::CustomContextMenu);
+	connect(m_ui.toolBar, &QToolBar::customContextMenuRequested, this, &MainWindow::onToolbarContextMenuRequested);
 
 	m_settings_toolbar_menu = new QMenu(m_ui.toolBar);
 	m_settings_toolbar_menu->addAction(m_ui.actionSettings);
@@ -229,6 +250,8 @@ void MainWindow::setupAdditionalUi()
 	m_ui.actionGridViewShowTitles->setChecked(m_game_list_widget->getShowGridCoverTitles());
 	m_ui.actionGridViewShowFullTitles->setChecked(m_game_list_widget->getShowGridFullCoverTitles());
 	m_ui.mainContainer->addWidget(m_game_list_widget);
+
+	rebuildToolbar();
 
 	updateEmulationActions(false, false, false);
 	updateDisplayRelatedActions(false, false, false);
@@ -346,6 +369,8 @@ void MainWindow::setupStatusBarWidgets()
 		Host::RunOnCPUThread([value]() {
 			if (!VMManager::HasValidVM())
 				return;
+			// The audio stream belongs to the IOP thread (IOP thread design 8.10).
+			IopThread::VmHold iop_hold(IopThread::HoldKind::Emulation);
 			EmuConfig.SPU2.StandardVolume = static_cast<u32>(value);
 			SPU2::SetOutputVolume(static_cast<u32>(value));
 		});
@@ -463,6 +488,7 @@ void MainWindow::applyStatusBarVolumeChanges(std::optional<int> volume, bool tog
 
 		if (VMManager::HasValidVM())
 		{
+			IopThread::VmHold iop_hold(IopThread::HoldKind::Emulation);
 			EmuConfig.SPU2.StandardVolume = static_cast<u32>(target_vol);
 			EmuConfig.SPU2.OutputMuted = target_mute;
 			SPU2::SetOutputMuted(target_mute);
@@ -529,6 +555,7 @@ void MainWindow::connectSignals()
 	connect(m_ui.actionRescanAllGames, &QAction::triggered, [this]() { refreshGameList(true, true); });
 	connect(m_ui.actionViewToolbar, &QAction::toggled, this, &MainWindow::onViewToolbarActionToggled);
 	connect(m_ui.actionViewLockToolbar, &QAction::toggled, this, &MainWindow::onViewLockToolbarActionToggled);
+	connect(m_ui.actionCustomizeToolbar, &QAction::triggered, this, &MainWindow::onCustomizeToolbarTriggered);
 	connect(m_ui.actionViewStatusBar, &QAction::toggled, this, &MainWindow::onViewStatusBarActionToggled);
 	connect(m_ui.actionViewGameList, &QAction::triggered, this, &MainWindow::onViewGameListActionTriggered);
 	connect(m_ui.actionViewGameGrid, &QAction::triggered, this, &MainWindow::onViewGameGridActionTriggered);
@@ -539,6 +566,8 @@ void MainWindow::connectSignals()
 	connect(m_ui.actionAbout, &QAction::triggered, this, &MainWindow::onAboutActionTriggered);
 	connect(m_ui.actionOpenDataDirectory, &QAction::triggered, this, &MainWindow::onToolsOpenDataDirectoryTriggered);
 	connect(m_ui.actionCoverDownloader, &QAction::triggered, this, &MainWindow::onToolsCoverDownloaderTriggered);
+	connect(m_ui.actionControllerTester, &QAction::triggered, this, &MainWindow::onToolsControllerTesterTriggered);
+	connect(m_ui.actionArcadeSetup, &QAction::triggered, this, &MainWindow::onToolsArcadeSetupTriggered);
 	connect(m_ui.actionGridViewShowTitles, &QAction::triggered, m_game_list_widget, &GameListWidget::setShowCoverTitles);
 	connect(m_ui.actionGridViewShowFullTitles, &QAction::triggered, m_game_list_widget, &GameListWidget::setShowFullCoverTitles);
 	connect(m_ui.actionGridViewZoomIn, &QAction::triggered, m_game_list_widget, [this]() {
@@ -605,6 +634,7 @@ void MainWindow::connectSignals()
 	// These need to be queued connections to stop crashing due to menus opening/closing and switching focus.
 	connect(m_game_list_widget, &GameListWidget::refreshProgress, this, &MainWindow::onGameListRefreshProgress);
 	connect(m_game_list_widget, &GameListWidget::refreshComplete, this, &MainWindow::onGameListRefreshComplete);
+	new AutoCoversController(m_game_list_widget, this);
 	connect(m_game_list_widget, &GameListWidget::selectionChanged, this, &MainWindow::onGameListSelectionChanged, Qt::QueuedConnection);
 	connect(m_game_list_widget, &GameListWidget::entryActivated, this, &MainWindow::onGameListEntryActivated, Qt::QueuedConnection);
 	connect(m_game_list_widget, &GameListWidget::entryContextMenuRequested, this, &MainWindow::onGameListEntryContextMenuRequested,
@@ -646,6 +676,7 @@ void MainWindow::connectVMThreadSignals(EmuThread* thread)
 	m_ui.actionDebugger->setVisible(false);
 #endif
 	connect(m_ui.actionReloadPatches, &QAction::triggered, thread, &EmuThread::reloadPatches);
+	new ArcadeMenu(this, thread, m_ui.menuArcade, m_ui.actionArcadeInsertCoinP1, m_ui.actionArcadeInsertCoinP2, m_ui.actionArcadeService, m_ui.actionArcadeTest);
 }
 
 void MainWindow::createRendererSwitchMenu()
@@ -1051,6 +1082,7 @@ void MainWindow::updateEmulationActions(bool starting, bool running, bool stoppi
 	m_ui.actionToolbarStartBios->setDisabled(starting_or_running_or_stopping);
 	m_ui.actionStartFullscreenUI->setDisabled(starting_or_running_or_stopping);
 	m_ui.actionToolbarStartFullscreenUI->setDisabled(starting_or_running_or_stopping);
+	m_ui.actionControllerTester->setDisabled(starting_or_running_or_stopping);
 
 	m_ui.actionPowerOff->setEnabled(running);
 	m_ui.actionPowerOffWithoutSaving->setEnabled(running);
@@ -1947,6 +1979,82 @@ void MainWindow::onViewLockToolbarActionToggled(bool checked)
 	m_ui.toolBar->setMovable(!checked);
 }
 
+static std::vector<ToolbarActionInfo> getToolbarActionRegistry(const Ui::MainWindow& ui)
+{
+	return {
+		{"start_file", ui.actionToolbarStartFile},
+		{"start_disc", ui.actionToolbarStartDisc},
+		{"start_bios", ui.actionToolbarStartBios},
+		{"fullscreen_ui", ui.actionToolbarStartFullscreenUI},
+		{"power_off", ui.actionToolbarPowerOff},
+		{"reset", ui.actionToolbarReset},
+		{"pause", ui.actionToolbarPause},
+		{"change_disc", ui.actionToolbarChangeDisc},
+		{"screenshot", ui.actionToolbarScreenshot},
+		{"load_state", ui.actionToolbarLoadState},
+		{"save_state", ui.actionToolbarSaveState},
+		{"fullscreen", ui.actionToolbarFullscreen},
+		{"settings", ui.actionToolbarSettings},
+		{"game_settings", ui.actionViewGameProperties},
+		{"controller_settings", ui.actionToolbarControllerSettings},
+		{"hotkey_settings", ui.actionToolbarHotkeySettings},
+		{"debugger", ui.actionDebugger},
+	};
+}
+
+void MainWindow::rebuildToolbar()
+{
+	std::string layout_str = Host::GetBaseStringSettingValue("UI", "ToolbarItems", DEFAULT_TOOLBAR_LAYOUT);
+	if (layout_str.empty())
+		layout_str = DEFAULT_TOOLBAR_LAYOUT;
+
+	const auto registry = getToolbarActionRegistry(m_ui);
+	QHash<QString, QAction*> action_map;
+	for (const auto& item : registry)
+	{
+		if (item.action)
+			action_map.insert(QString::fromUtf8(item.id), item.action);
+	}
+
+	m_ui.toolBar->clear();
+
+	const QStringList items = QString::fromStdString(layout_str).split(QLatin1Char(','), Qt::KeepEmptyParts);
+	for (const QString& item_id : items)
+	{
+		const QString trimmed_id = item_id.trimmed();
+		if (trimmed_id.isEmpty())
+		{
+			m_ui.toolBar->addSeparator();
+		}
+		else
+		{
+			if (QAction* act = action_map.value(trimmed_id, nullptr); act != nullptr)
+			{
+				m_ui.toolBar->addAction(act);
+			}
+		}
+	}
+
+	updateEmulationActions(s_vm_valid, s_vm_valid, false);
+}
+
+void MainWindow::onCustomizeToolbarTriggered()
+{
+	ToolbarCustomizationDialog dlg(this, getToolbarActionRegistry(m_ui));
+	if (dlg.exec() == QDialog::Accepted)
+		rebuildToolbar();
+}
+
+void MainWindow::onToolbarContextMenuRequested(const QPoint& pos)
+{
+	QMenu menu(m_ui.toolBar);
+
+	menu.addAction(m_ui.actionViewLockToolbar);
+	menu.addAction(m_ui.actionCustomizeToolbar);
+
+	menu.exec(m_ui.toolBar->mapToGlobal(pos));
+}
+
 void MainWindow::onViewStatusBarActionToggled(bool checked)
 {
 	Host::SetBaseBoolSettingValue("UI", "ShowStatusBar", checked);
@@ -2067,6 +2175,24 @@ void MainWindow::onToolsCoverDownloaderTriggered()
 	CoverDownloadDialog dlg(this);
 	connect(&dlg, &CoverDownloadDialog::coverRefreshRequested, m_game_list_widget, &GameListWidget::refreshGridCovers);
 	dlg.exec();
+}
+
+void MainWindow::onToolsArcadeSetupTriggered()
+{
+	VMLock lock(pauseAndLockVM());
+	ArcadeLaunch::ShowSetup(lock.getDialogParent());
+}
+
+void MainWindow::onToolsControllerTesterTriggered()
+{
+	const std::string path = Path::Combine(EmuFolders::Cache, "padtest_ps2.elf");
+	if (!FileSystem::FileExists(path.c_str()) &&
+		!QtHost::DownloadFile(this, tr("Downloading Controller Tester"), CONTROLLER_TESTER_URL, path))
+	{
+		return;
+	}
+
+	startFile(QString::fromStdString(path));
 }
 
 #if !defined(__APPLE__)
@@ -2425,12 +2551,6 @@ void MainWindow::showEvent(QShowEvent* event)
 {
 	QMainWindow::showEvent(event);
 
-	// This is a bit silly, but for some reason resizing *before* the window is shown
-	// gives the incorrect sizes for columns, if you set the style before setting up
-	// the rest of the window... so, instead, let's just force it to be resized on show.
-	if (isShowingGameList())
-		m_game_list_widget->resizeTableViewColumnsToFit();
-
 #ifdef ENABLE_RAINTEGRATION
 	if (Achievements::IsUsingRAIntegration())
 		Achievements::RAIntegration::MainWindowChanged((void*)winId());
@@ -2557,6 +2677,11 @@ bool MainWindow::startFile(const QString& filename)
 
 		g_emu_thread->setELFOverride(filename);
 		switchToEmulationView();
+	}
+	else if (VMManager::IsArcadeGameFileName(filename_str))
+	{
+		// An arcade game is a different board, not a different disc: it starts from nothing.
+		QMessageBox::critical(this, tr("Error"), tr("Cannot start an arcade game without shutting down the current game first."));
 	}
 	else if (VMManager::IsGSDumpFileName(filename_str))
 	{
@@ -2981,7 +3106,6 @@ void MainWindow::destroyDisplayWidget(bool show_game_list)
 		if (show_game_list)
 		{
 			m_ui.mainContainer->setCurrentIndex(0);
-			m_game_list_widget->resizeTableViewColumnsToFit();
 		}
 	}
 
@@ -3534,6 +3658,13 @@ void MainWindow::populateLoadStateMenu(QMenu* menu, const QString& filename, con
 			QtUtils::MarkActionAsDefault(action);
 			has_any_states = true;
 		}
+	}
+
+	// Autosaves are load-only: they are not slots, and nothing here saves into one.
+	for (const Autosave::Entry& autosave : Autosave::List(game_serial_utf8.constData(), crc))
+	{
+		action = menu->addAction(tr("Load Autosave %1 (%2)").arg(autosave.index).arg(formatTimestampForSaveStateMenu(autosave.modified)));
+		connect(action, &QAction::triggered, [this, filename, path = QString::fromStdString(autosave.path)]() { loadSaveStateFile(filename, path); });
 	}
 
 	for (s32 i = 1; i <= VMManager::NUM_SAVE_STATE_SLOTS; i++)

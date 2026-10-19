@@ -276,6 +276,24 @@ object HiddenGames {
     }
 }
 
+/** Library toggle (the ⋮ menu's Arcade games only): the library shows only the Namco System 246/256
+ *  arcade games, or every game. Kept across launches. */
+object ArcadeOnly {
+    private const val KEY = "library.arcadeOnly"
+    val enabled = mutableStateOf(false)
+    fun load() {
+        enabled.value = MainActivityRuntime.prefs.getBoolean(KEY, false)
+    }
+    fun set(value: Boolean) {
+        enabled.value = value
+        MainActivityRuntime.prefs.edit().putBoolean(KEY, value).apply()
+    }
+    /** Whether [game] is an arcade game: what the library badges as one. */
+    fun isArcade(game: GameInfo): Boolean = game.extension == com.armsx2.arcade.Arcade.BADGE
+    /** Whether [game] stays in the library: any game while this is off, an arcade one while it is on. */
+    fun shows(game: GameInfo): Boolean = !enabled.value || isArcade(game)
+}
+
 /**
  * Library toggle: show the game title under each cover on the shelves. Off by
  * default — the cover already carries the title and a label under every card
@@ -424,6 +442,7 @@ data class GameInfo(
     val discCoverUrl: String? get() = serial?.let { coverUrlFor(it) }
 
     private fun coverUrlFor(s: String): String {
+        arcadeCoverUrl(s)?.let { return it }
         val repo = when (platform) {
             GamePlatform.PS2 -> "ps2-covers"
             GamePlatform.PS1 -> "psx-covers"
@@ -482,15 +501,12 @@ object CustomCovers {
     /** Bumped on set/remove so cover tiles re-resolve. */
     val version = mutableStateOf(0)
 
-    // MainActivityRuntime.assetCopyRoot() can flip between the chosen system dir and the
-    // app-private fallback depending on a transient write-probe — so covers got
-    // stored under one root and looked up under another ("sometimes there,
-    // sometimes not"). Cache the covers root on first resolve so set + load always
-    // agree, and share this exact cache with the library cover loader.
-    @Volatile
-    private var cachedCoversRoot: File? = null
+    // Not cached. This used to remember the first answer because assetCopyRoot re-ran a write
+    // check on every call and could flip between the chosen folder and app-private storage.
+    // It now returns the folder pinned at startup, and a cache filled before startup finished
+    // would hold on to the wrong one.
     fun coversRoot(context: Context): File =
-        cachedCoversRoot ?: File(MainActivityRuntime.assetCopyRoot(context), "covers").also { cachedCoversRoot = it }
+        File(MainActivityRuntime.assetCopyRoot(context), "covers")
 
     private fun dir(context: Context): File = File(coversRoot(context), "custom")
 
@@ -498,10 +514,13 @@ object CustomCovers {
         game.uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':')
             ?.substringBeforeLast('.')?.trim()?.takeIf { it.isNotEmpty() }
 
-    /** Names the user might give the cover file, highest priority first. */
+    /** Names the user might give the cover file, highest priority first. The ROM filename comes
+     *  first: it is the one key two versions of a game don't share. GTA: San Andreas v1.03 and
+     *  v3.00 are both SLUS-20946, so a cover keyed by serial showed on both (#517). A cover named
+     *  by serial still applies to every version that has none of its own. */
     private fun keys(game: GameInfo): List<String> = buildList {
-        game.serial?.takeIf { it.isNotBlank() }?.let { add(it) }
         filenameStem(game)?.let { add(it) }
+        game.serial?.takeIf { it.isNotBlank() }?.let { add(it) }
         game.title.takeIf { it.isNotBlank() }?.let { add(it) }
     }
 
@@ -531,17 +550,21 @@ object CustomCovers {
      *  (does its own listing) — used off the scroll path. */
     fun fileFor(context: Context, game: GameInfo): File? = matchIn(loadAll(context), game)
 
-    /** Path the in-app picker writes to (serial if present, else ROM filename). */
+    /** Path the in-app picker writes to: the ROM filename, so the cover belongs to this file
+     *  alone (see [keys]); the serial or title only when there is no filename. */
     private fun targetFor(context: Context, game: GameInfo): File {
-        val key = game.serial?.takeIf { it.isNotBlank() }
-            ?: filenameStem(game) ?: game.title.ifBlank { "cover" }
+        val key = filenameStem(game)
+            ?: game.serial?.takeIf { it.isNotBlank() } ?: game.title.ifBlank { "cover" }
         return File(dir(context), sanitize(key) + ".png")
     }
 
-    /** Copy [source] in as [game]'s cover, replacing any prior one. */
+    /** Copy [source] in as [game]'s cover, replacing its own prior one in any format. Only its
+     *  own: the cover showing may be a serial-named one that other versions of the game use. */
     fun set(context: Context, game: GameInfo, source: Uri): Boolean = runCatching {
-        remove(context, game)
         val target = targetFor(context, game)
+        dir(context).listFiles()
+            ?.filter { it.isFile && it.nameWithoutExtension.equals(target.nameWithoutExtension, ignoreCase = true) }
+            ?.forEach { it.delete() }
         target.parentFile?.mkdirs()
         context.contentResolver.openInputStream(source)?.use { ins ->
             target.outputStream().use { outs -> ins.copyTo(outs) }
@@ -557,6 +580,22 @@ object CustomCovers {
     private fun sanitize(s: String): String =
         s.replace(Regex("""[/\\:*?"<>|\n\r\t]"""), "_").trim().ifEmpty { "cover" }
 }
+
+/** A Namco System 246/256 game's ID, which is its serial (Arcade's, kept here so a cover lookup never
+ *  touches Arcade and its Compose state). */
+private val ARCADE_GAME_ID = Regex("NM\\d{5}")
+
+/** A Namco System 246/256 game's cover (its NM game ID) in ARMSX2's own arcade covers, in the chosen
+ *  style: its real art on a PS2-style case insert, flat or as a case like the PS2 ones. Null for any
+ *  other serial. Friends' Discord rows use it too, so an arcade game looks the same there. */
+internal fun arcadeCoverUrl(serial: String): String? = when {
+    !ARCADE_GAME_ID.matches(serial) -> null
+    CoverArtStyle.use3d.value -> "$ARCADE_COVERS/3d/$serial.png"
+    else -> "$ARCADE_COVERS/$serial.jpg"
+}
+
+/** ARMSX2's arcade covers, on bmd's arcade server: <game ID>.jpg flat, 3d/<game ID>.png as a case. */
+private const val ARCADE_COVERS = "https://arcade.ps2ktxpak.net/arcade-covers"
 
 /** Map a PS1/PS2 serial prefix to a region label. */
 // GameDB region cache (serial -> mapped label, or "" = looked up & not in DB / no JNI).

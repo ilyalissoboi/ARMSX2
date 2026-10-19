@@ -33,10 +33,9 @@ public:
 	int pixels;
 	int counter;
 	u8 scanmsk_value;
-	/// Splitting a draw by scanline is only a split of MEMORY while the draw stays
-	/// inside its buffer's page row; past it the addressing folds onto the rows a
-	/// page below and two workers own the same bytes. Set for those draws: the
-	/// rasterizer list runs them whole, alone, on one thread.
+	/// Set when the draw reaches past its buffer's page row, where addressing folds
+	/// onto rows a page away and two workers could write the same bytes. The
+	/// rasterizer list runs such draws whole, alone, on one thread.
 	bool serial;
 
 	GSScanlineGlobalData global;
@@ -116,16 +115,24 @@ protected:
 	using DrawEdgeLinePtr = void (GSRasterizer::*)(const GSVertexSW&, const GSVertexSW&, const GSVertexSW&);
 	static const DrawEdgeLinePtr m_draw_edge_line[2][2][2][2];
 
+	// ledge: the section's left edge's top vertex, where the attribute plane is
+	// evaluated. Position and depth still use p0.
 #if _M_SSE >= 0x501
-	__forceinline void DrawTriangleSection(int top, int bottom, int prim_top, GSVertexSW2& RESTRICT edge, const GSVertexSW2& RESTRICT dedge, const GSVertexSW2& RESTRICT dscan, const GSVector4& RESTRICT p0);
+	__forceinline void DrawTriangleSection(int top, int bottom, int prim_top, GSVertexSW2& RESTRICT edge, const GSVertexSW2& RESTRICT dedge, const GSVertexSW2& RESTRICT dscan, const GSVector4& RESTRICT p0, const GSVertexSW2& RESTRICT ledge);
 #else
-	__forceinline void DrawTriangleSection(int top, int bottom, int prim_top, GSVertexSW& RESTRICT edge, const GSVertexSW& RESTRICT dedge, const GSVertexSW& RESTRICT dscan, const GSVector4& RESTRICT p0);
+	__forceinline void DrawTriangleSection(int top, int bottom, int prim_top, GSVertexSW& RESTRICT edge, const GSVertexSW& RESTRICT dedge, const GSVertexSW& RESTRICT dscan, const GSVector4& RESTRICT p0, const GSVertexSW& RESTRICT ledge);
 #endif
 
 	void DrawEdge(const GSVertexSW& v0, const GSVertexSW& v1, const GSVertexSW& dv, int orientation, int side);
 
 	__forceinline void AddScanline(GSVertexSW* e, int pixels, int left, int top, const GSVertexSW& scan);
-	__forceinline void Flush(const GSVertexSW* vertex, const u16* index, const GSVertexSW& dscan, bool edge = false);
+
+	/// Wraps m_setup_prim and marks the colour walk tables stale for a primitive
+	/// with a walk (GSColourWalk.h). `cwalk_live` is true only for a triangle's main
+	/// pass; lines, points, sprites and the AA1 edge pass have no walk and take
+	/// zeroed tables, which carry over from one walkless primitive to the next.
+	__forceinline void SetupPrim(const GSVertexSW* vertex, const u16* index, const GSVertexSW& dscan, bool cwalk_live);
+	__forceinline void Flush(const GSVertexSW* vertex, const u16* index, const GSVertexSW& dscan, bool cwalk_live, bool edge = false);
 
 	__forceinline void DrawScanline(int pixels, int left, int top, const GSVertexSW& scan);
 	__forceinline void DrawEdge(int pixels, int left, int top, const GSVertexSW& scan);
@@ -153,10 +160,8 @@ public:
 	virtual int GetPixels(bool reset = true) = 0;
 	virtual void PrintStats() = 0;
 
-	/// Are rows `page_height` apart owned by different workers? That is the whole
-	/// question behind GSRasterizerData::serial: a draw reaching past its buffer's
-	/// page row writes the bytes of the rows exactly one page below, so it is safe
-	/// to split by scanline only when those rows come back to the same worker.
+	/// Are rows `page_height` apart owned by different workers? If so, a draw
+	/// past its buffer's page row must run serially (GSRasterizerData::serial).
 	virtual bool RowsFoldAcrossWorkers(int page_height) const = 0;
 };
 
@@ -190,9 +195,8 @@ protected:
 	// Worker threads depend on the rasterizers, so don't change the order.
 	std::vector<std::unique_ptr<GSRasterizer>> m_r;
 	std::vector<std::unique_ptr<GSWorker>> m_workers;
-	// Configured as if it were alone, so it takes every scanline. Serial draws run
-	// on it, on the GS thread, with the workers drained -- which makes them the
-	// single-threaded arm exactly, not an approximation of it.
+	// Owns every scanline. Serial draws run on it, on the GS thread, with the
+	// workers drained.
 	std::unique_ptr<GSRasterizer> m_serial;
 	u8* m_scanline;
 	int m_thread_height;

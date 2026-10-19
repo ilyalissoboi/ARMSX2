@@ -112,7 +112,12 @@ public:
 
 		HashCacheKey();
 
-		static HashCacheKey Create(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const u32* clut, const GSVector2i* lod, SourceRegion region);
+		/// `raw_blocks` lets a paletted window (T8, T4, T8H, T4HL, T4HH) that is at least one block in each
+		/// direction be hashed from the bytes of its blocks as they sit in local memory, instead of from the
+		/// texels they unswizzle to. Two windows with the same raw key have the same texels, so it is as good
+		/// a cache key, and it needs no unswizzle. It is not the texel hash, which names texture pack files
+		/// and upscaler results, so a lookup for those passes false and gets the texel hash.
+		static HashCacheKey Create(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const u32* clut, const GSVector2i* lod, SourceRegion region, bool raw_blocks);
 
 		HashCacheKey WithRemovedCLUTHash() const;
 		void RemoveCLUTHash();
@@ -136,9 +141,56 @@ public:
 		std::pair<u8, u8> alpha_minmax;
 		bool valid_alpha_minmax;
 		bool is_replacement;
+
+		/// The texture is an upscale the texture upscaler generated, not a texture pack's.
+		bool generated = false;
+
+		/// The guest's own texels, uploaded the first time a draw reads this texture as colours
+		/// (GetNativeTexture). Owned by the entry; null until then and for any other entry.
+		GSTexture* native = nullptr;
 	};
 
 	using HashCacheMap = std::unordered_map<HashCacheKey, HashCacheEntry, HashCacheKeyHash>;
+
+	/// What HashCacheKey::Create did with the memo of texture hashes of this cache.
+	struct HashMemoStats
+	{
+		u64 lookups = 0; ///< Texture hashes asked for of a texture large enough to be memoised.
+		u64 hits = 0; ///< Answered by the memo, without reading local memory.
+		u64 stale = 0; ///< Had a memo entry whose pages were written since.
+	};
+
+	/// What verify mode found. Totals over every cache of the process.
+	struct HashMemoVerifyReport
+	{
+		u64 hits = 0; ///< Memo hits whose hash was computed afresh and compared.
+		u64 mismatches = 0; ///< Of those, how many differed.
+		u64 sweeps = 0; ///< Frame boundaries at which the pages of local memory were hashed.
+		u64 missed_writers = 0; ///< Pages whose bytes changed between two sweeps with no mark in between.
+	};
+
+	/// A 64-bit hash for each 256-byte block of local memory, kept valid by the hash-dirty bitmap of
+	/// GSLocalMemory (see HashCacheKey::Create). Defined in the .cpp.
+	struct BlockHashCache;
+
+	/// What the block hash cache did, over every cache of the process.
+	struct BlockHashStats
+	{
+		u64 levels = 0; ///< Texture levels keyed through the cache.
+		u64 blocks = 0; ///< Blocks of those levels.
+		u64 rehashed = 0; ///< Of those, how many had to be hashed (their hash-dirty bit was set), or were masked H-format blocks.
+	};
+
+	/// What -verify-block-hash found. Totals over every cache of the process.
+	struct BlockHashVerifyReport
+	{
+		u64 levels = 0; ///< Levels whose cached block hashes were each compared with a fresh hash.
+		u64 blocks = 0; ///< Blocks compared.
+		u64 stale_blocks = 0; ///< Of those, how many cached hashes differed: a store into local memory that was not marked.
+		u64 lookups = 0; ///< Keys whose cached form was compared with the form without the cache.
+		u64 extra_misses = 0; ///< Lookups where two windows had one key without the cache and two with it: a hit lost.
+		u64 false_hits = 0; ///< Lookups where two windows had one key with the cache and two without it: a wrong texture.
+	};
 
 	class Surface : public GSAlignedClass<32>
 	{
@@ -462,6 +514,42 @@ protected:
 	u64 m_hash_cache_memory_usage = 0;
 	u64 m_hash_cache_replacement_memory_usage = 0;
 
+	/// The last hash of each texture and the write sequence of local memory it was taken at, so that
+	/// HashCacheKey::Create can reuse it while no page the texture reads has been written since. Direct
+	/// mapped, a fixed array: a lookup is a few compares and no allocation. Lives and dies with the cache,
+	/// as the local memory its sequence belongs to does with the renderer.
+	static constexpr u32 HASH_MEMO_ENTRIES = 32;
+	static constexpr u32 HASH_MEMO_MAX_LEVELS = 8; // the base level and the six mipmaps below it
+	/// Smallest base level that is memoised, in blocks of 256 bytes: 128 KiB of local memory read per hash.
+	static constexpr int HASH_MEMO_MIN_BLOCKS = 512;
+	struct HashMemoEntry
+	{
+		u64 seq; ///< GSLocalMemory::WriteSeq() before the hash was computed.
+		HashType hash;
+		u64 texa; ///< The TEXA bits the hash reads.
+		u64 region; ///< SourceRegion::bits of the base level.
+		u64 tex0[HASH_MEMO_MAX_LEVELS]; ///< Per level, the TEX0 bits the hash reads.
+		u32 levels; ///< Number of levels hashed. 0 in an empty entry.
+		bool raw_blocks; ///< The hash was allowed to read raw blocks (HashCacheKey::Create), which is a different hash.
+		bool block_hash_cache; ///< The raw levels were keyed through the block hash cache, which is another hash again.
+	};
+	struct HashMemo
+	{
+		HashMemoEntry entries[HASH_MEMO_ENTRIES] = {};
+		HashMemoStats stats;
+	};
+	HashMemo m_hash_memo;
+
+	static inline bool s_hash_memo_verify = false;
+	struct HashMemoSweep;
+	std::unique_ptr<HashMemoSweep> m_hash_memo_sweep;
+
+	/// The block hash cache of this texture cache, made at the first lookup that needs it.
+	std::unique_ptr<BlockHashCache> m_block_hash_cache;
+	BlockHashCache& SyncBlockHashCache(GSLocalMemory& mem);
+	static inline bool s_block_hash_cache_enabled = true;
+	static inline bool s_block_hash_verify = false;
+
 	FastList<Target*> m_dst[2];
 	FastList<TargetHeightElem> m_target_heights;
 	u64 m_target_memory_usage = 0;
@@ -561,14 +649,107 @@ protected:
 		bool m_clear = true;
 	};
 public:
+	/// Converts one native coordinate to the device grid. Native pixel n owns device pixels
+	/// [ceil(n * scale), ceil((n + 1) * scale)), which is where the rasteriser puts it, so the
+	/// conversion ceils. This is the one place that rule lives; everything in the cache scales
+	/// through it rather than open-coding a multiply that truncates. Also the device size of a
+	/// texture whose native size is `native`, since that is a span starting at 0.
+	static int ScaleNativeToDevice(int native, float scale);
+
+	/// The device length of the native span [start, start + length): the difference of its two
+	/// edges' device positions. Not ScaleNativeToDevice(length), which is the length of a span
+	/// starting at native 0; at a fractional scale the two differ by up to a device pixel.
+	static int ScaleNativeSpanToDevice(int start, int length, float scale);
+
+	/// The device rectangles a native w x h move from (sx, sy) to (dx, dy) copies between. Each
+	/// starts at its native corner's first owned device pixel. Both have the same size, since a
+	/// copy cannot stretch, and that size is the smaller of the two owned spans per axis: at a
+	/// fractional scale the source and destination spans can differ by one device pixel, and
+	/// taking the larger would read a pixel the source does not own or write one the destination
+	/// does not own.
+	struct DeviceMove
+	{
+		GSVector4i src;
+		GSVector4i dst;
+	};
+	static DeviceMove ScaleMoveToDevice(int sx, int sy, int dx, int dy, int w, int h, float scale);
+
 	GSTextureCache();
 	~GSTextureCache();
 
 	__fi u64 GetHashCacheMemoryUsage() const { return m_hash_cache_memory_usage; }
 	__fi u64 GetHashCacheReplacementMemoryUsage() const { return m_hash_cache_replacement_memory_usage; }
 	__fi u64 GetTotalHashCacheMemoryUsage() const { return (m_hash_cache_memory_usage + m_hash_cache_replacement_memory_usage); }
+	__fi size_t GetHashCacheEntryCount() const { return m_hash_cache.size(); }
 	__fi u64 GetSourceMemoryUsage() const { return m_source_memory_usage; }
 	__fi u64 GetTargetMemoryUsage() const { return m_target_memory_usage; }
+	__fi const HashMemoStats& GetHashMemoStats() const { return m_hash_memo.stats; }
+
+	/// Verify mode for the hash memo and the write stamps (pcsx2-gsrunner -verify-hash-memo), off by default.
+	/// While it is on, every memo hit also hashes the texture afresh and compares, and VerifyWriteStamps()
+	/// finds stores into local memory that nothing marked. Neither changes what the renderer does.
+	static void SetHashMemoVerify(bool enable);
+	static bool IsHashMemoVerify() { return s_hash_memo_verify; }
+	static HashMemoVerifyReport GetHashMemoVerifyReport();
+	/// Hashes every page of `mem` and reports each page whose bytes changed since the previous call while
+	/// its stamp did not, which is a store that was not marked. Call at a frame boundary, on the thread that
+	/// writes `mem`, with no writer in flight.
+	void VerifyWriteStamps(const GSLocalMemory& mem);
+
+	/// The per-block hash cache. A paletted window that is keyed from the bytes of its blocks (see
+	/// HashCacheKey::Create) is keyed from a hash of each block's hash, and the hash of a block is computed
+	/// when its hash-dirty bit in GSLocalMemory is set and kept until it is set again, so a window that was
+	/// looked up last frame costs the blocks written since, and not all of its bytes. Every lookup of such a
+	/// window, on every backend, relies on the marks of the writers of local memory to be complete.
+	///
+	/// On by default. Off, a window is keyed by one hash of its raw blocks, with no cache (gsrunner
+	/// -block-hash-cache off, to check a suspect title without a rebuild). The two keys of a window differ,
+	/// and two windows have one key if and only if they have one in the other, so which is in use changes no
+	/// pixel and no hit.
+	static void SetBlockHashCacheEnabled(bool enable) { s_block_hash_cache_enabled = enable; }
+	static bool IsBlockHashCacheEnabled() { return s_block_hash_cache_enabled; }
+
+	/// Verify mode for the block hash cache (pcsx2-gsrunner -verify-block-hash), off by default. While it is
+	/// on, every level keyed through the cache has each of its blocks hashed afresh and compared with the
+	/// cached hash, the key is also made without the cache, and the two forms must agree on which windows are
+	/// one. The memo of texture hashes is not consulted, so every lookup is checked. Neither changes what the
+	/// renderer does.
+	static void SetBlockHashVerify(bool enable);
+	static bool IsBlockHashVerify() { return s_block_hash_verify; }
+	static BlockHashVerifyReport GetBlockHashVerifyReport();
+	static BlockHashStats GetBlockHashStats();
+
+	/// How much AgeHashCache keeps. Entries unused for 30 frames go regardless; past these limits the oldest
+	/// unreferenced entries go first. An entry's memory is its texture's, a replacement or an upscale counted
+	/// the same as a texture of the guest's own texels.
+	struct HashCacheLimits
+	{
+		/// Entries are never dropped for memory while there are no more than this many (the limit the cache had
+		/// before there was a memory limit), so a title keeps at least what it always did.
+		u32 floor_entries = 800;
+		/// The most entries kept, whatever they hold. 0 = no limit.
+		u32 max_entries = 1600;
+		/// The most bytes of textures kept above `floor_entries` entries. 0 = no limit.
+		u64 max_bytes = 128ull << 20;
+	};
+	static void SetHashCacheLimits(const HashCacheLimits& limits);
+	static HashCacheLimits GetHashCacheLimits();
+
+	/// The most the hash cache has held at the end of a frame (just before AgeHashCache drops anything), over
+	/// every cache of the process, and the same moment's total of the memory the renderer accounts for.
+	struct HashCacheStats
+	{
+		u64 peak_entries = 0;
+		u64 peak_bytes = 0; ///< The textures of the entries: GetTotalHashCacheMemoryUsage().
+		u64 peak_total_bytes = 0; ///< Targets, sources, hash cache and the device's texture pool.
+		u64 frames = 0; ///< Frames sampled.
+		u64 sum_bytes = 0; ///< Sum of the per-frame bytes, for the mean.
+	};
+	static HashCacheStats GetHashCacheStats();
+
+	/// The block hash of `block` of `mem`: of its 256 bytes, hashed now if its hash-dirty bit is set. The cache
+	/// is bound to the memory by GSLocalMemory::Id(); a different memory than the last one invalidates it.
+	u64 BlockHash(GSLocalMemory& mem, u32 block);
 
 	void Read(Target* t, const GSVector4i& r, bool force_synchronous = false);
 	void Read(Source* t, const GSVector4i& r);
@@ -685,7 +866,15 @@ public:
 	void InvalidateTemporaryZ();
 
 	/// Injects a texture into the hash cache, by using GSTexture::Swap(), transitively applying to all sources. Ownership of tex is transferred.
-	void InjectHashCacheTexture(const HashCacheKey& key, GSTexture* tex, const std::pair<u8, u8>& alpha_minmax);
+	/// generated says it is an upscale made by the texture upscaler rather than a pack texture.
+	void InjectHashCacheTexture(const HashCacheKey& key, GSTexture* tex, const std::pair<u8, u8>& alpha_minmax, bool generated);
+
+	/// The unscaled texture for a source whose hash cache texture is a generated upscale, for a draw
+	/// that reads texels as colours (GSTexelAddressedDraw.h). It is uploaded from guest memory on
+	/// the first call and kept with the hash cache entry. Returns null for any other source, and
+	/// when the upload fails. Not valid across a change to the guest's texture or palette: call it
+	/// from the draw that looked the source up.
+	GSTexture* GetNativeTexture(const Source* s);
 };
 
 extern std::unique_ptr<GSTextureCache> g_texture_cache;

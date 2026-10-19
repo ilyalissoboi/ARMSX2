@@ -1,10 +1,12 @@
 // [P63] Stubs for macOS native build — symbols not available without full UI
 #include <TargetConditionals.h>
+#include <cstring>
 #if !TARGET_OS_IPHONE
 
 #include "Host.h"
 #include "VMManager.h"
 #include "Input/InputManager.h"
+#include "IopThread/OwnerAsserts.h"
 #include "DEV9/pcap_io.h"
 #include "Achievements.h"
 #include "common/HTTPDownloader.h"
@@ -49,7 +51,7 @@ INISettingsInterface* g_p44_settings_interface = nullptr;
 
 // --- Host functions (declared in Host.h) ---
 bool Host::InNoGUIMode() { return true; }
-void Host::RunOnCPUThread(std::function<void()> f, bool b) { if (f) f(); }
+void Host::RunOnCPUThread(std::function<void()> f, bool b) { BLOCKING_HOST_CALL_ASSERT(b); if (f) f(); }
 void Host::RequestVMShutdown(bool a, bool b, bool c) {}
 bool Host::RequestResetSettings(bool a, bool b, bool c, bool d, bool e) { return false; }
 void Host::CancelGameListRefresh() {}
@@ -168,9 +170,14 @@ void Discord_RegisterSteamGame(const char* applicationId, const char* steamId) {
 #include "GS/GS.h"
 #include "Input/InputManager.h"
 
-// g_host_hotkeys - normally defined in pcsx2-qt, empty on iOS
+// g_host_hotkeys - normally defined in pcsx2-qt, empty on iOS. Not in a
+// libretro core, which defines its own in pcsx2-libretro/Main.cpp: this is a
+// frontend definition, and the core is the frontend there. Two of them is one
+// duplicate symbol at link, which is what the first iOS core build stopped on.
+#ifndef ENABLE_LIBRETRO
 BEGIN_HOTKEY_LIST(g_host_hotkeys)
 END_HOTKEY_LIST()
+#endif
 
 #endif // !TARGET_OS_IPHONE
 

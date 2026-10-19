@@ -288,7 +288,8 @@ namespace ImGuiFullscreen
 	{
 		None,
 		Numeric,
-		IPAddress
+		IPAddress,
+		Password ///< Anything, shown as one star per character.
 	};
 
 	void OpenInputStringDialog(
@@ -312,6 +313,8 @@ namespace ImGuiFullscreen
 	float GetNotificationVerticalDirection();
 	void SetNotificationVerticalPosition(float position, float direction);
 	void SetNotificationPosition(float horizontal_position, float vertical_position, float direction);
+	/// Size of notification popups relative to the normal layout, 1.0 = stock.
+	void SetNotificationScale(float scale);
 
 	void OpenProgressDialog(const char* str_id, std::string message, s32 min, s32 max, s32 value);
 	void UpdateProgressDialog(const char* str_id, std::string message, s32 min, s32 max, s32 value);

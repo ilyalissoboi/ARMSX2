@@ -6,6 +6,7 @@
 #include "VMManager.h"
 #include "Elfheader.h"
 #include "Cache.h"
+#include "EECycleRate.h"
 #include "ee_divtrace.h"
 #include "no-jit-improvements.h"
 
@@ -43,7 +44,7 @@ void intChargeSkippedHandlerCycles(u32 raw_block_cycles)
 void intUpdateCPUCycles()
 {
 	const bool lowcycles = (cpuBlockCycles <= 40);
-	const s8 cyclerate = EmuConfig.Speedhacks.EECycleRate;
+	const s8 cyclerate = EECycleRate::GetEffective();
 	u32 scale_cycles = 0;
 
 	if (cyclerate == 0 || lowcycles || cyclerate < -99 || cyclerate > 3)
@@ -75,6 +76,26 @@ void intUpdateCPUCycles()
 	}
 }
 
+#ifdef PCSX2_RECOMPILER_TESTS
+// Test-only counterpart of recEeScaleBlockCyclesForTest: the interpreter keeps
+// its own hand-written copy of the same seven formulas, so the characterization
+// table drives both and requires them to agree. Restores cpuBlockCycles and
+// cpuRegs.cycle.
+u32 intScaleBlockCyclesForTest(u32 raw_block_cycles, u32* out_remainder)
+{
+	const u32 saved_block = cpuBlockCycles;
+	const u32 saved_cycle = cpuRegs.cycle;
+	cpuBlockCycles = raw_block_cycles;
+	intUpdateCPUCycles();
+	const u32 charge = cpuRegs.cycle - saved_cycle;
+	if (out_remainder)
+		*out_remainder = cpuBlockCycles;
+	cpuBlockCycles = saved_block;
+	cpuRegs.cycle = saved_cycle;
+	return charge;
+}
+#endif
+
 // These macros are used to assemble the repassembler functions
 
 void intBreakpoint(bool memcheck)
@@ -90,6 +111,9 @@ void intBreakpoint(bool memcheck)
 	{
 		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_EE, pc);
 		if (cond && !cond->Evaluate())
+			return;
+
+		if(!CBreakPoints::HandleBreakpointHit(BREAKPOINT_EE, pc))
 			return;
 	}
 
@@ -110,10 +134,10 @@ void intMemcheck(u32 op, u32 bits, bool store)
 	start = standardizeBreakpointAddress(start);
 	const u32 end = start + bits/8;
 
-	auto checks = CBreakPoints::GetMemChecks(BREAKPOINT_EE);
+	const auto checks = CBreakPoints::GetMemChecks(BREAKPOINT_EE);
 	for (size_t i = 0; i < checks.size(); i++)
 	{
-		auto& check = checks[i];
+		const auto& check = checks[i];
 
 		if (check.result == 0)
 			continue;
@@ -599,10 +623,15 @@ static void intReset()
 	NoJITImprovements::ResetEEBlockCache();
 }
 
+// The event test instance for the IOP thread mode in effect. The interpreter reaches it through this
+// pointer, which the IOP thread code sets with the mode; the JIT has the address baked into its
+// dispatcher instead and pays no load.
+CpuEventTestFn g_intEventTestShared = &_cpuEventTest_Shared<IopThreadMode::Off>;
+
 void intEventTest()
 {
 	// Perform counters, ints, and IOP updates:
-	_cpuEventTest_Shared();
+	g_intEventTestShared();
 
 	if (intExitExecution)
 	{

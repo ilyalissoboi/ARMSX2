@@ -25,6 +25,7 @@
 #include "Config.h"
 
 #include <gtest/gtest.h>
+#include <cstring>
 
 // EE-SRA 3 Arm C: VI-pool probe, defined in arm64/microVU-arm64.cpp
 // (PCSX2_RECOMPILER_TESTS builds only). Global scope — must be declared
@@ -1174,6 +1175,144 @@ TEST(EeVu0Cop2Macro, VclipSignedIntegerCompareWithNaNLane)
 	          h.Vu0InterpSnapshot().regs.VI[REG_CLIP_FLAG].UL);
 }
 
+// The bit layout and the denormal rule over the operand classes, rather than
+// the three discriminators above. The model is the same statement of the rule
+// vu_clip_flag_tests.cpp scores the micro path against: both operands flushed
+// when their exponent field is zero, then six strict signed comparisons. The
+// emitter reaches it the other way round -- fs untouched, the threshold raised
+// to the largest denormal pattern -- and below the smallest normal the two
+// reduce to the same answers, which is what this sweep has to hold.
+
+namespace {
+
+// Operand classes: both signs of each, because the threshold is |ft.w| and the
+// two per-lane tests are the two signs of fs. 2.0 and both its neighbours are
+// present against a 2.0 threshold, so the strict comparison is decided in both
+// directions.
+constexpr u32 kClipValues[] = {
+	0x00000000u, 0x80000000u, // zero
+	0x00000001u, 0x80000001u, // smallest denormal
+	0x007fffffu, 0x807fffffu, // largest denormal
+	0x00800000u, 0x80800000u, // smallest normal
+	0x3f800000u, 0xbf800000u, // 1.0
+	0x40000000u, 0xc0000000u, // 2.0
+	0x3fffffffu, 0xbfffffffu, // one ULP below it
+	0x40000001u, 0xc0000001u, // one ULP above it
+	0x40600000u, 0xc0600000u, // 3.5
+	0x7f7fffffu, 0xff7fffffu, // FLT_MAX
+	0x7f800000u, 0xff800000u, // the infinity encoding
+	0x7fc00000u, 0xffc00000u, // a quiet NaN encoding
+	0x7fffffffu, 0xffffffffu, // the VU FMAC ceiling
+};
+constexpr int kClipValueCount = static_cast<int>(std::size(kClipValues));
+
+constexpr u32 ClipFlush(u32 bits) { return (bits & 0x7f800000u) ? bits : 0u; }
+
+// bit0 = x > +|w|, bit1 = x < -|w|, bits 2/3 the same for y, 4/5 for z.
+u32 ClipBitsRef(u32 x, u32 y, u32 z, u32 w)
+{
+	const s32 threshold = static_cast<s32>(ClipFlush(w) & 0x7fffffffu);
+	const u32 lane[3] = {ClipFlush(x), ClipFlush(y), ClipFlush(z)};
+	u32 bits = 0;
+	for (int i = 0; i < 3; i++)
+	{
+		if (static_cast<s32>(lane[i]) > threshold)
+			bits |= 1u << (2 * i);
+		if (static_cast<s32>(lane[i] ^ 0x80000000u) > threshold)
+			bits |= 2u << (2 * i);
+	}
+	return bits;
+}
+
+// A 32-bit xorshift, so the case stream is the same on every standard library.
+struct ClipRng
+{
+	u32 s;
+	u32 Next() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
+};
+
+// Four VCLIPs, which is what the 24-bit flag retains, so one compile scores
+// four cases and the history shift on each. vuRegs[0].clipflag is the running
+// value the emitter folds into -- writing it here IS the incoming history.
+void RunClipQuad(const u32 (&x)[4], const u32 (&y)[4], const u32 (&z)[4],
+	const u32 (&w)[4], u32 seed)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	for (int i = 0; i < 4; i++)
+	{
+		h.SeedVu0VfBits(1u + static_cast<u32>(i) * 2u, x[i], y[i], z[i], 0u);
+		h.SeedVu0VfBits(2u + static_cast<u32>(i) * 2u, 0u, 0u, 0u, w[i]);
+	}
+	vuRegs[0].clipflag = seed;
+	h.LoadProgram({
+		VCLIP_C2(/*ft*/2, /*fs*/1),
+		VCLIP_C2(/*ft*/4, /*fs*/3),
+		VCLIP_C2(/*ft*/6, /*fs*/5),
+		VCLIP_C2(/*ft*/8, /*fs*/7),
+	});
+	h.Run();
+
+	u32 want = seed & 0xFFFFFFu;
+	for (int i = 0; i < 4; i++)
+		want = ((want << 6) | ClipBitsRef(x[i], y[i], z[i], w[i])) & 0xFFFFFFu;
+
+	EXPECT_EQ(h.GetVu0ViJit(REG_CLIP_FLAG), want) << "jit, seed " << seed;
+	EXPECT_EQ(h.GetVu0ViInterp(REG_CLIP_FLAG), want) << "interp, seed " << seed;
+}
+
+} // namespace
+
+// Every operand class against every threshold class, once per lane, so a
+// permuted or dropped clip bit has nowhere to hide.
+TEST(EeVu0Cop2Macro, VclipLaneAndThresholdClassesAgreeWithTheRule)
+{
+	u32 x[4], y[4], z[4], w[4];
+	int filled = 0;
+	u32 seed = 0x123456u;
+	for (int lead = 0; lead < 3; lead++)
+	{
+		for (int wi = 0; wi < kClipValueCount; wi++)
+		{
+			for (int vi = 0; vi < kClipValueCount; vi++)
+			{
+				u32 lane[3];
+				lane[lead] = kClipValues[vi];
+				lane[(lead + 1) % 3] = kClipValues[(vi + 7) % kClipValueCount];
+				lane[(lead + 2) % 3] = kClipValues[(vi + 13) % kClipValueCount];
+				x[filled] = lane[0]; y[filled] = lane[1]; z[filled] = lane[2];
+				w[filled] = kClipValues[wi];
+				if (++filled == 4)
+				{
+					RunClipQuad(x, y, z, w, seed);
+					seed = (seed * 1103515245u + 12345u) & 0xFFFFFFu;
+					filled = 0;
+				}
+			}
+		}
+	}
+	ASSERT_EQ(filled, 0) << "the class sweep must divide into whole quads";
+}
+
+// The same rule with the four lanes drawn independently.
+TEST(EeVu0Cop2Macro, VclipRandomOperandCombinationsAgreeWithTheRule)
+{
+	ClipRng rng{0xC0DEu};
+	for (int program = 0; program < 200; program++)
+	{
+		u32 x[4], y[4], z[4], w[4];
+		for (int i = 0; i < 4; i++)
+		{
+			x[i] = kClipValues[rng.Next() % kClipValueCount];
+			y[i] = kClipValues[rng.Next() % kClipValueCount];
+			z[i] = kClipValues[rng.Next() % kClipValueCount];
+			w[i] = kClipValues[rng.Next() % kClipValueCount];
+		}
+		RunClipQuad(x, y, z, w, rng.Next() & 0xFFFFFFu);
+	}
+}
+
 // Denormal ft.w forces value = 0x007FFFFF, and the previous clip flag shifts
 // left by 6 before the new bits merge. fs.x = 0x00800000 (smallest normal,
 // 0x00800000 > 0x007FFFFF as s32) sets +x; fs.y/z below the bound set nothing.
@@ -2148,6 +2287,58 @@ TEST(EeVu0Cop2Macro, PinnedTier1SurvivesMacroRoutedOps)
 	EXPECT_EQ(h.GetVu0ViJit(3), 6u);
 	for (char l : {'x', 'y', 'z', 'w'})
 		EXPECT_EQ(h.GetVu0VfBitsJit(8, l), h.GetVu0VfBitsInterp(8, l));
+}
+
+// x29 is the EE's $v0 pin and, in micro mode, microVU's pin for the VU's data
+// memory. A live $v0 has to come through every macro-routed memory op, which
+// emit inline in the EE block and must leave x29 alone, and through a VCALLMS
+// whose microprogram addresses VU0 memory off x29 under its own dispatcher,
+// which saves and restores the EE's value. The microprogram stores through a
+// vi00 base (the constant address) and through a live VI, and loads both back.
+TEST(EeVu0Cop2Macro, PinnedV0SurvivesMacroMemoryOpsAndMicroDispatch)
+{
+	EeRecTestHarness h;
+	h.EnableVu0Capture();
+	h.EnableCop1();
+	h.SeedVu0Vi(1, 5);  // VSQI address index
+	h.SeedVu0Vi(3, 5);  // VLQI readback index
+	h.SeedVu0Vi(5, 12); // VSQD / VLQD index (pre-decrement)
+	h.SeedVu0Vi(6, 12);
+	h.SeedVu0Vi(7, 30); // VISWR / VILWR address
+	h.SeedVu0Vi(9, 0x1234);
+	h.SeedVu0Vi(10, 40); // microprogram's live base
+	h.SeedVu0VfBits(2, 0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u);
+	h.SeedVu0VfBits(4, 0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u);
+	h.SeedVu0Microprogram(0, {
+		VuOp{vu::VSQ_L(vu::mask::xyzw, /*fs*/4, vu::vi::vi0, 20), vu::VNOP_U()},
+		VuOp{vu::VSQ_L(vu::mask::xyzw, /*fs*/2, vu::vi::vi10, 1), vu::VNOP_U()},
+		VuOp{vu::VLQ_L(vu::mask::xyzw, /*ft*/11, vu::vi::vi0, 20), vu::VNOP_U()},
+		VuOp{vu::VLQ_L(vu::mask::xyzw, /*ft*/12, vu::vi::vi10, 1), vu::VNOP_U()},
+		EBitNopPair(),
+	});
+	h.SetGpr64(reg::t0, 0x1111'2222'3333'4444ull);
+	h.LoadProgram({
+		DADDU(reg::v0, reg::t0, reg::t0),               // $v0 rides x29
+		VSQI_C2(mask_xyzw, /*fs*/2, /*it*/1),
+		VLQI_C2(mask_xyzw, /*ft*/8, /*is*/3),
+		VSQD_C2(mask_xyzw, /*fs*/4, /*it*/5),
+		VLQD_C2(mask_xyzw, /*ft*/9, /*is*/6),
+		VISWR_C2(mask_xyzw, /*it*/9, /*is*/7),
+		VILWR_C2(0x1u << 24, /*it*/8, /*is*/7),
+		VCALLMS(0),
+		DADDU(reg::t1, reg::v0, reg::t0),
+	});
+	h.Run();
+	EXPECT_EQ(h.GetGpr64Jit(reg::v0), 0x2222'4444'6666'8888ull);
+	EXPECT_EQ(h.GetGpr64Jit(reg::t1), 0x3333'6666'9999'CCCCull);
+	for (u32 r : {(u32)reg::v0, (u32)reg::t1})
+		EXPECT_EQ(h.GetGpr64Jit(r), h.GetGpr64Interp(r)) << "GPR " << r;
+	EXPECT_EQ(h.GetVu0ViJit(8), 0x1234u);
+	for (u32 f : {8u, 9u, 11u, 12u})
+		for (char l : {'x', 'y', 'z', 'w'})
+			EXPECT_EQ(h.GetVu0VfBitsJit(f, l), h.GetVu0VfBitsInterp(f, l)) << "vf" << f << "." << l;
+	EXPECT_EQ(h.GetVu0VfBitsJit(11, 'x'), 0x40a00000u);
+	EXPECT_EQ(h.GetVu0VfBitsJit(12, 'w'), 0x40800000u);
 }
 
 // =========================================================================
