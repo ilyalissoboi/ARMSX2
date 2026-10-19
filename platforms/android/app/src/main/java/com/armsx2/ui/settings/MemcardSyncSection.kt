@@ -26,7 +26,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -47,10 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.armsx2.i18n.str
 import com.armsx2.sync.MemcardSyncSettings
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * Memory card sync (emusync) in Settings > Network. Every change is stored at once and sync is
@@ -71,11 +67,12 @@ fun MemcardSyncSection() {
             return@CollapsibleSection
         }
         var values by remember { mutableStateOf(MemcardSyncSettings.load(context)) }
-        var starting by remember { mutableStateOf(false) }
+        // Restarts still queued or running (see MemcardSyncSettings.startAsync).
+        var pendingStarts by remember { mutableStateOf(0) }
+        val starting = pendingStarts > 0
         var error by remember { mutableStateOf<String?>(null) }
         var status by remember { mutableStateOf(MemcardSyncSettings.status()) }
         var running by remember { mutableStateOf(MemcardSyncSettings.isRunning()) }
-        val scope = rememberCoroutineScope()
 
         // The core updates its status from its own thread; a light poll while this is on screen.
         LaunchedEffect(Unit) {
@@ -86,14 +83,16 @@ fun MemcardSyncSection() {
             }
         }
 
+        // Not in a coroutine of this screen: a field saved as the section closes or the screen is
+        // left restarts sync too, and that restart must outlive the screen.
         fun restart() {
             values = MemcardSyncSettings.load(context)
-            starting = true
-            scope.launch {
-                error = withContext(Dispatchers.IO) { MemcardSyncSettings.start(context) }
+            pendingStarts++
+            MemcardSyncSettings.startAsync(context) { result ->
+                error = result
                 running = MemcardSyncSettings.isRunning()
                 status = MemcardSyncSettings.status()
-                starting = false
+                pendingStarts--
             }
         }
 
@@ -233,18 +232,27 @@ private fun SyncTextRow(
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
 
+    // What the field last saved. Leaving the screen ends editing twice (the field loses focus, then
+    // the row is disposed), and each save restarts sync, so the same text is saved only once.
+    var saved by remember(value) { mutableStateOf(value) }
     val latestText by rememberUpdatedState(text)
-    val latestValue by rememberUpdatedState(value)
     val latestCommit by rememberUpdatedState(onCommit)
     fun commit() {
         val trimmed = latestText.trim()
-        if (trimmed != latestValue) latestCommit(trimmed)
+        if (trimmed != saved) {
+            saved = trimmed
+            latestCommit(trimmed)
+        }
         // The secret field never holds what was saved; empty it again once it is stored.
-        if (secret) text = ""
+        if (secret) {
+            text = ""
+            saved = ""
+        }
     }
     // Leaving the screen mid-edit (Back, another tab) still saves what was typed.
+    val latestCommitRow by rememberUpdatedState(::commit)
     DisposableEffect(Unit) {
-        onDispose { if (latestText.trim() != latestValue) latestCommit(latestText.trim()) }
+        onDispose { latestCommitRow() }
     }
 
     // A pad user moving the selection off the row is done with it.

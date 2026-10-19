@@ -5,6 +5,8 @@ package com.armsx2.sync
 
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -12,6 +14,7 @@ import android.util.Log
 import com.armsx2.BuildConfig
 import java.io.File
 import java.security.KeyStore
+import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -32,8 +35,8 @@ import kr.co.iefriends.pcsx2.NativeApp
  * - emusync's own data (database and upload queue) lives in noBackupFilesDir/emusync. It must not
  *   be restored onto another device: two installs with one device identity would mix their logs.
  *
- * Starting talks to the network for up to ~10 s, so [start] blocks and the UI calls it on a
- * background thread; [startInBackground] is the fire-and-forget form used at app start.
+ * Starting talks to the network for up to ~10 s, so [start] blocks; the settings screen uses
+ * [startAsync], and [startInBackground] is the fire-and-forget form used at app start.
  */
 object MemcardSyncSettings {
     private const val TAG = "MemcardSync"
@@ -122,13 +125,27 @@ object MemcardSyncSettings {
         }
     }
 
-    /** [start] on its own thread, for app start: nothing waits for it. */
-    fun startInBackground(context: Context) {
+    /** [start] in the background, for app start: nothing waits for it. */
+    fun startInBackground(context: Context) = startAsync(context) { it?.let { e -> Log.w(TAG, "not syncing: $e") } }
+
+    /**
+     * [start] in the background, then [onDone] with its result on the main thread.
+     *
+     * Starts run one at a time, in order, on a thread that belongs to the app rather than to a
+     * screen: a settings screen that closes right after a change (a field saved as it leaves the
+     * screen) must not cancel the restart, or the stored settings and the running sync disagree.
+     * Each start reads the settings when it runs, so after several quick changes the last one wins.
+     */
+    fun startAsync(context: Context, onDone: (String?) -> Unit) {
         val app = context.applicationContext
-        Thread({
-            start(app)?.let { Log.w(TAG, "not syncing: $it") }
-        }, "MemcardSyncStart").start()
+        starter.execute {
+            val result = start(app)
+            mainHandler.post { onDone(result) }
+        }
     }
+
+    private val starter = Executors.newSingleThreadExecutor { Thread(it, "MemcardSyncStart") }
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     fun stop() {
         runCatching { NativeApp.memcardSyncStop() }
