@@ -351,6 +351,10 @@ fun NetworkTab(state: MutableState<Settings>) {
             apply(s.copy(system = s.system.copy(usbKeyboard = it)))
         }
         HelpText(str("network.usbKeyboard.help"))
+
+        // Memory card sync (emusync): app-owned settings, not part of [Settings] (see
+        // com.armsx2.sync.MemcardSyncSettings for why the secret stays out of the core's INI).
+        MemcardSyncSection()
     }
 }
 

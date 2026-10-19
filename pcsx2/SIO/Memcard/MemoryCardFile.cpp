@@ -4,6 +4,7 @@
 #include "SIO/Memcard/MemoryCardFile.h"
 
 #include "SIO/Memcard/MemcardBackup.h"
+#include "SIO/Memcard/MemcardSync.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 #include "SIO/Sio.h"
 #include <SIO/SioTypes.h>
@@ -684,6 +685,7 @@ void FileMcd_EmuClose()
 	FileMcd_Open = false;
 	Mcd::implFolder.Close();
 	Mcd::impl.Close();
+	MemcardSync::OnCardsFlushed(); // closed: the cards on disk are complete
 }
 
 void FileMcd_Flush()
@@ -692,6 +694,7 @@ void FileMcd_Flush()
 		return;
 	Mcd::implFolder.Flush();
 	Mcd::impl.Flush();
+	MemcardSync::OnCardsFlushed();
 }
 
 void FileMcd_CancelEject()
@@ -709,6 +712,9 @@ void FileMcd_Reopen(std::string new_serial)
 	FileMcd_EmuClose();
 	FileMcd_SetType();
 	sioSetGameSerial(new_serial);
+	// Sync first, then the backup: the backup then holds the card the game is about to see, while the
+	// app's own pre-boot snapshot holds the card from before sync changed it (MemcardSync.h).
+	MemcardSync::OnCardsReopening(); // newer saves from other devices, while no card is open
 	MemcardBackup::OnCardsReopening(); // snapshot while no card is open
 	FileMcd_EmuOpen();
 }
@@ -834,6 +840,7 @@ s32 FileMcd_Read(uint port, uint slot, u8* dest, u32 adr, int size)
 s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
+	MemcardSync::OnCardWritten(combinedSlot);
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:
@@ -848,6 +855,7 @@ s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
 s32 FileMcd_EraseBlock(uint port, uint slot, u32 adr)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
+	MemcardSync::OnCardWritten(combinedSlot);
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:

@@ -1610,6 +1610,9 @@
     <ClCompile Include="SIO\Memcard\MemcardBackup.cpp">
       <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
     </ClCompile>
+    <ClCompile Include="SIO\Memcard\MemcardSync.cpp">
+      <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
+    </ClCompile>
     <ClCompile Include="SIO\Memcard\MemoryCardFile.cpp">
       <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
     </ClCompile>
@@ -2788,6 +2791,9 @@
       <Filter>System\Ps2\Iop\SIO\Multitap</Filter>
     </ClInclude>
     <ClInclude Include="SIO\Memcard\MemcardBackup.h">
+      <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
+    </ClInclude>
+    <ClInclude Include="SIO\Memcard\MemcardSync.h">
       <Filter>System\Ps2\Iop\SIO\Memcard</Filter>
     </ClInclude>
     <ClInclude Include="SIO\Memcard\MemoryCardFile.h">

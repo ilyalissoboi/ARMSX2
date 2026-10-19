@@ -41,6 +41,7 @@
 #include "Recording/InputRecording.h"
 #include "Recording/InputRecordingControls.h"
 #include "SIO/Memcard/MemoryCardFile.h"
+#include "SIO/Memcard/MemcardSync.h"
 #include "SIO/Pad/Pad.h"
 #include "SIO/Sio.h"
 #include "SIO/Sio0.h"
@@ -2178,7 +2179,12 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 	// Figure out which game we're running! This also loads game settings.
 	UpdateDiscDetails(true);
 
-	ScopedGuard close_memcards(&FileMcd_EmuClose);
+	// A boot that fails from here on never reaches Shutdown(): end the card sync session it began
+	// in UpdateDiscDetails (FileMcd_Reopen), so its cards are not left marked in use.
+	ScopedGuard close_memcards([]() {
+		FileMcd_EmuClose();
+		MemcardSync::OnVMShutdown();
+	});
 
 	// Read fast boot setting late so it can be overridden per-game.
 	// ELFs must be fast booted, and GS dumps are never fast booted.
@@ -2461,6 +2467,7 @@ void VMManager::Shutdown(bool save_resume_state)
 	DoCDVDclose();
 	FWclose();
 	FileMcd_EmuClose();
+	MemcardSync::OnVMShutdown(); // after the cards closed: uploads, then applies what waited
 
 	// If the fullscreen UI is running, do a hardware reset on the GS
 	// so that the texture cache and targets are all cleared.

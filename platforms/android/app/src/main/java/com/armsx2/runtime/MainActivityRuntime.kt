@@ -2302,6 +2302,11 @@ open class MainActivityRuntime : ComponentActivity() {
             NativeApp.initializeOnce(applicationContext)
             nativeReady.value = true
 
+            // Memory card sync, if the user set it up. On its own thread: starting checks the storage
+            // over the network (up to ~10 s), which nothing here should wait for. A game booted before
+            // it finishes simply starts unsynced; sync then follows the cards it has open.
+            runCatching { com.armsx2.sync.MemcardSyncSettings.startInBackground(applicationContext) }
+
             // Lightgun: read the pref and re-assert the USB device type. The ini is
             // authoritative, but this covers a first run that has no USB section yet.
             runCatching {

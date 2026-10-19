@@ -257,6 +257,11 @@ endif()
 # compiles out, so a missing Rust toolchain can never break the build.
 add_subdirectory(3rdparty/librashader)
 
+# emusync: memory card sync through the cloud, so saves follow the player between ARMSX2 and
+# PCSX2 on other devices. Rust-built from a pinned commit and OPTIONAL in the same way as
+# librashader: no cargo leaves ARMSX2_HAVE_EMUSYNC off and the feature compiles out.
+add_subdirectory(3rdparty/emusync)
+
 # LSFG: Lossless Scaling frame generation, github flavour only — ARMSX2_ENABLE_LSFG defaults
 # OFF and only the github flavour turns it on, so a play build compiles the feature out.
 #
@@ -396,7 +401,16 @@ if(ARMSX2_HAVE_LIBRASHADER)
 	target_link_libraries(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE librashader)
 endif()
 
-# Same PCSX2_FLAGS reasoning as librashader directly above, and for the same reason: the
+# emusync, with the same PCSX2_FLAGS reasoning as librashader directly above: the memory card
+# hooks live in core sources (VMManager.cpp, SIO/Memcard), which release builds compile into the
+# separate PCSX2_LTO target, so a define on PCSX2 would silently compile the sync out.
+if(ARMSX2_HAVE_EMUSYNC)
+	target_link_libraries(PCSX2_FLAGS INTERFACE emusync::emusync)
+	target_compile_definitions(PCSX2_FLAGS INTERFACE ARMSX2_HAS_EMUSYNC=1)
+	target_link_libraries(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE emusync::emusync)
+endif()
+
+# Same PCSX2_FLAGS reasoning as librashader above, and for the same reason: the
 # frame-generation hook lives in GS/Renderers/Vulkan/GSDeviceVK.cpp, which release builds
 # compile into the separate PCSX2_LTO target. A define placed on PCSX2 would never reach it,
 # the code behind #ifdef ARMSX2_HAS_LSFG would vanish, and the build would succeed anyway —

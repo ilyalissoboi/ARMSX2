@@ -1,0 +1,55 @@
+# emusync — memory card sync through the cloud (https://github.com/ilyalissoboi/emusync).
+#
+# Like librashader next door, emusync is a RUST project, so it is not vendored: this repo keeps no
+# git submodules and no checked-in binaries. A PINNED commit is fetched at configure time and its
+# C-ABI library is built by cargo as libemusync.so for the ABI being built, through emusync's own
+# CMake module (bindings/cmake/EmuSyncAndroid.cmake). The pin keeps the build reproducible.
+#
+# libemusync.so is a SEPARATE shared library, not linked into emucore statically. emusync bundles
+# its own zstd and SQLite; a static link would put a second copy of the ZSTD_* symbols next to the
+# core's, and drag Rust objects into the core's LTO link. The cdylib exports only es_* symbols.
+#
+# OPTIONAL, exactly like librashader: without cargo (or the Rust target for this ABI) the module
+# leaves ARMSX2_HAVE_EMUSYNC off and memory card sync compiles out (#ifdef ARMSX2_HAS_EMUSYNC), so
+# a contributor without a Rust toolchain still builds.
+#
+# For local development against an emusync checkout, configure with
+#   -DEMUSYNC_SOURCE_DIR=/path/to/emusync
+# and the fetch is skipped.
+
+set(EMUSYNC_PIN "9e51d6c908de97d6d150462e512c1a5a482c3fe8"
+	CACHE STRING "Pinned emusync commit. Bump deliberately; never track a branch.")
+option(ARMSX2_DISABLE_EMUSYNC "Build without memory card sync even when Rust is available" OFF)
+
+if(ARMSX2_DISABLE_EMUSYNC)
+	message(STATUS "emusync: explicitly disabled (ARMSX2_DISABLE_EMUSYNC)")
+	set(ARMSX2_HAVE_EMUSYNC OFF PARENT_SCOPE)
+	return()
+endif()
+
+# The module reports a missing cargo itself, but checking first avoids a pointless fetch.
+find_program(EMUSYNC_CARGO cargo HINTS "$ENV{HOME}/.cargo/bin" "$ENV{CARGO_HOME}/bin")
+if(NOT EMUSYNC_CARGO)
+	message(STATUS "emusync: cargo not found -> memory card sync DISABLED. "
+	               "Install Rust (https://rustup.rs) to enable it.")
+	set(ARMSX2_HAVE_EMUSYNC OFF PARENT_SCOPE)
+	return()
+endif()
+
+if(NOT EMUSYNC_SOURCE_DIR)
+	# ---- Fetch the pinned source (configure time, nothing vendored) ----------------------------
+	include(FetchContent)
+	FetchContent_Declare(emusync_src
+		GIT_REPOSITORY https://github.com/ilyalissoboi/emusync.git
+		GIT_TAG        ${EMUSYNC_PIN}
+	)
+	# emusync has no top-level CMakeLists.txt, so this only downloads; nothing is added to the build.
+	FetchContent_MakeAvailable(emusync_src)
+	set(EMUSYNC_SOURCE_DIR "${emusync_src_SOURCE_DIR}")
+endif()
+
+include("${EMUSYNC_SOURCE_DIR}/bindings/cmake/EmuSyncAndroid.cmake")
+set(ARMSX2_HAVE_EMUSYNC ${EMUSYNC_ANDROID_FOUND} PARENT_SCOPE)
+if(EMUSYNC_ANDROID_FOUND)
+	message(STATUS "emusync: ${EMUSYNC_SOURCE_DIR} -> ${EMUSYNC_ANDROID_LIBRARY}")
+endif()

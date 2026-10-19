@@ -19,6 +19,7 @@
 #include "pcsx2/CDVD/IsoReader.h" // ISO extraction for host: quick-loading setups
 #include "pcsx2/CDVD/CDVD.h" // cdvdSaveNVRAM (flush BIOS NVM on background)
 #include "SIO/Memcard/MemoryCardFile.h"
+#include "SIO/Memcard/MemcardSync.h"
 #include "SIO/Sio.h" // MemcardBusy — save-state refusal reason
 #include "pcsx2/Patch.h"
 #include "pcsx2/R5900.h"
@@ -4035,6 +4036,13 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAppBackgrounded(JNIEnv *env, jclass claz
     s_app_backgrounded.store(bg, std::memory_order_release);
     SPU2::SetOutputBackgrounded(bg);
     Host::RunOnCPUThread([]() { SPU2::UpdateOutputPaused(); });
+    // Memory card sync uploads when the app leaves the screen, and catches up when it returns. With a
+    // VM, queued on the CPU thread BEHIND the flush that onPause's pause() queued (the queue is FIFO),
+    // so the cards are on disk before they are read. MemcardSync does the upload on its own thread.
+    if (VMManager::HasValidVM())
+        Host::RunOnCPUThread([bg]() { MemcardSync::SetAppBackgrounded(bg); });
+    else
+        MemcardSync::SetAppBackgrounded(bg);
 }
 
 extern "C"
@@ -7083,4 +7091,58 @@ Java_kr_co_iefriends_pcsx2_NativeApp_zstdDecoderDecode(
 	if (zo.pos > 0)
 		env->SetByteArrayRegion(out, out_off, static_cast<jsize>(zo.pos), out_buf.data());
 	return static_cast<jint>(zo.pos);
+}
+
+// ---- Memory card sync (pcsx2/SIO/Memcard/MemcardSync.h) ----
+// Configured by the app (com.armsx2.sync.MemcardSyncSettings), which keeps the settings and the
+// Keystore-encrypted secret; the core only holds them in memory while sync runs.
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncAvailable(JNIEnv *env, jclass clazz) {
+    return MemcardSync::IsAvailable() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncStart(JNIEnv *env, jclass clazz, jstring data_dir,
+        jstring device_name, jstring app_version, jstring remote_uri, jstring access_key_id,
+        jstring secret_access_key) {
+    // Blocks for the local database and up to ~10 s on the network: call it off the main thread.
+    // Returns null on success, else a sentence for the user.
+    MemcardSync::Config config;
+    config.data_dir = GetJavaString(env, data_dir);
+    config.device_name = GetJavaString(env, device_name);
+    config.emulator_version = GetJavaString(env, app_version);
+    config.remote_uri = GetJavaString(env, remote_uri);
+    config.access_key_id = GetJavaString(env, access_key_id);
+    config.secret_access_key = GetJavaString(env, secret_access_key);
+    std::string error;
+    if (MemcardSync::Start(config, &error))
+        return nullptr;
+    return env->NewStringUTF(error.c_str());
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncStop(JNIEnv *env, jclass clazz) {
+    MemcardSync::Stop(2000);
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncRunning(JNIEnv *env, jclass clazz) {
+    return MemcardSync::IsRunning() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncNow(JNIEnv *env, jclass clazz) {
+    MemcardSync::SyncNow();
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncStatus(JNIEnv *env, jclass clazz) {
+    return env->NewStringUTF(MemcardSync::GetStatus().c_str());
 }

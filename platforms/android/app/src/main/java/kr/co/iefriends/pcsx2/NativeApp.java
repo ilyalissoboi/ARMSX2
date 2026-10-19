@@ -1140,6 +1140,20 @@ public class NativeApp {
 	/** True while the emulated memory card is mid-write, when a state save is refused to protect
 	 *  the card. The counter only ticks down while the VM runs, so it does NOT clear while paused. */
 	public static native boolean isMemcardBusy();
+
+	// ---- Memory card sync (core side: pcsx2/SIO/Memcard/MemcardSync.h; settings: com.armsx2.sync) ----
+	/** False when this build has no sync (no Rust toolchain at build time). */
+	public static native boolean memcardSyncAvailable();
+	/** Starts syncing the slot 1 and 2 cards. Blocks (local database, up to ~10 s of network): call
+	 *  it off the main thread. Returns null on success, else a sentence for the user. */
+	public static native String memcardSyncStart(String dataDir, String deviceName, String appVersion,
+			String remoteUri, String accessKeyId, String secretAccessKey);
+	public static native void memcardSyncStop();
+	public static native boolean memcardSyncRunning();
+	/** Queues a full sync now. */
+	public static native void memcardSyncNow();
+	/** One line about the last sync, for the settings screen; empty when nothing happened yet. */
+	public static native String memcardSyncStatus();
 	public static native boolean loadStateFromSlot(int slot);
 	public static native String getGamePathSlot(int slot);
 	public static native byte[] getImageSlot(int slot);
