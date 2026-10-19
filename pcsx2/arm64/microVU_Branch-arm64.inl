@@ -9,6 +9,16 @@ extern void* mVUcompile(microVU& mVU, u32 startPC, uptr pState);
 void mVU0clearlpStateJIT() { if (!microVU0.prog.cleared) std::memset(&microVU0.prog.lpState, 0, sizeof(microVU0.prog.lpState)); }
 void mVU1clearlpStateJIT() { if (!microVU1.prog.cleared) std::memset(&microVU1.prog.lpState, 0, sizeof(microVU1.prog.lpState)); }
 
+// Where a program that ends on the E bit leaves through.
+__fi const u8* mVUexitEBit(mV)
+{
+	if (!(mVU.index && THREAD_VU1))
+		return mVU.exitFunct;
+
+	pxAssert(mVU.exitFunctEBit);
+	return mVU.exitFunctEBit;
+}
+
 // The incoming ring phase, as recorded by the predecessor: phase P means the live
 // instance is (P - 1) & 3. Status/Mac/Clip occupy flagInfo bits 2-3 / 4-5 / 6-7.
 __fi int getIncomingFlagInst(microRegInfo& pState, int flagType)
@@ -291,9 +301,7 @@ void mVUendProgram(mV, microFlagCycles* mFC, int isEbit)
 		// reaches here. mVUendProgram intentionally does NOT copy pipeline state
 		// (matching mVUendProgram in x86 microVU_Branch.inl), so a Q/P-pipeline
 		// countdown still carried by lpState is preserved for the next program.
-		if (mVU.index && THREAD_VU1)
-			armEmitCall((void*)mVUEBit);
-		armEmitJmp(mVU.exitFunct);
+		armEmitJmp(mVUexitEBit(mVU));
 	}
 
 	memcpy(&mVUregs, &stateBackup, sizeof(mVUregs));
@@ -303,10 +311,15 @@ void mVUendProgram(mV, microFlagCycles* mFC, int isEbit)
 // Branch Setup
 //------------------------------------------------------------------
 
-void mVUsetupBranch(mV, microFlagCycles& mFC)
+// reorderFlags: put the flag instances in the order the successor block
+// expects. A block that ends the program on every path has no successor, and
+// mVUendProgram reads the instance it leaves by its pre-reorder slot, so such
+// a block must not reorder (see condBranch).
+void mVUsetupBranch(mV, microFlagCycles& mFC, bool reorderFlags = true)
 {
 	mVU.regAlloc->flushAll();
-	mVUsetupFlags(mVU, mFC);
+	if (reorderFlags)
+		mVUsetupFlags(mVU, mFC);
 
 	// Shuffle P/Q regs since every block starts at instance #0.
 	// qmmPQ layout: [0]=Q, [1]=pending_q, [2]=P, [3]=pending_p.
@@ -425,9 +438,7 @@ void normJumpCompile(mV, microFlagCycles& mFC, bool isEvilJump)
 	{
 		mVUendProgram(mVU, &mFC, 2);
 		armAsm->Str(RWARG1, mVUstateMem(offsetof(VURegs, VI) + REG_TPC * sizeof(REG_VI)));
-		if (mVU.index && THREAD_VU1)
-			armEmitCall((void*)mVUEBit);
-		armEmitJmp(mVU.exitFunct);
+		armEmitJmp(mVUexitEBit(mVU));
 	}
 
 	if (!mVU.index)
@@ -528,7 +539,7 @@ static void mVUcloseCodeCache(microVU& mVU)
 
 	// Persisted-JIT recorder: finalize (or drop) the chunk. Runs after
 	// FinalizeCode so the captured bytes include any literal pool.
-	mVUPersist::EndEpisode(mVU, codeStart + codeSize);
+	mVUPersist::EndEpisode(mVU, codeStart, codeStart + codeSize);
 
 	armAsm = nullptr; // unbind; do not delete (persistent)
 	HostSys::EndCodeWriteRange(mVU.prog.x86start, mVUcodeCacheWriteSpan(mVU));
@@ -581,8 +592,17 @@ _mVUt void* mVUcompileJIT(u32 startPC, uptr ptr)
 		if (jc.prog && jc.prog == mVU.prog.quick[startPC / 8].prog)
 			return jc.hostEntry;
 
+		// A jump the cache did not know: the vu-aot tier counts these to see
+		// when a tiered program has met a target its regions do not hold.
+		if constexpr (vuIndex == 1)
+			mVUvuAotOnJumpMiss(mVU);
+
 		mVUopenCodeCache(mVU);
 		void* v = mVUsearchProg<vuIndex>(startPC, (uptr)&pBlock->pStateEnd);
+		// A program microVU only ever reaches through a JR/JALR (an overlay the
+		// dispatcher never enters) is counted, and tiered up, here.
+		if constexpr (vuIndex == 1)
+			v = mVUvuAotAfterJump(mVU, startPC, (uptr)&pBlock->pStateEnd, v);
 		mVUcloseCodeCache(mVU);
 
 		jc.prog = mVU.prog.quick[startPC / 8].prog;
@@ -594,6 +614,8 @@ _mVUt void* mVUcompileJIT(u32 startPC, uptr ptr)
 	{
 		mVUopenCodeCache(mVU);
 		void* v = mVUsearchProg<vuIndex>(startPC, ptr);
+		if constexpr (vuIndex == 1)
+			v = mVUvuAotAfterJump(mVU, startPC, ptr, v);
 		mVUcloseCodeCache(mVU);
 		return v;
 	}
@@ -678,9 +700,7 @@ void normBranch(mV, microFlagCycles& mFC)
 		armAsm->Add(a64::x8, gprVUState, offsetof(VURegs, VI) + REG_TPC * sizeof(REG_VI));
 		armAsm->Mov(a64::w9, xPC);
 		armAsm->Str(a64::w9, a64::MemOperand(a64::x8));
-		if (mVU.index && THREAD_VU1)
-			armEmitCall((void*)mVUEBit);
-		armEmitJmp(mVU.exitFunct);
+		armEmitJmp(mVUexitEBit(mVU));
 		iPC = tempPC;
 	}
 	if (mVUup.eBit)
@@ -704,7 +724,16 @@ void normBranch(mV, microFlagCycles& mFC)
 
 void condBranch(mV, microFlagCycles& mFC, a64::Condition cond)
 {
-	mVUsetupBranch(mVU, mFC);
+	// With the E bit the program ends after the delay slot on both sides, so
+	// no successor block runs and nothing needs the flag instances reordered
+	// for one. Reordering anyway moved them under mVUendProgram, which picks
+	// the final instance by its slot from before the reorder: when the branch
+	// target's lookahead asked for exact status (a status reader early in
+	// code that never runs), the final STATUS, MAC and CLIP came from the
+	// wrong register, or from one the reorder had overwritten. The M bit is
+	// the exception: its exit leaves the program resumable at a successor, and
+	// its non-E-bit mVUendProgram reads slot 3 of the reordered ring.
+	mVUsetupBranch(mVU, mFC, !(mVUup.eBit && !mVUup.mBit));
 
 	// T-bit, D-bit, M-bit conditional branches — match x86 condBranch(). Each
 	// branch bit tests the relevant FBRST flag (T/D), then if set raises INTC,
@@ -834,18 +863,14 @@ void condBranch(mV, microFlagCycles& mFC, a64::Condition cond)
 			armAsm->Add(a64::x8, gprVUState, offsetof(VURegs, VI) + REG_TPC * sizeof(REG_VI));
 			armAsm->Mov(a64::w9, xPC);
 			armAsm->Str(a64::w9, a64::MemOperand(a64::x8));
-			if (mVU.index && THREAD_VU1)
-				armEmitCall((void*)mVUEBit);
-			armEmitJmp(mVU.exitFunct);
+			armEmitJmp(mVUexitEBit(mVU));
 		armAsm->Bind(&mJMP);
 		incPC(-4);
 		iPC = branchAddr(mVU) / 4;
 		armAsm->Add(a64::x8, gprVUState, offsetof(VURegs, VI) + REG_TPC * sizeof(REG_VI));
 		armAsm->Mov(a64::w9, xPC);
 		armAsm->Str(a64::w9, a64::MemOperand(a64::x8));
-		if (mVU.index && THREAD_VU1)
-			armEmitCall((void*)mVUEBit);
-		armEmitJmp(mVU.exitFunct);
+		armEmitJmp(mVUexitEBit(mVU));
 
 		iPC = tempPC;
 	}
@@ -873,9 +898,7 @@ void condBranch(mV, microFlagCycles& mFC, a64::Condition cond)
 			armAsm->Add(a64::x8, gprVUState, offsetof(VURegs, VI) + REG_TPC * sizeof(REG_VI));
 			armAsm->Mov(a64::w9, xPC);
 			armAsm->Str(a64::w9, a64::MemOperand(a64::x8));
-			if (mVU.index && THREAD_VU1)
-				armEmitCall((void*)mVUEBit);
-			armEmitJmp(mVU.exitFunct);
+			armEmitJmp(mVUexitEBit(mVU));
 		armAsm->Bind(&taken);
 		incPC(-4);
 
@@ -884,9 +907,7 @@ void condBranch(mV, microFlagCycles& mFC, a64::Condition cond)
 		armAsm->Add(a64::x8, gprVUState, offsetof(VURegs, VI) + REG_TPC * sizeof(REG_VI));
 		armAsm->Mov(a64::w9, xPC);
 		armAsm->Str(a64::w9, a64::MemOperand(a64::x8));
-		if (mVU.index && THREAD_VU1)
-			armEmitCall((void*)mVUEBit);
-		armEmitJmp(mVU.exitFunct);
+		armEmitJmp(mVUexitEBit(mVU));
 		return;
 	}
 
@@ -897,7 +918,10 @@ void condBranch(mV, microFlagCycles& mFC, a64::Condition cond)
 		// by construction — see mVUcondBranchDest/Finish). The mVUsetupBranch
 		// flushAll only unmapped the temp; any emission that could have
 		// clobbered it would have cleared the carry.
-		armAsm->Cmp(armWRegister(mVU.branchCondCarryGpr), 0);
+		if (mVU.branchCondCarryLow16)
+			armAsm->Tst(armWRegister(mVU.branchCondCarryGpr), 0xffff);
+		else
+			armAsm->Cmp(armWRegister(mVU.branchCondCarryGpr), 0);
 		mVUclearBranchCondCarry(mVU);
 	}
 	else
@@ -1038,9 +1062,7 @@ void normJump(mV, microFlagCycles& mFC)
 		mVUendProgram(mVU, &mFC, 2);
 		mVUldrField(mVU, gprT1, &mVU.branch);
 		armAsm->Str(gprT1, mVUstateMem(offsetof(VURegs, VI) + REG_TPC * sizeof(REG_VI)));
-		if (mVU.index && THREAD_VU1)
-			armEmitCall((void*)mVUEBit);
-		armEmitJmp(mVU.exitFunct);
+		armEmitJmp(mVUexitEBit(mVU));
 	}
 	else
 	{

@@ -7,15 +7,20 @@
 #include "Gif_Unit.h"
 #include "MTGS.h"
 #include "VMManager.h"
+#include "common/ARCADE.h"
+#include "IopThread/SharedWord.h"
 
 #include <list>
 
 alignas(16) u8 g_RealGSMem[Ps2MemSize::GSregs];
 static bool s_GSRegistersWritten = false;
 
+// gsVideoMode is written here, on the EE thread, and read by GetVerticalFrequency from other threads
+// (the IOP thread's cdvdVsync, the GS thread's frame rate), so these stores and that load are relaxed
+// atomics: the same plain instructions, and no torn or invented value for the other thread.
 void gsSetVideoMode(GS_VideoMode mode)
 {
-	gsVideoMode = mode;
+	SharedWord::StoreRelaxed(gsVideoMode, mode);
 	UpdateVSyncRate(false);
 }
 
@@ -23,7 +28,7 @@ void gsSetVideoMode(GS_VideoMode mode)
 void gsReset()
 {
 	MTGS::ResetGS(true);
-	gsVideoMode = GS_VideoMode::Uninitialized;
+	SharedWord::StoreRelaxed(gsVideoMode, GS_VideoMode::Uninitialized);
 	std::memset(g_RealGSMem, 0, sizeof(g_RealGSMem));
 	UpdateVSyncRate(true);
 }
@@ -74,7 +79,10 @@ static __fi void gsCSRwrite( const tGS_CSR& csr )
 	if (csr.FINISH)	{
 		CSRreg.FINISH = false;
 		gifUnit.gsFINISH.gsFINISHFired = false; //Clear the previously fired FINISH (YS, Indiecar 2005, MGS3)
-		gifUnit.gsFINISH.gsFINISHPending = false;
+		// On an arcade board, clearing the status bit does not cancel a FINISH still queued behind the
+		// draw delay (GS->EE readback; PCSX2x6).
+		if (!Arcade::IsActive())
+			gifUnit.gsFINISH.gsFINISHPending = false;
 	}
 	if(csr.HSINT)	CSRreg.HSINT	= false;
 	if(csr.VSINT)	CSRreg.VSINT	= false;

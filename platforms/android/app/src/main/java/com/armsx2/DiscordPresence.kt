@@ -20,6 +20,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import com.armsx2.discord.DiscordIpc
 
@@ -62,7 +64,7 @@ data class DiscordFriend(
      * this device's choice to make, not theirs.
      */
     val coverUrl: String? get() = serial.takeIf { it.isNotBlank() }?.let { s ->
-        if (CoverArtStyle.use3d.value)
+        arcadeCoverUrl(s) ?: if (CoverArtStyle.use3d.value)
             "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/3d/$s.png"
         else
             "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/$s.jpg"
@@ -73,6 +75,7 @@ object DiscordPresence {
     private const val TAG = "DiscordPresence"
     private const val PREF_ENABLED = "discord.enabled"
     private const val PREF_TOKEN = "discord.token"
+    private const val PREF_REFRESH = "discord.refresh"
     private const val PREF_NOTIFY = "discord.notifyInGame"
 
     /** Seconds between RA rich-presence re-checks. Discord rate-limits presence updates, so this
@@ -99,6 +102,21 @@ object DiscordPresence {
     private var presenceJob: Job? = null
     private var started = false
 
+    // Whether the app is on screen. Out of sight nothing shows the status or the friends list, and
+    // the device may be locked for hours: the helper drains the SDK once a second instead of twenty
+    // times, and the poll below waits for the app to come back.
+    private val foreground = MutableStateFlow(true)
+
+    /** From the activity's onStart (true) and onStop (false). */
+    fun setForeground(fg: Boolean) {
+        if (foreground.value == fg) return
+        foreground.value = fg
+        sendIdle()
+    }
+
+    private fun sendIdle() =
+        send(DiscordIpc.MSG_IDLE, Bundle().apply { putBoolean(DiscordIpc.DATA_IDLE, !foreground.value) })
+
     // ---- helper-process link -------------------------------------------------------------
     //
     // The Discord SDK runs in :discord, not here. That is a licensing boundary: ARMSX2 is GPL-3.0+
@@ -123,8 +141,9 @@ object DiscordPresence {
             Log.i(TAG, "helper process connected")
             // Re-issue whatever the helper needs to know: a reconnect means a fresh process that
             // remembers nothing, so anything set before the bind has to be replayed.
-            send(DiscordIpc.MSG_START, Bundle().apply { putString(DiscordIpc.DATA_TOKEN, savedToken) })
+            send(DiscordIpc.MSG_START, savedSignIn())
             pushPresence()
+            sendIdle()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -222,14 +241,77 @@ object DiscordPresence {
     }
 
     /** Re-publish the current game; used on (re)connect and whenever the running game changes. */
+    /**
+     * Where in ARMSX2 the player is, when it is neither a game nor the plain library:
+     * [PLACE_MUSEUM], [PLACE_ONLINE_ICONS]. Published the way a game is (as the title, with no
+     * serial and no cover), so a friend's client of any version shows it where it would show a
+     * game's name, and Discord reads it under ARMSX2. The bridge captions the image with the title
+     * when there is no serial, which a friend's client knows not to take for one. Null: the library.
+     */
+    val place = mutableStateOf<String?>(null)
+    const val PLACE_MUSEUM = "In the Icon Museum"
+    const val PLACE_ONLINE_ICONS = "Browsing Online Icons"
+
+    /** Discord's second line under a place: two braille blanks (U+2800), which Discord shows as
+     *  nothing, so it reads just "In the Icon Museum". It can't be left out: a friend's client
+     *  tells a place (or a game) from the library by the second line being there, and with none to
+     *  give the bridge puts "-" in it. Shown, never parsed: see [place]. */
+    private const val PLACE_STATE = "\u2800\u2800"
+
+    /** The player is at [where] until [leave]. */
+    fun enter(where: String) {
+        place.value = where
+    }
+
+    fun leave(where: String) {
+        if (place.value == where) place.value = null
+    }
+
+    /**
+     * A remote play session with both players in it, on either device. While there is one, Discord
+     * reads "Playing remote play (2 of 2)" under the game, and both devices publish the same [id]
+     * so Discord knows they are together. [hostGame] and [hostSerial] are the host's game, for the
+     * friend's device, which runs no game of its own; on the host they stay null and it publishes
+     * its own game as usual. Nobody's name or device goes into it.
+     */
+    data class RemotePlayParty(val id: String, val hostGame: String? = null, val hostSerial: String = "")
+
+    val remotePlay = mutableStateOf<RemotePlayParty?>(null)
+
+    /** Both players are in: the host has started streaming, or the friend shows its first frame. */
+    fun joinRemotePlay(party: RemotePlayParty) {
+        remotePlay.value = party
+    }
+
+    /** That session is over. A newer one is left alone. */
+    fun leaveRemotePlay(id: String) {
+        if (remotePlay.value?.id == id) remotePlay.value = null
+    }
+
     private fun pushPresence() {
         val game = MainActivityRuntime.currentGame.value
         lastRaPresence = raPresence()
+        val party = remotePlay.value
+        val hostGame = party?.hostGame
+        if (party != null && hostGame != null) {
+            // The friend's side of remote play: the host's game, with the cover this device would
+            // show for it, derived from the serial the way a friend's row is.
+            send(DiscordIpc.MSG_SET_PLAYING, Bundle().apply {
+                putString(DiscordIpc.DATA_SERIAL, party.hostSerial)
+                putString(DiscordIpc.DATA_TITLE, hostGame)
+                putString(DiscordIpc.DATA_COVER, DiscordFriend("", hostGame, party.hostSerial, "").coverUrl.orEmpty())
+                putString(DiscordIpc.DATA_RA, "")
+                putString(DiscordIpc.DATA_PARTY, party.id)
+            })
+            return
+        }
+        val where = place.value.takeIf { game == null }
         send(DiscordIpc.MSG_SET_PLAYING, Bundle().apply {
             putString(DiscordIpc.DATA_SERIAL, game?.serial.orEmpty())
-            putString(DiscordIpc.DATA_TITLE, game?.let { it.displayTitle(false) }.orEmpty())
+            putString(DiscordIpc.DATA_TITLE, game?.let { it.displayTitle(false) } ?: where.orEmpty())
             putString(DiscordIpc.DATA_COVER, game?.coverUrl.orEmpty())
-            putString(DiscordIpc.DATA_RA, lastRaPresence)
+            putString(DiscordIpc.DATA_RA, if (where != null) PLACE_STATE else lastRaPresence)
+            putString(DiscordIpc.DATA_PARTY, party?.id.orEmpty())
         })
     }
 
@@ -258,6 +340,23 @@ object DiscordPresence {
         set(value) {
             runCatching { MainActivityRuntime.prefs.edit().putString(PREF_TOKEN, value).apply() }
         }
+
+    /** Renews [savedToken] when Discord stops taking it (an access token lasts about a week).
+     *  Empty for a sign-in made before 2.8, which then has to be made again once it runs out. */
+    private var savedRefresh: String
+        get() = runCatching { MainActivityRuntime.prefs.getString(PREF_REFRESH, "") ?: "" }.getOrDefault("")
+        set(value) {
+            runCatching { MainActivityRuntime.prefs.edit().putString(PREF_REFRESH, value).apply() }
+        }
+
+    /** Discord refused the sign-in and it could not be renewed: the panel says so under Connect
+     *  until the player connects again. */
+    private var signInExpired = false
+
+    private fun savedSignIn() = Bundle().apply {
+        putString(DiscordIpc.DATA_TOKEN, savedToken)
+        putString(DiscordIpc.DATA_REFRESH, savedRefresh)
+    }
 
     /** Announce on the in-game OSD when a friend joins. Default on: it is the point of the feature. */
     var notifyInGame: Boolean
@@ -318,7 +417,7 @@ object DiscordPresence {
         //
         // A no-op when the bind is still in flight: send() drops it, and onServiceConnected covers
         // that case a moment later.
-        send(DiscordIpc.MSG_START, Bundle().apply { putString(DiscordIpc.DATA_TOKEN, savedToken) })
+        send(DiscordIpc.MSG_START, savedSignIn())
         startPolling()
         startPresenceWatch()
     }
@@ -332,6 +431,7 @@ object DiscordPresence {
         }
         if (!started) start()
         bindHelper()
+        signInExpired = false
         error.value = null
         Log.i(TAG, "authorize() requested (started=$started, enabled=$enabled)")
         send(DiscordIpc.MSG_AUTHORIZE)
@@ -342,6 +442,8 @@ object DiscordPresence {
         presenceJob?.cancel(); presenceJob = null
         started = false
         savedToken = ""
+        savedRefresh = ""
+        signInExpired = false
         knownFriends = emptySet()
         seededFriends = false
         justOnline.value = null
@@ -373,6 +475,8 @@ object DiscordPresence {
             // and some games update their RA line every few seconds.
             var sinceRaCheck = 0
             while (true) {
+                // Nothing to show while out of sight, so wait here instead of asking every second.
+                foreground.first { it }
                 // No pump here any more: the SDK's callback queue is drained inside the helper, on
                 // the thread that created the client. This loop only asks for a snapshot.
                 bindHelper()
@@ -395,6 +499,15 @@ object DiscordPresence {
                     savedToken = fresh
                     Log.i(TAG, "authorization stored")
                 }
+                snap.getString(DiscordIpc.DATA_FRESH_REFRESH)?.takeIf { it.isNotBlank() }?.let { savedRefresh = it }
+                if (snap.getBoolean(DiscordIpc.DATA_AUTH_EXPIRED, false)) {
+                    // Discord refused the sign-in and it could not be renewed. Forget it, so the
+                    // panel offers Connect again instead of retrying a dead token forever.
+                    savedToken = ""
+                    savedRefresh = ""
+                    signInExpired = true
+                    Log.i(TAG, "sign-in expired: signed out")
+                }
 
                 // Reconnect after a drop. The SDK does not retry, and its connection does not
                 // survive the app being backgrounded for long — swapping apps, or a device
@@ -404,9 +517,7 @@ object DiscordPresence {
                         sinceRetry = 0
                         retryAfter = (retryAfter * 2).coerceAtMost(60)
                         Log.i(TAG, "connection dropped — reconnecting (next retry in $retryAfter s)")
-                        send(DiscordIpc.MSG_START, Bundle().apply {
-                            putString(DiscordIpc.DATA_TOKEN, savedToken)
-                        })
+                        send(DiscordIpc.MSG_START, savedSignIn())
                     }
                 } else if (s == CONNECTED) {
                     sinceRetry = 0
@@ -440,7 +551,11 @@ object DiscordPresence {
                     if (raPresence() != lastRaPresence) pushPresence()
                 }
 
-                error.value = if (s == FAILED) snap.getString(DiscordIpc.DATA_ERROR) else null
+                error.value = when {
+                    s == FAILED -> snap.getString(DiscordIpc.DATA_ERROR)
+                    signInExpired -> com.armsx2.i18n.I18n.get("friends.expired")
+                    else -> null
+                }
             }
         }
     }
@@ -510,7 +625,8 @@ object DiscordPresence {
             // pushPresence reads currentGame itself, so this only needs to know it changed. The
             // cover it sends is the same URL the library renders — Discord takes a URL, so there
             // is nothing to upload per game and a title with no published cover falls back.
-            snapshotFlow { MainActivityRuntime.currentGame.value }.collect { pushPresence() }
+            snapshotFlow { Triple(MainActivityRuntime.currentGame.value, place.value, remotePlay.value) }
+                .collect { pushPresence() }
         }
     }
 }

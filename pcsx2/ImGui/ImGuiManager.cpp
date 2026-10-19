@@ -5,6 +5,7 @@
 #include "Config.h"
 #include "Counters.h"
 #include "GS/GS.h"
+#include "GS/Renderers/Common/GSHeadlessPresent.h"
 #include "Host.h"
 #include "IconsFontAwesome.h"
 #include "ImGui/FullscreenUI.h"
@@ -235,6 +236,9 @@ bool ImGuiManager::InitializeFullscreenUI()
 
 void ImGuiManager::Shutdown(bool clear_state)
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
+
 	DestroySoftwareCursorTextures();
 
 	FullscreenUI::Shutdown(clear_state);
@@ -354,6 +358,8 @@ void ImGuiManager::NewFrame()
 {
 	ImGuiIO& io = ImGui::GetIO();
 	io.DeltaTime = s_last_render_time.GetTimeSecondsAndReset();
+	if (GSHeadless::IsEnabled())
+		io.DeltaTime = GSHeadless::kFrameTime;
 
 	if (s_scale_changed)
 	{
@@ -574,16 +580,6 @@ void ImGuiManager::UnloadFontData()
 	std::vector<u8>().swap(s_fixed_font_data);
 	std::vector<u8>().swap(s_icon_fa_font_data);
 	std::vector<u8>().swap(s_icon_pf_font_data);
-}
-
-static u16 Load16BE(const u8* data)
-{
-	return (data[0] << 8) | data[1];
-}
-
-static u32 Load32BE(const u8* data)
-{
-	return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
 }
 
 // Attempt to find the font index for the given font in its font file
@@ -1469,6 +1465,9 @@ void ImGuiManager::CreateSoftwareCursorTextures()
 
 void ImGuiManager::DestroySoftwareCursorTextures()
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
+
 	for (u32 i = 0; i < InputManager::MAX_POINTER_DEVICES; i++)
 	{
 		s_software_cursors[i].texture.reset();
@@ -1477,6 +1476,9 @@ void ImGuiManager::DestroySoftwareCursorTextures()
 
 void ImGuiManager::UpdateSoftwareCursorTexture(u32 index)
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
+
 	SoftwareCursor& sc = s_software_cursors[index];
 	if (sc.image_path.empty())
 	{

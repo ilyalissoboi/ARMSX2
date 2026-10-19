@@ -3,11 +3,13 @@
 
 #include "fmt/format.h"
 #include "Host.h"
+#include "GS/GS.h"
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSTexture.h"
 #include "ImGui/FullscreenUI.h"
 #include "ImGui/ImGuiAnimated.h"
 #include "ImGui/ImGuiFullscreen.h"
+#include "ImGui/ImGuiFullscreen_Keyboard.h"
 #include "ImGui/ImGuiManager.h"
 #include "Input/InputManager.h"
 
@@ -118,10 +120,9 @@ namespace ImGuiFullscreen
 	static std::string s_input_dialog_title;
 	static std::string s_input_dialog_message;
 	static std::string s_input_dialog_caption;
-	static std::string s_input_dialog_text;
 	static std::string s_input_dialog_ok_text;
 	static InputStringDialogCallback s_input_dialog_callback;
-	static InputFilterType s_input_dialog_filter_type = InputFilterType::None;
+	static KeyboardEntry s_input_dialog_entry;
 
 	static bool s_message_dialog_open = false;
 	static std::string s_message_dialog_title;
@@ -193,6 +194,7 @@ namespace ImGuiFullscreen
 	static float s_notification_vertical_position = 0.15f;
 	static float s_notification_vertical_direction = 1.0f;
 	static float s_notification_horizontal_position = 0.0f; // 0.0 = left, 0.5 = center, 1.0 = right
+	static float s_notification_scale = 1.0f; // ARMSX2: user-set popup size, see SetNotificationScale
 
 	static std::string s_toast_title;
 	static std::string s_toast_message;
@@ -325,6 +327,9 @@ std::optional<RGBA8Image> ImGuiFullscreen::LoadTextureImage(const char* path)
 
 std::shared_ptr<GSTexture> ImGuiFullscreen::UploadTexture(const char* path, const RGBA8Image& image)
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
+
 	GSTexture* texture = g_gs_device->CreateTexture(image.GetWidth(), image.GetHeight(), 1, GSTexture::Format::Color);
 	if (!texture)
 	{
@@ -340,7 +345,10 @@ std::shared_ptr<GSTexture> ImGuiFullscreen::UploadTexture(const char* path, cons
 	}
 
 	DevCon.WriteLn("Uploaded texture resource '%s' (%ux%u)", path, image.GetWidth(), image.GetHeight());
-	return std::shared_ptr<GSTexture>(texture, [](GSTexture* tex) { g_gs_device->Recycle(tex); });
+	return std::shared_ptr<GSTexture>(texture, [](GSTexture* tex) {
+		GSDrainBackQueue();
+		g_gs_device->Recycle(tex);
+	});
 }
 
 std::shared_ptr<GSTexture> ImGuiFullscreen::LoadTexture(std::string_view path)
@@ -2664,9 +2672,8 @@ void ImGuiFullscreen::OpenInputStringDialog(
 	s_input_dialog_message = std::move(message);
 	s_input_dialog_caption = std::move(caption);
 	s_input_dialog_ok_text = std::move(ok_button_text);
-	s_input_dialog_text = std::move(default_value);
 	s_input_dialog_callback = std::move(callback);
-	s_input_dialog_filter_type = filter_type;
+	s_input_dialog_entry.Begin(std::move(default_value), filter_type);
 	QueueResetFocus(FocusResetType::PopupOpened);
 }
 
@@ -2675,7 +2682,7 @@ void ImGuiFullscreen::DrawInputDialog()
 	if (!s_input_dialog_open)
 		return;
 
-	ImGui::SetNextWindowSize(LayoutScale(700.0f, 0.0f));
+	ImGui::SetNextWindowSize(ImVec2(GetKeyboardEntryWidth(s_input_dialog_entry), 0.0f));
 	ImGui::SetNextWindowPos((ImGui::GetIO().DisplaySize - LayoutScale(0.0f, LAYOUT_FOOTER_HEIGHT)) * 0.5f,
 		ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 	ImGui::OpenPopup(s_input_dialog_title.c_str());
@@ -2692,94 +2699,32 @@ void ImGuiFullscreen::DrawInputDialog()
 
 	bool is_open = true;
 	if (ImGui::BeginPopupModal(s_input_dialog_title.c_str(), &is_open,
-			ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar))
+			ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+				ImGuiWindowFlags_NoNavInputs))
 	{
 		ResetFocusHere();
-		ImGui::TextWrapped("%s", s_input_dialog_message.c_str());
 
-		BeginMenuButtons();
-
-		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(10.0f));
-
-		if (!s_input_dialog_caption.empty())
+		// The on-screen keyboard owns the D-pad and the face buttons, so ImGui's navigation is off in this window.
+		switch (DrawKeyboardEntry(s_input_dialog_entry, s_input_dialog_message.c_str(), s_input_dialog_caption.c_str(),
+			s_input_dialog_ok_text.c_str()))
 		{
-			const float prev = ImGui::GetCursorPosX();
-			ImGui::TextUnformatted(s_input_dialog_caption.c_str());
-			ImGui::SetNextItemWidth(ImGui::GetCursorPosX() - prev);
-		}
-		else
-		{
-			ImGui::SetNextItemWidth(ImGui::GetCurrentWindow()->WorkRect.GetWidth());
-		}
-
-		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(10.0f));
-
-		static const ImGuiInputTextCallback input_callback = [](ImGuiInputTextCallbackData* data) -> int {
-			InputFilterType* filter_type = static_cast<InputFilterType*>(data->UserData);
-
-			if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
-				char c = static_cast<char>(data->EventChar);
-
-				if (*filter_type == InputFilterType::Numeric) {
-					if (!std::isdigit(c)) {
-						return 1;
-					}
-				}
-				else if (*filter_type == InputFilterType::IPAddress) {
-					if (!std::isdigit(c) && c != '.') {
-						return 1;
-					}
-				}
+			case KeyboardAction::Submit:
+			{
+				// have to move out in case they open another dialog in the callback
+				InputStringDialogCallback cb(std::move(s_input_dialog_callback));
+				std::string text(s_input_dialog_entry.GetText());
+				CloseInputDialog();
+				ImGui::CloseCurrentPopup();
+				cb(std::move(text));
+				break;
 			}
-
-			return 0;
-		};
-
-		ImGuiInputTextFlags flags = ImGuiInputTextFlags_None;
-		if (s_input_dialog_filter_type != InputFilterType::None)
-			flags |= ImGuiInputTextFlags_CallbackCharFilter;
-
-		if (s_focus_reset_queued != FocusResetType::None)
-			ImGui::SetKeyboardFocusHere();
-
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, LayoutScale(LAYOUT_FRAME_ROUNDING));
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, LayoutScale(12.0f, 10.0f));
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, LayoutScale(1.0f));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
-		ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.25f, 0.25f, 0.25f, 1.0f));
-		ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
-		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
-
-		ImGui::InputText("##input", &s_input_dialog_text, flags,
-			(s_input_dialog_filter_type != InputFilterType::None) ? input_callback : nullptr,
-			(s_input_dialog_filter_type != InputFilterType::None) ? static_cast<void*>(&s_input_dialog_filter_type) : nullptr);
-
-		ImGui::PopStyleColor(5);
-		ImGui::PopStyleVar(3);
-
-		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(10.0f));
-
-		const bool ok_enabled = !s_input_dialog_text.empty();
-
-		if (ActiveButton(s_input_dialog_ok_text.c_str(), false, ok_enabled) && ok_enabled)
-		{
-			// have to move out in case they open another dialog in the callback
-			InputStringDialogCallback cb(std::move(s_input_dialog_callback));
-			std::string text(std::move(s_input_dialog_text));
-			CloseInputDialog();
-			ImGui::CloseCurrentPopup();
-			cb(std::move(text));
+			case KeyboardAction::Cancel:
+				CloseInputDialog();
+				ImGui::CloseCurrentPopup();
+				break;
+			case KeyboardAction::None:
+				break;
 		}
-
-		if (ActiveButton(ICON_FA_XMARK " Cancel", false))
-		{
-			CloseInputDialog();
-
-			ImGui::CloseCurrentPopup();
-		}
-
-		EndMenuButtons();
 
 		ImGui::EndPopup();
 	}
@@ -2803,9 +2748,8 @@ void ImGuiFullscreen::CloseInputDialog()
 	s_input_dialog_message = {};
 	s_input_dialog_caption = {};
 	s_input_dialog_ok_text = {};
-	s_input_dialog_text = {};
 	s_input_dialog_callback = {};
-	s_input_dialog_filter_type = InputFilterType::None;
+	s_input_dialog_entry = {};
 }
 
 bool ImGuiFullscreen::IsMessageBoxDialogOpen()
@@ -2974,6 +2918,11 @@ void ImGuiFullscreen::SetNotificationPosition(float horizontal_position, float v
 	s_notification_horizontal_position = horizontal_position;
 	s_notification_vertical_position = vertical_position;
 	s_notification_vertical_direction = direction;
+}
+
+void ImGuiFullscreen::SetNotificationScale(float scale)
+{
+	s_notification_scale = scale;
 }
 
 void ImGuiFullscreen::OpenProgressDialog(const char* str_id, std::string message, s32 min, s32 max, s32 value)
@@ -3182,18 +3131,21 @@ void ImGuiFullscreen::DrawNotifications(ImVec2& position, float spacing)
 	static constexpr float MOVE_DURATION = 0.5f;
 	const Common::Timer::Value current_time = Common::Timer::GetCurrentValue();
 
-	const float horizontal_padding = ImGuiFullscreen::LayoutScale(20.0f);
-	const float vertical_padding = ImGuiFullscreen::LayoutScale(10.0f);
-	const float horizontal_spacing = ImGuiFullscreen::LayoutScale(10.0f);
-	const float vertical_spacing = ImGuiFullscreen::LayoutScale(4.0f);
-	const float badge_size = ImGuiFullscreen::LayoutScale(48.0f);
-	const float min_width = ImGuiFullscreen::LayoutScale(200.0f);
-	const float max_width = ImGuiFullscreen::LayoutScale(800.0f);
-	const float shadow_size = ImGuiFullscreen::LayoutScale(4.0f);
-	const float rounding = ImGuiFullscreen::LayoutScale(4.0f);
+	// ARMSX2: everything scales with the user's notification size, text and badge included --
+	// the stock size was hard to read on a handheld.
+	const float scale = s_notification_scale;
+	const float horizontal_padding = ImGuiFullscreen::LayoutScale(20.0f) * scale;
+	const float vertical_padding = ImGuiFullscreen::LayoutScale(10.0f) * scale;
+	const float horizontal_spacing = ImGuiFullscreen::LayoutScale(10.0f) * scale;
+	const float vertical_spacing = ImGuiFullscreen::LayoutScale(4.0f) * scale;
+	const float badge_size = ImGuiFullscreen::LayoutScale(48.0f) * scale;
+	const float min_width = ImGuiFullscreen::LayoutScale(200.0f) * scale;
+	const float max_width = ImGuiFullscreen::LayoutScale(800.0f) * scale;
+	const float shadow_size = ImGuiFullscreen::LayoutScale(4.0f) * scale;
+	const float rounding = ImGuiFullscreen::LayoutScale(4.0f) * scale;
 
-	const std::pair<ImFont*, float> title_font = ImGuiFullscreen::g_large_font;
-	const std::pair<ImFont*, float> text_font = ImGuiFullscreen::g_medium_font;
+	const std::pair<ImFont*, float> title_font(ImGuiFullscreen::g_large_font.first, ImGuiFullscreen::g_large_font.second * scale);
+	const std::pair<ImFont*, float> text_font(ImGuiFullscreen::g_medium_font.first, ImGuiFullscreen::g_medium_font.second * scale);
 
 	const u32 toast_background_color = IM_COL32(0x21, 0x21, 0x21, 255);
 	const u32 toast_border_color = IM_COL32(0x48, 0x48, 0x48, 255);

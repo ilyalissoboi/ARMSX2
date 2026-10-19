@@ -50,6 +50,11 @@ object PadRouter {
      * Auto-assignment is first-to-press, which is fine until two people care WHICH player they
      * are -- an external pad and a handheld's built-in controller cannot be told apart by press
      * order alone. A pin overrides that for the pads it names and leaves the rest automatic.
+     *
+     * Several pads can be pinned to one player, and all of them play as it: a handheld's own
+     * controls and a pad for the TV it is docked to, both player 1, with nothing to change when
+     * it docks. The live slot holds whichever of them pressed something last; the player's rumble
+     * goes to all of them ([otherDevicesForPort]).
      */
     private val pinned = LinkedHashMap<String, Int>()
     private const val KEY_PINNED = "pad_router_pinned"
@@ -68,10 +73,30 @@ object PadRouter {
     private val rumbleModes = LinkedHashMap<String, RumbleMode>()
     private const val KEY_RUMBLE = "pad_router_rumble"
 
+    /**
+     * Every controller plays as player 1, whatever presses first and whatever is pinned.
+     *
+     * For one person on a handheld that gets docked: its own controls and a Bluetooth pad both
+     * drive player 1, with nothing to assign first. Pinning each of them to player 1 does the
+     * same, but nobody found it. The pins stay saved and apply again once this is off.
+     */
+    @Volatile var allToPlayer1 = false
+        private set
+    private const val KEY_ALL_P1 = "pad_router_all_p1"
+
+    fun setAllToPlayer1(on: Boolean) {
+        allToPlayer1 = on
+        reset()
+        com.armsx2.runtime.MainActivityRuntime.prefs.edit().putBoolean(KEY_ALL_P1, on).apply()
+    }
+
     /** Load pins and rumble choices from prefs. Safe to call more than once. */
     fun loadPins() {
         pinned.clear()
         rumbleModes.clear()
+        allToPlayer1 = runCatching {
+            com.armsx2.runtime.MainActivityRuntime.prefs.getBoolean(KEY_ALL_P1, false)
+        }.getOrDefault(false)
         runCatching {
             val raw = com.armsx2.runtime.MainActivityRuntime.prefs.getString(KEY_PINNED, null)
             if (raw != null) {
@@ -128,19 +153,20 @@ object PadRouter {
     /**
      * Pin a controller to a player slot, or pass null to clear it.
      *
-     * A slot holds one controller, so pinning displaces whatever else claimed it -- both the
-     * pin and the live slot, otherwise the settings screen would disagree with where input
-     * actually goes until the next reset.
+     * The controllers already pinned to that player stay: they all play as it (see [pinned]).
+     * Anything that merely claimed the slot by pressing first is displaced, the live claim with
+     * it, otherwise the settings screen would disagree with where input actually goes until the
+     * next reset.
      */
     fun setPin(descriptor: String, port: Int?) {
         if (port == null) {
             pinned.remove(descriptor)
         } else {
             if (port !in 0 until MAX_PADS) return
-            pinned.entries.removeAll { it.value == port && it.key != descriptor }
             pinned[descriptor] = port
             val claimed = slots[port]
-            if (claimed >= 0 && descriptorOf(claimed) != descriptor) slots[port] = -1
+            val claimedBy = if (claimed >= 0) descriptorOf(claimed) else null
+            if (claimed >= 0 && claimedBy != descriptor && claimedBy?.let { pinned[it] } != port) slots[port] = -1
             for (i in slots.indices) {
                 if (i != port && slots[i] >= 0 && descriptorOf(slots[i]) == descriptor) slots[i] = -1
             }
@@ -206,6 +232,7 @@ object PadRouter {
      */
     fun fallbackDeviceIdForPort(port: Int): Int {
         if (port !in slots.indices) return -1
+        if (allToPlayer1) return if (port == 0) connectedPads().firstOrNull()?.deviceId ?: -1 else -1
         val pins = pins()
         val free = connectedPads().filter { pins[it.descriptor] == null }
         if (free.isEmpty()) return -1
@@ -213,6 +240,24 @@ object PadRouter {
         var rank = 0
         for (p in 0 until port) if (p !in pinnedPorts) rank++
         return free.getOrNull(rank)?.deviceId ?: -1
+    }
+
+    /**
+     * The other controllers playing as [port] besides [primary], so that player's rumble reaches
+     * all of them: every connected pad pinned to it. Before, only the one that pressed something
+     * last felt it, and the other pad of a docked handheld stayed still. Each still goes where its
+     * own rumble setting says ([rumbleMode]), Off included. One device per physical controller,
+     * never [primary]'s, and none for a pin Multitap does not arm.
+     */
+    fun otherDevicesForPort(port: Int, primary: Int): IntArray {
+        // With every controller on player 1, every controller is one of player 1's.
+        if (allToPlayer1 && port != 0) return IntArray(0)
+        if (!allToPlayer1 && (pinned.isEmpty() || port !in 0 until activeSlotCount())) return IntArray(0)
+        val primaryDescriptor = if (primary >= 0) descriptorOf(primary) else null
+        return connectedPads()
+            .filter { (allToPlayer1 || pinned[it.descriptor] == port) && it.descriptor != primaryDescriptor }
+            .map { it.deviceId }
+            .toIntArray()
     }
 
     /** Fired exactly once, the first time the 2nd controller (slot 1 = P2 main) joins,
@@ -244,6 +289,11 @@ object PadRouter {
         }
     }
 
+    /** Whether a connected controller is pinned to player 2, whose port must then be plugged in
+     *  even when it is the only controller there. */
+    fun player2Pinned(devices: List<InputDevice>): Boolean =
+        devices.any { dev -> dev.descriptor?.let { pinned[it] } == 1 }
+
     /** True once a second controller has joined this session (P2 main is live). */
     fun coopActive(): Boolean = slots[1] != -1
 
@@ -251,6 +301,14 @@ object PadRouter {
      *  Lets per-slot PS2 rumble buzz the right pad. */
     fun deviceIdForPort(port: Int): Int {
         if (port !in slots.indices) return -1
+
+        // Everything on player 1: the controller that pressed something last answers for it.
+        if (allToPlayer1) {
+            if (port != 0) return -1
+            val live = slots[0]
+            if (live >= 0 && runCatching { InputDevice.getDevice(live) }.getOrNull() != null) return live
+            return -1
+        }
 
         // A PIN OUTRANKS A CLAIM. Slots are filled first-to-press, so a pad can auto-claim a
         // port before the user ever states a preference -- on a handheld the built-in pad
@@ -260,7 +318,15 @@ object PadRouter {
         //
         // Checked against connected pads, so a pin for a controller that is not plugged in
         // does not black-hole the port.
+        //
+        // Several pads can be pinned to one player: the one that pressed something last holds
+        // the live slot and answers. The others get the player's rumble too (otherDevicesForPort).
         if (pinned.isNotEmpty()) {
+            val live = slots[port]
+            if (live >= 0) {
+                val dev = runCatching { InputDevice.getDevice(live) }.getOrNull()
+                if (dev != null && pinned[dev.descriptor] == port) return live
+            }
             for (pad in connectedPads()) {
                 if (pinned[pad.descriptor] == port) return pad.deviceId
             }
@@ -284,6 +350,17 @@ object PadRouter {
      * and non-gamepad nodes never claim a slot — they're treated as Player 1.
      */
     fun portForDevice(deviceId: Int): Int {
+        if (allToPlayer1) {
+            // Remembered as the last to press, so it answers for player 1 (deviceIdForPort). Only
+            // a real pad node: a DualSense's touchpad node is not where its motors are.
+            if (deviceId >= 0 && slots[0] != deviceId) {
+                val src = runCatching { InputDevice.getDevice(deviceId)?.sources }.getOrNull() ?: 0
+                if ((src and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+                    (src and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+                ) slots[0] = deviceId
+            }
+            return 0
+        }
         // The USB takeover's synthetic id, which belongs to the slot it was started for.
         if (deviceId != 0 && deviceId == syntheticDeviceId) return syntheticPort
         if (deviceId < 0) return 0

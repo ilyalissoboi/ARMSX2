@@ -10,7 +10,10 @@
 #include "SIO/Sio2.h"
 
 #include "Sif.h"
+#include "IopThread/EeBridge.h"
+#include "IopThread/OwnerAsserts.h"
 #include "DEV9/DEV9.h"
+#include "common/ARCADE.h"
 
 using namespace R3000A;
 
@@ -56,6 +59,8 @@ static void psxDmaGeneric(u32 madr, u32 bcr, u32 chcr, u32 spuCore)
 
 void psxDma4(u32 madr, u32 bcr, u32 chcr) // SPU2's Core 0
 {
+	IOP_SIDE_ASSERT();
+
 	psxDmaGeneric(madr, bcr, chcr, 0);
 }
 
@@ -85,6 +90,8 @@ void spu2DMA4Irq()
 
 void psxDma7(u32 madr, u32 bcr, u32 chcr) // SPU2's Core 1
 {
+	IOP_SIDE_ASSERT();
+
 	psxDmaGeneric(madr, bcr, chcr, 1);
 }
 
@@ -114,6 +121,8 @@ void spu2DMA7Irq()
 #ifndef DISABLE_PSX_GPU_DMAS
 void psxDma2(u32 madr, u32 bcr, u32 chcr) // GPU
 {
+	IOP_SIDE_ASSERT();
+
 	//DevCon.Warning("SIF2 IOP CHCR = %x MADR = %x BCR = %x first 16bits %x", chcr, madr, bcr, iopMemRead16(madr));
 	sif2.iop.busy = true;
 	sif2.iop.end = false;
@@ -125,6 +134,8 @@ void psxDma2(u32 madr, u32 bcr, u32 chcr) // GPU
 
 void psxDma6(u32 madr, u32 bcr, u32 chcr)
 {
+	IOP_SIDE_ASSERT();
+
 	u32* mem = (u32*)iopPhysMem(madr);
 
 	PSXDMA_LOG("*** DMA 6 - OT *** %lx addr = %lx size = %lx", chcr, madr, bcr);
@@ -151,18 +162,21 @@ void psxDma6(u32 madr, u32 bcr, u32 chcr)
 
 void psxDma8(u32 madr, u32 bcr, u32 chcr)
 {
-	const int size = (bcr >> 16) * (bcr & 0xFFFF) * 8;
+	IOP_SIDE_ASSERT();
+
+	const int size = (bcr >> 16) * (bcr & 0xFFFF);
 
 	switch (chcr & 0x01000201)
 	{
 		case 0x01000201: //cpu to dev9 transfer
 			PSXDMA_LOG("*** DMA 8 - DEV9 mem2dev9 *** %lx addr = %lx size = %lx", chcr, madr, bcr);
-			DEV9writeDMA8Mem((u32*)iopPhysMem(madr), size);
+			DEV9writeDMA8Mem((u32*)iopPhysMem(madr), size * 4);
 			break;
 
 		case 0x01000200: //dev9 to cpu transfer
 			PSXDMA_LOG("*** DMA 8 - DEV9 dev9mem *** %lx addr = %lx size = %lx", chcr, madr, bcr);
-			DEV9readDMA8Mem((u32*)iopPhysMem(madr), size);
+			DEV9readDMA8Mem((u32*)iopPhysMem(madr), size * 4);
+			psxCpu->Clear(madr, size);
 			break;
 
 		default:
@@ -182,26 +196,37 @@ void psxDMA8Interrupt()
 
 void psxDma9(u32 madr, u32 bcr, u32 chcr)
 {
+	IOP_SIDE_ASSERT();
+
 	SIF_LOG("IOP: dmaSIF0 chcr = %lx, madr = %lx, bcr = %lx, tadr = %lx", chcr, madr, bcr, HW_DMA9_TADR);
 
 	sif0.iop.busy = true;
 	sif0.iop.end = false;
 
-	SIF0Dma();
+	EeBridge::Sif0Pump();
+
+	// On an arcade board, clear DMA9's busy bit once SIF0 is idle, so each queued sceSifSetDma kicks
+	// again and reads its reused bounce buffer fresh; otherwise movies corrupt (PCSX2x6).
+	if (Arcade::IsActive() && !sif0.iop.busy)
+		HW_DMA9_CHCR &= ~0x01000000;
 }
 
 void psxDma10(u32 madr, u32 bcr, u32 chcr)
 {
+	IOP_SIDE_ASSERT();
+
 	SIF_LOG("IOP: dmaSIF1 chcr = %lx, madr = %lx, bcr = %lx", chcr, madr, bcr);
 
 	sif1.iop.busy = true;
 	sif1.iop.end = false;
 
-	SIF1Dma();
+	EeBridge::Sif1Pump();
 }
 
 void psxDma11(u32 madr, u32 bcr, u32 chcr)
 {
+	IOP_SIDE_ASSERT();
+
 	unsigned int i, j;
 	int size = (bcr >> 16) * (bcr & 0xffff);
 	PSXDMA_LOG("*** DMA 11 - SIO2 in *** %lx addr = %lx size = %lx", chcr, madr, bcr);
@@ -239,6 +264,8 @@ void psxDMA11Interrupt()
 
 void psxDma12(u32 madr, u32 bcr, u32 chcr)
 {
+	IOP_SIDE_ASSERT();
+
 	int size = ((bcr >> 16) * (bcr & 0xFFFF)) * 4;
 	PSXDMA_LOG("*** DMA 12 - SIO2 out *** %lx addr = %lx size = %lx", chcr, madr, size);
 

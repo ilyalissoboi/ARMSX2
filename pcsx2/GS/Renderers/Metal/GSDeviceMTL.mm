@@ -642,22 +642,20 @@ static constexpr MTLPixelFormat ConvertPixelFormat(GSTexture::Format format)
 		case GSTexture::Format::BC2:          return MTLPixelFormatBC2_RGBA;
 		case GSTexture::Format::BC3:          return MTLPixelFormatBC3_RGBA;
 		case GSTexture::Format::BC7:          return MTLPixelFormatBC7_RGBAUnorm;
-			// Metal ASTC is optional and unimplemented; the replacement loader rejects ASTC
-			// before anything can ask for a pixel format. Keep the switch exhaustive.
-		case GSTexture::Format::ASTC4x4:
-		case GSTexture::Format::ASTC5x4:
-		case GSTexture::Format::ASTC5x5:
-		case GSTexture::Format::ASTC6x5:
-		case GSTexture::Format::ASTC6x6:
-		case GSTexture::Format::ASTC8x5:
-		case GSTexture::Format::ASTC8x6:
-		case GSTexture::Format::ASTC8x8:
-		case GSTexture::Format::ASTC10x5:
-		case GSTexture::Format::ASTC10x6:
-		case GSTexture::Format::ASTC10x8:
-		case GSTexture::Format::ASTC10x10:
-		case GSTexture::Format::ASTC12x10:
-		case GSTexture::Format::ASTC12x12:    return MTLPixelFormatInvalid;
+		case GSTexture::Format::ASTC4x4:      return MTLPixelFormatASTC_4x4_LDR;
+		case GSTexture::Format::ASTC5x4:      return MTLPixelFormatASTC_5x4_LDR;
+		case GSTexture::Format::ASTC5x5:      return MTLPixelFormatASTC_5x5_LDR;
+		case GSTexture::Format::ASTC6x5:      return MTLPixelFormatASTC_6x5_LDR;
+		case GSTexture::Format::ASTC6x6:      return MTLPixelFormatASTC_6x6_LDR;
+		case GSTexture::Format::ASTC8x5:      return MTLPixelFormatASTC_8x5_LDR;
+		case GSTexture::Format::ASTC8x6:      return MTLPixelFormatASTC_8x6_LDR;
+		case GSTexture::Format::ASTC8x8:      return MTLPixelFormatASTC_8x8_LDR;
+		case GSTexture::Format::ASTC10x5:     return MTLPixelFormatASTC_10x5_LDR;
+		case GSTexture::Format::ASTC10x6:     return MTLPixelFormatASTC_10x6_LDR;
+		case GSTexture::Format::ASTC10x8:     return MTLPixelFormatASTC_10x8_LDR;
+		case GSTexture::Format::ASTC10x10:    return MTLPixelFormatASTC_10x10_LDR;
+		case GSTexture::Format::ASTC12x10:    return MTLPixelFormatASTC_12x10_LDR;
+		case GSTexture::Format::ASTC12x12:    return MTLPixelFormatASTC_12x12_LDR;
 	}
 }
 
@@ -666,7 +664,7 @@ GSTexture* GSDeviceMTL::CreateSurface(GSTexture::Usage usage, int width, int hei
 	pxAssert(GSTexture::ValidateUsageAndFormat(usage, format));
 
 	MTLPixelFormat fmt = ConvertPixelFormat(format);
-	pxAssertRel(format != GSTexture::Format::Invalid, "Can't create surface of this format!");
+	pxAssertRel(fmt != MTLPixelFormatInvalid, "Can't create surface of this format!");
 
 	MTLTextureDescriptor* desc = [MTLTextureDescriptor
 		texture2DDescriptorWithPixelFormat:fmt
@@ -724,7 +722,7 @@ GSTexture* GSDeviceMTL::CreateSurface(GSTexture::Usage usage, int width, int hei
 	}
 }}
 
-void GSDeviceMTL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex, GSVector4* dRect, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c, const Filter filter)
+void GSDeviceMTL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex, GSVector4* dRect, const MergeTopBand* top_band, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c, const Filter filter)
 { @autoreleasepool {
 	id<MTLCommandBuffer> cmdbuf = GetRenderCmdBuf();
 	GSScopedDebugGroupMTL dbg(cmdbuf, @"DoMerge");
@@ -747,6 +745,8 @@ void GSDeviceMTL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
 		// 2nd output is enabled and selected. Copy it to destination so we can blend it with 1st output
 		// Note: value outside of dRect must contains the background color (c)
 		StretchRect(sTex[1], sRect[1], dTex, dRect[1], ShaderConvert::COPY, filter);
+		if (top_band[1].enabled)
+			StretchRect(sTex[1], top_band[1].src, dTex, top_band[1].dst, ShaderConvert::COPY, filter);
 	}
 
 	// Save 2nd output
@@ -766,11 +766,21 @@ void GSDeviceMTL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
 		{
 			// Blend with a constant alpha
 			DoStretchRect(sTex[0], sRect[0], dTex, dRect[0], pipeline, filter, LoadAction::Load, &cb_c, sizeof(cb_c));
+			if (top_band[0].enabled)
+			{
+				DoStretchRect(sTex[0], top_band[0].src, dTex, top_band[0].dst, pipeline, filter, LoadAction::Load,
+					&cb_c, sizeof(cb_c));
+			}
 		}
 		else
 		{
 			// Blend with 2 * input alpha
 			DoStretchRect(sTex[0], sRect[0], dTex, dRect[0], pipeline, filter, LoadAction::Load, nullptr, 0);
+			if (top_band[0].enabled)
+			{
+				DoStretchRect(sTex[0], top_band[0].src, dTex, top_band[0].dst, pipeline, filter, LoadAction::Load,
+					nullptr, 0);
+			}
 		}
 	}
 
@@ -810,12 +820,14 @@ void GSDeviceMTL::DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float par
 
 #ifdef ARMSX2_HAS_LIBRASHADER
 
-static void ReportShaderChainError(const char* what, libra_error_t err)
+static std::string ReportShaderChainError(const char* what, libra_error_t err)
 {
+	std::string message;
 	char* msg = nullptr;
 	if (libra_error_write(err, &msg) == 0 && msg)
 	{
 		Console.Error("(GS) librashader %s failed: %s", what, msg);
+		message = msg;
 		libra_error_free_string(&msg);
 	}
 	else
@@ -823,6 +835,7 @@ static void ReportShaderChainError(const char* what, libra_error_t err)
 		Console.Error("(GS) librashader %s failed (errno %d)", what, static_cast<int>(libra_error_errno(err)));
 	}
 	libra_error_free(&err);
+	return message;
 }
 
 #endif
@@ -871,12 +884,17 @@ bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fr
 #else
 	// Latch it, or a preset that fails to compile runs a full slang compile every frame
 	if (m_shader_chain_failed && m_shader_chain_preset == GSConfig.ShaderChainPreset)
-		return false;
+	{
+		if (m_shader_chain_retry == GetShaderChainRetry())
+			return false;
+		DestroyShaderChain();
+	}
 
 	if (!m_shader_chain || m_shader_chain_preset != GSConfig.ShaderChainPreset)
 	{
 		DestroyShaderChain();
 		m_shader_chain_preset = GSConfig.ShaderChainPreset;
+		m_shader_chain_retry = GetShaderChainRetry();
 
 		libra_shader_preset_t preset = nullptr;
 		if (libra_error_t err = libra_preset_create(m_shader_chain_preset.c_str(), &preset))
@@ -890,12 +908,13 @@ bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fr
 		libra_mtl_filter_chain_t chain = nullptr;
 		if (libra_error_t err = libra_mtl_filter_chain_create(&preset, m_queue, nullptr, &chain))
 		{
-			ReportShaderChainError("chain create", err);
+			SetShaderChainError(m_shader_chain_preset, ReportShaderChainError("chain create", err));
 			m_shader_chain_failed = true;
 			return false;
 		}
 
 		m_shader_chain = chain;
+		SetShaderChainError({}, {});
 		m_shader_param_generation = 0;
 		Console.WriteLn("(GS) librashader: loaded preset '%s'", m_shader_chain_preset.c_str());
 	}
@@ -914,19 +933,16 @@ bool GSDeviceMTL::DoApplyShaderChain(GSTexture* sTex, GSTexture* dTex, size_t fr
 	if (libra_error_t err = libra_mtl_filter_chain_frame(
 			&chain, GetRenderCmdBuf(), frame_count, src, dst, &vp, nullptr, nullptr))
 	{
-		ReportShaderChainError("frame", err);
+		SetShaderChainError(m_shader_chain_preset, ReportShaderChainError("frame", err));
 		m_shader_chain_failed = true;
-		// A chain that failed partway has already encoded passes into this command buffer, and
-		// the ring it recycles per-frame objects over is shallower than our deferred-submit
-		// window. The success path flushes for exactly that reason; so must this one.
+		// A failed frame may already have encoded passes, so it flushes like the success path.
 		FlushEncoders();
 		return false;
 	}
 	dTex->SetState(GSTexture::State::Dirty);
 
-	// librashader recycles per-frame objects over a ring shallower than our deferred-submit
-	// window, so a frame is only safe once a submit follows it. This also clears the
-	// deferred-submit counters, so a chain frame always ends a batch
+	// librashader reuses per-frame objects over a ring shallower than the deferred-submit window,
+	// so every chain frame is submitted before the next. This also ends the current batch.
 	FlushEncoders();
 	return true;
 #endif
@@ -1281,7 +1297,10 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 			Console.Warning("Metal: Couldn't find adapter %s, using default", GSConfig.Adapter.c_str());
 		m_dev = GSMTLDevice(MRCTransfer(MTLCreateSystemDefaultDevice()));
 		if (!m_dev.dev)
-			Host::ReportErrorAsync(TRANSLATE_SV("GSDeviceMTL", "No Metal Devices Available"), TRANSLATE_SV("GSDeviceMTL", "No Metal-supporting GPUs were found.  PCSX2 requires a Metal GPU (available on all Macs from 2012 onwards)."));
+		{
+			Host::ReportErrorAsync(TRANSLATE_SV("GSDeviceMTL", "No Metal Devices Available"), TRANSLATE_SV("GSDeviceMTL", "No Metal-supporting GPUs were found.  PCSX2 requires a Metal GPU (available on all Macs from 2012 onwards).  If you're using OCLP on a Mac that should support Metal, try rerunning the OCLP installer."));
+			return false;
+		}
 	}
 
 	m_name = [[m_dev.dev name] UTF8String];
@@ -1349,8 +1368,11 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	m_features.point_expand = true;
 	m_features.line_expand = false;
 	m_features.prefer_new_textures = true;
-	m_features.dxt_textures = true;
-	m_features.bptc_textures = true;
+	// Only Apple9 and some iPads sample BC on iOS; without it the replacement loader decodes on the CPU.
+	m_features.dxt_textures = [m_dev.dev supportsBCTextureCompression];
+	m_features.bptc_textures = m_features.dxt_textures;
+	// Every Apple GPU samples ASTC; a Mac with an Intel or AMD GPU does not.
+	m_features.astc_textures = [m_dev.dev supportsFamily:MTLGPUFamilyApple2];
 	m_features.framebuffer_fetch = m_dev.features.framebuffer_fetch && !GSConfig.DisableFramebufferFetch;
 	// Apple's programmable blending reads the tile in rasterization order, so overlapping
 	// primitives in one draw already observe each other and a full barrier adds nothing.
@@ -1373,7 +1395,7 @@ bool GSDeviceMTL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	// shows through as pinpoints -- God of War II's Athena statue, and dark walls in Black.
 	// Skipping the floor also drops [[depth(less)]] output, restoring early-ZS on a TBDR.
 	// See the matching gate in GSDeviceVK::CheckFeatures for the measurements.
-	m_features.no_ps2_z_quantization = GSConfig.DisablePS2DepthQuantization || m_dev.features.apple_gpu;
+	m_features.no_ps2_z_quantization = m_dev.features.apple_gpu;
 	// MetalFX spatial upscaler: macOS 13+ / iOS 16+ device. The supportsDevice:
 	// probe returns NO on devices whose GPU lacks the hardware. On the iOS Simulator
 	// the MetalFX framework is absent at compile time (PCSX2_HAS_METALFX=0), so the
@@ -2408,6 +2430,7 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 		setFnConstantB(m_fn_constants, pssel.colclip_hw,            GSMTLConstantIndex_PS_COLCLIP_HW);
 		setFnConstantB(m_fn_constants, pssel.rta_correction,        GSMTLConstantIndex_PS_RTA_CORRECTION);
 		setFnConstantB(m_fn_constants, pssel.rta_source_correction, GSMTLConstantIndex_PS_RTA_SRC_CORRECTION);
+		setFnConstantB(m_fn_constants, pssel.replacement_alpha_snap, GSMTLConstantIndex_PS_REPLACEMENT_ALPHA_SNAP);
 		setFnConstantB(m_fn_constants, pssel.colclip,               GSMTLConstantIndex_PS_COLCLIP);
 		setFnConstantI(m_fn_constants, pssel.blend_mix,             GSMTLConstantIndex_PS_BLEND_MIX);
 		setFnConstantB(m_fn_constants, pssel.round_inv,             GSMTLConstantIndex_PS_ROUND_INV);
@@ -2427,6 +2450,7 @@ void GSDeviceMTL::MRESetHWPipelineState(GSHWDrawConfig::VSSelector vssel, GSHWDr
 		setFnConstantB(m_fn_constants, pssel.automatic_lod,         GSMTLConstantIndex_PS_AUTOMATIC_LOD);
 		setFnConstantB(m_fn_constants, pssel.manual_lod,            GSMTLConstantIndex_PS_MANUAL_LOD);
 		setFnConstantB(m_fn_constants, pssel.region_rect,           GSMTLConstantIndex_PS_REGION_RECT);
+		setFnConstantB(m_fn_constants, pssel.native_texel_grid,     GSMTLConstantIndex_PS_NATIVE_TEXEL_GRID);
 		setFnConstantI(m_fn_constants, pssel.scanmsk,               GSMTLConstantIndex_PS_SCANMSK);
 		setFnConstantI(m_fn_constants, pssel.aa1,                   GSMTLConstantIndex_PS_AA1);
 		setFnConstantB(m_fn_constants, pssel.abe,                   GSMTLConstantIndex_PS_ABE);
@@ -2673,6 +2697,13 @@ static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, TCOffsetHack)     == of
 static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, STScale)          == offsetof(GSMTLMainPSUniform, st_scale));
 static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, DitherMatrix)     == offsetof(GSMTLMainPSUniform, dither_matrix));
 static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, ScaleFactor)      == offsetof(GSMTLMainPSUniform, scale_factor));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, DitherPhase)      == offsetof(GSMTLMainPSUniform, dither_phase));
+static_assert(offsetof(GSHWDrawConfig::PSConstantBuffer, NativeTexelGrid)  == offsetof(GSMTLMainPSUniform, native_texel_grid));
+
+// DoInterlace hands the shader the whole InterlaceConstantBuffer, so the two layouts have to agree.
+static_assert(sizeof(InterlaceConstantBuffer) == sizeof(GSMTLInterlacePSUniform));
+static_assert(offsetof(InterlaceConstantBuffer, ZrH)        == offsetof(GSMTLInterlacePSUniform, ZrH));
+static_assert(offsetof(InterlaceConstantBuffer, FieldPad)   == offsetof(GSMTLInterlacePSUniform, field_pad));
 
 void GSDeviceMTL::SetupDestinationAlpha(GSTexture* rt, GSTexture* ds, const GSVector4i& r, SetDATM datm)
 {
@@ -3129,7 +3160,7 @@ static simd::float4 ToSimd(const ImVec4& vec)
 
 void GSDeviceMTL::RenderImGui(ImDrawData* data)
 {
-	if (data->CmdListsCount == 0)
+	if (data->CmdLists.Size == 0)
 		return;
 	UpdateImGuiTextures();
 	simd::float4 transform;
@@ -3152,7 +3183,7 @@ void GSDeviceMTL::RenderImGui(ImDrawData* data)
 	simd::float2 clip_scale = ToSimd(data->FramebufferScale); // (1,1) unless using retina display which are often (2,2)
 	ImTextureID last_tex = reinterpret_cast<ImTextureID>(nullptr);
 
-	for (int i = 0; i < data->CmdListsCount; i++)
+	for (int i = 0; i < data->CmdLists.Size; i++)
 	{
 		const ImDrawList* cmd_list = data->CmdLists[i];
 		size_t vtx_size = cmd_list->VtxBuffer.Size * sizeof(ImDrawVert);

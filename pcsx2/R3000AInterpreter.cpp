@@ -10,6 +10,7 @@
 #include "DebugTools/Breakpoints.h"
 #include "IopBios.h"
 #include "IopHw.h"
+#include "IopThread/EeBridge.h"
 
 using namespace R3000A;
 
@@ -131,11 +132,13 @@ void psxBreakpoint(bool memcheck)
 		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_IOP, pc);
 		if (cond && !cond->Evaluate())
 			return;
+
+		if (!CBreakPoints::HandleBreakpointHit(BREAKPOINT_IOP, pc))
+			return;
 	}
 
 	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_IOP);
-	VMManager::SetPaused(true);
-	Cpu->ExitExecution();
+	EeBridge::RequestPause();
 }
 
 void psxMemcheck(u32 op, u32 bits, bool store)
@@ -147,10 +150,10 @@ void psxMemcheck(u32 op, u32 bits, bool store)
 
 	u32 end = start + bits / 8;
 
-	auto checks = CBreakPoints::GetMemChecks(BREAKPOINT_IOP);
+	const auto checks = CBreakPoints::GetMemChecks(BREAKPOINT_IOP);
 	for (size_t i = 0; i < checks.size(); i++)
 	{
-		auto& check = checks[i];
+		const auto& check = checks[i];
 
 		if (check.result == 0)
 			continue;

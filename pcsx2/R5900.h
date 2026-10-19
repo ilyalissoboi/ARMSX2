@@ -4,6 +4,7 @@
 #pragma once
 
 #include "EeFpuFormat.h"
+#include "IopThread/IopThreadMode.h"
 
 #include "common/Pcsx2Defs.h"
 
@@ -285,7 +286,7 @@ struct EeCop2RecState
 	alignas(16) u32 maxFloat[4];      // +FLT_MAX per lane (clamp upper bound)
 	alignas(16) u32 minFloat[4];      // -FLT_MAX per lane (pre-negated lower bound)
 	alignas(16) u32 destMasks[16][4]; // per-XYZW lane-select masks (lane = ~0 if written)
-	alignas(16) u32 clipWeightPos[4]; // VCLIP positive per-lane clip-bit weights
+	alignas(16) u16 clipWeights[8];   // VCLIP per-comparison clip-bit weights
 	alignas(16) u32 deficitPark[4];   // multiply-deficit scratch (block-transient)
 	alignas(16) u32 bandFs[4];        // short-tail band operands and product
 	alignas(16) u32 bandFt[4];        // (block-transient)
@@ -303,10 +304,11 @@ struct cpuRegistersPack
 	// fields with single [RSTATE, #imm] accesses. Prediction-only state: NOT
 	// savestate-serialized (Freeze(cpuRegs) covers cpuRegisters alone) and
 	// reset by recResetRaw. eeCallRetOff is a byte offset into the ring,
-	// 16-aligned, wrapped by the emitted And; u64 so JIT stores stay whole-
-	// register. x86 builds carry the 16 bytes and never touch them.
+	// 16-aligned; the ring is exactly 64KB, so the field's own width is the
+	// wrap and the emitted code needs no mask. x86 builds carry the bytes and
+	// never touch them.
 	alignas(16) u64 eeCallRetBase;
-	u64 eeCallRetOff;
+	u16 eeCallRetOff;
 
 	// COP2 macro-mode constants/scratch — in the pack for the same reason as
 	// the call-ret fields: one [RSTATE, #imm] instruction per access from
@@ -497,7 +499,33 @@ extern int  cpuTestCycle( u64 startCycle, s32 delta );
 extern void cpuSetEvent();
 extern int cpuGetCycles(int interrupt);
 
-extern void _cpuEventTest_Shared();		// for internal use by the Dynarecs and Ints inside R5900:
+// The shared event test, compiled once per IOP thread mode. The mode only changes how the IOP's slice
+// is run, and which instance is called is chosen where the CPU provider is reset (the JIT's dispatcher
+// is generated for it, the interpreter's pointer is set with it), so the Off instance has no test of
+// the mode in it. Instances exist for Off, Lockstep and Threaded.
+template <IopThreadMode M>
+extern void _cpuEventTest_Shared();
+
+// The unchanged name, for internal use by the Dynarecs and Ints inside R5900. It is the Off instance:
+// the x86 recompilers call it exactly as they always did (x86 resolves every IOP thread mode to Off),
+// and the ARM64 JIT and interpreter call the instance of the mode in effect. Inline, so no second
+// copy of the event test is built where nothing calls it.
+inline void _cpuEventTest_Shared()
+{
+	_cpuEventTest_Shared<IopThreadMode::Off>();
+}
+
+using CpuEventTestFn = void (*)();
+/// The event test instance for `mode`.
+CpuEventTestFn cpuEventTestFor(IopThreadMode mode);
+
+/// The interpreter's event test calls this. It is the instance for the mode in effect; the IOP
+/// thread code sets it together with the mode.
+extern CpuEventTestFn g_intEventTestShared;
+
+/// What the IOP does with a slice once the EE has settled its books: its CPU runs the budget if it
+/// has work, then its event test. In Lockstep the IOP thread runs this while the EE waits.
+void iopRunSliceOnIopThread();
 
 extern void cpuTestINTCInts();
 extern void cpuTestDMACInts();

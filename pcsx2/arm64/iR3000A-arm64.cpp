@@ -10,10 +10,12 @@
 #include "R5900OpcodeTables.h"
 #include "IopBios.h"
 #include "IopHw.h"
+#include "IopThread/EeBridge.h"
 #include "DebugTools/SymbolGuardian.h"
 #include "Common.h"
 #include "VMManager.h"
 #include "Config.h"
+#include "EECycleRate.h"
 
 #include "common/Assertions.h"
 #include "common/AlignedMalloc.h"
@@ -99,16 +101,11 @@ static ArmConstantPool s_iopConstantPool;
 
 static void iopRecRecompile(u32 startpc);
 
-static const void* iopDispatcherEvent = nullptr;
 static const void* iopDispatcherReg = nullptr;
 static const void* iopJITCompile = nullptr;
 static const void* iopEnterRecompiledCode = nullptr;
 static const void* iopExitRecompiledCode = nullptr;
 static const void* iopUnmappedRecLUTPage = nullptr;
-static void recEventTest()
-{
-	_cpuEventTest_Shared();
-}
 
 // ARM64 dispatcher: Load PC → two-level LUT lookup → jump to block
 //
@@ -303,10 +300,6 @@ static void _DynGen_Dispatchers()
 {
 	const u8* start = armGetCurrentCodePointer();
 
-	// Event test: call recEventTest, then fall through to dispatcher
-	iopDispatcherEvent = armGetCurrentCodePointer();
-	armEmitCall((void*)recEventTest);
-
 	iopDispatcherReg = _DynGen_DispatcherReg();
 	iopJITCompile = _DynGen_JITCompile();
 	iopEnterRecompiledCode = _DynGen_EnterRecompiledCode();
@@ -341,8 +334,7 @@ static void iopRecError(int err)
 			break;
 	}
 
-	VMManager::SetPaused(true);
-	Cpu->ExitExecution();
+	EeBridge::RequestPause();
 }
 
 // =====================================================================================================
@@ -573,9 +565,10 @@ static __fi u32 psxScaleBlockCycles()
 	return s_psxBlockCycles;
 }
 
-// Contract: leaves the new iopCycleEE value in RWSCRATCH (callers test it
-// against 0 for the timeslice exit) and must not clobber x2 (the caller's
-// freshly-stored psxRegs.cycle, still live for the event check).
+// Contract: leaves the new iopCycleEE value in RWSCRATCH, and the flags of the
+// subtraction that produced it, so a caller's timeslice exit is a bare b.le
+// with nothing between. Must not clobber x2 (the caller's freshly-stored
+// psxRegs.cycle, still live for the event check).
 static void iPsxAddEECycles(u32 blockCycles)
 {
 	if (!(psxHu32(HW_ICFG) & (1 << 3))) [[likely]]
@@ -586,17 +579,17 @@ static void iPsxAddEECycles(u32 blockCycles)
 		if (blockCycles != 0xFFFFFFFF)
 		{
 			if (blockCycles * 8 < 4096)
-				armAsm->Sub(RWSCRATCH, RWSCRATCH, blockCycles * 8);
+				armAsm->Subs(RWSCRATCH, RWSCRATCH, blockCycles * 8);
 			else
 			{
 				armAsm->Mov(a64::w1, blockCycles * 8);
-				armAsm->Sub(RWSCRATCH, RWSCRATCH, a64::w1);
+				armAsm->Subs(RWSCRATCH, RWSCRATCH, a64::w1);
 			}
 		}
 		else
 		{
 			// blockCycles in w0 (from wait loop optimization)
-			armAsm->Sub(RWSCRATCH, RWSCRATCH, a64::w0);
+			armAsm->Subs(RWSCRATCH, RWSCRATCH, a64::w0);
 		}
 
 		armAsm->Str(RWSCRATCH, armPsxRegMem(&psxRegs.iopCycleEE));
@@ -623,7 +616,7 @@ static void iPsxAddEECycles(u32 blockCycles)
 	armAsm->Msub(a64::w1, a64::w3, a64::w1, a64::w0);   // w1 = remainder
 	armAsm->Str(a64::w1, armPsxRegMem(&psxRegs.iopCycleEECarry));
 	armAsm->Ldr(RWSCRATCH, armPsxRegMem(&psxRegs.iopCycleEE));
-	armAsm->Sub(RWSCRATCH, RWSCRATCH, a64::w3);
+	armAsm->Subs(RWSCRATCH, RWSCRATCH, a64::w3);
 	armAsm->Str(RWSCRATCH, armPsxRegMem(&psxRegs.iopCycleEE));
 }
 
@@ -668,7 +661,6 @@ static void iPsxBranchTest(u32 newpc, u32 cpuBranch)
 		// Subtract consumed cycles from iopCycleEE
 		iPsxAddEECycles(0xFFFFFFFF); // uses w0 as the cycle count
 
-		armAsm->Cmp(RWSCRATCH, 0);
 		armEmitCondBranch(a64::le, iopExitRecompiledCode);
 
 		// Call event test
@@ -696,7 +688,6 @@ static void iPsxBranchTest(u32 newpc, u32 cpuBranch)
 
 		// Subtract from iopCycleEE — exit if <= 0
 		iPsxAddEECycles(blockCycles);
-		armAsm->Cmp(RWSCRATCH, 0);
 		armEmitCondBranch(a64::le, iopExitRecompiledCode);
 
 		// Check if event is pending: cycle >= iopNextEventCycle
@@ -1165,6 +1156,7 @@ static void recReserve()
 void recResetIOP()
 {
 	Console.WriteLn(Color_Green, "iR3000A-ARM64 Recompiler reset.");
+	EECycleRate::NoteIopReset();
 
 	if (CHECK_EXTRAMEM != extraRam)
 	{

@@ -28,6 +28,7 @@
 #include "GS/Renderers/SW/GSDrawScanlineCodeGenerator.arm64.h"
 #include "GS/Renderers/SW/GSSetupPrimCodeGenerator.arm64.h"
 #include "GS/Renderers/SW/GSScanlineEnvironment.h"
+#include "GS/Renderers/SW/GSLevelOfDetail.h"
 #include "GS/Renderers/SW/GSVertexSW.h"
 #include "GS/GSLocalMemory.h"
 #include "GS/GSState.h"
@@ -35,6 +36,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstring>
 
 #ifndef _WIN32
@@ -75,14 +77,16 @@ struct Span
 
 // The reciprocal the scanline multiplies by, in scalar, so a test can say what it
 // expects rather than only that the two paths agree. Same rule as
-// GSPerspectiveRecip: a float32 reciprocal with its low ten mantissa bits cleared.
-float TruncRecip(float q)
+// GSPerspectiveRecip: a float32 reciprocal on a grid of fifteen bits below its
+// leading bit, rounded as floor(x + 0.7) -- 179 of the 256 units of the mantissa's
+// last bit under the grid, added and then the low eight bits cleared.
+float GridRecip(float q)
 {
 	float r = 1.0f / q;
 	u32 bits;
 
 	std::memcpy(&bits, &r, sizeof(bits));
-	bits &= 0xfffffc00u;
+	bits = (bits + GS_RECIP_ROUND_UP) & ~((1u << GS_RECIP_GRID_SHIFT) - 1);
 	std::memcpy(&r, &bits, sizeof(bits));
 
 	return r;
@@ -355,23 +359,28 @@ u8* SwScanlineLodTest::s_code = nullptr;
 size_t SwScanlineLodTest::s_code_used = 0;
 GSLocalMemory* SwScanlineLodTest::s_mem = nullptr;
 
-// ---- the truncated perspective reciprocal -------------------------------------
+// ---- the perspective reciprocal -------------------------------------------------
 
-// The GS multiplies by a reciprocal truncated to thirteen mantissa bits rather than
-// dividing, so a perspective coordinate lands a little short of the true quotient --
-// which changes the sampled texel wherever the exact quotient lands on a boundary.
-TEST_F(SwScanlineLodTest, PerspectiveSamplesTheTruncatedReciprocal)
+// The GS multiplies by a reciprocal on a coarse grid rather than dividing, so a
+// perspective coordinate is not the true quotient: fifteen bits below the
+// reciprocal's leading bit, rounded as floor(x + 0.7) (GSPerspectivePlane.h). That
+// rounds UP by up to a grid step, which the old truncation to fourteen bits did not,
+// and it changes the sampled texel wherever the exact quotient sits just short of a
+// boundary.
+//
+// q = 3 has a reciprocal with bits below the grid, and s is placed a sixth of a
+// sixteenth of a texel under the boundary of texel 2: the exact quotient and the old
+// truncated reciprocal both read texel 1, the grid's rounded-up one reads texel 2.
+TEST_F(SwScanlineLodTest, PerspectiveSamplesTheGridReciprocal)
 {
 	GSScanlineSelector sel = BaseSelector();
 	sel.fst = 0; // perspective
 	sel.ltf = 0; // nearest, so the stored pixel is one texel and not a blend
 
 	// s and q are constant across the span, so nothing here depends on the DDA: the
-	// only thing between s/q and the texel is the reciprocal. q = 3 is a value whose
-	// float32 reciprocal has mantissa bits below the truncation, and s is three
-	// texels' worth of it, so the exact quotient lands exactly on texel 2.
+	// only thing between s/q and the texel is the reciprocal.
 	const float q = 3.0f;
-	const float s = 3.0f * 2.0f * static_cast<float>(kTexel);
+	const float s = 3.0f * 2.0f * static_cast<float>(kTexel) - 0.09375f;
 
 	Span span{};
 	span.s0 = s;
@@ -381,18 +390,25 @@ TEST_F(SwScanlineLodTest, PerspectiveSamplesTheTruncatedReciprocal)
 	span.dt = 0.0f;
 	span.dq = 0.0f;
 
+	u32 old_bits;
+	float old_r = 1.0f / q;
+	std::memcpy(&old_bits, &old_r, sizeof(old_bits));
+	old_bits &= 0xfffffe00u;
+	std::memcpy(&old_r, &old_bits, sizeof(old_r));
+
 	const int exact = static_cast<int>(s / q) >> 16;
-	const int truncated = static_cast<int>(s * TruncRecip(q)) >> 16;
-	ASSERT_EQ(exact, 2);
-	ASSERT_EQ(truncated, 1) << "the shape of this test is wrong: the two models must differ here";
+	const int old_truncated = static_cast<int>(s * old_r) >> 16;
+	const int grid = static_cast<int>(s * GridRecip(q)) >> 16;
+	ASSERT_EQ(exact, 1);
+	ASSERT_EQ(old_truncated, 1);
+	ASSERT_EQ(grid, 2) << "the shape of this test is wrong: the grid must differ from both here";
 
 	const Row got = Both(sel, span, AddressTexture(), nullptr, "perspective recip");
 
 	for (int i = 0; i < 4; i++)
 	{
-		EXPECT_EQ(got.px[i] & 0xff, static_cast<u32>(truncated))
-			<< "pixel " << i << ": the coordinate came out of an exact divide, not the "
-							   "hardware's truncated reciprocal";
+		EXPECT_EQ(got.px[i] & 0xff, static_cast<u32>(grid))
+			<< "pixel " << i << ": the coordinate did not come from the fifteen-bit rounded reciprocal";
 	}
 }
 
@@ -578,6 +594,155 @@ TEST(SwScanlineLodFraction, TheConstantFractionBroadcastFillsEveryLane)
 
 	for (int i = 0; i < 8; i++)
 		EXPECT_EQ(f.U16[i], 0x1234) << "lane " << i;
+}
+
+// TEX1.K arrives SIGNED -- `s32 K : 12` -- so reading it needs the 1:7:4 scale and
+// nothing else. The draw dumper used to sign-extend it a second time, which turns
+// every negative K into a number an order of magnitude too large: the -30 that
+// Spider-Man 3's draw 16033 sets (-2 levels, so its mip chain runs) printed as
+// -258, and a -258 reads as a chain that can never leave level 0. That misreading
+// cost a round's premise, which is why the conversion is a named function with a
+// test rather than an expression at the format string.
+TEST(Tex1KDecode, TheFieldIsAlreadySignedAndScalesByASixteenth)
+{
+	GIFRegTEX1 t = {};
+
+	t.K = -32;
+	EXPECT_EQ(t.K, -32);
+	EXPECT_FLOAT_EQ(t.KLevels(), -2.0f);
+
+	t.K = -30;
+	EXPECT_FLOAT_EQ(t.KLevels(), -1.875f);
+
+	// The two ends of the twelve-bit field, and zero.
+	t.K = 2047;
+	EXPECT_FLOAT_EQ(t.KLevels(), 127.9375f);
+	t.K = -2048;
+	EXPECT_FLOAT_EQ(t.KLevels(), -128.0f);
+	t.K = 0;
+	EXPECT_FLOAT_EQ(t.KLevels(), 0.0f);
+
+	// What the second sign-extension did, stated so a revert fails here. -32 is the
+	// value the misread was found on, and -258 is what the context file printed.
+	t.K = -32;
+	const float doubled = static_cast<float>((static_cast<int>(t.K) ^ 0x800) - 0x800) / 16.0f;
+	EXPECT_NE(doubled, t.KLevels());
+	EXPECT_FLOAT_EQ(doubled, -258.0f);
+}
+
+// The renderer's own use of the field: `TEX1.K << 12` puts K into the 16.16 the LOD
+// walk carries, folding the sixteenth in (1/16 * 65536 = 4096). A doubly
+// sign-extended K would land 137 levels away from where the walk needs it.
+TEST(Tex1KDecode, TheRendererCarriesKAsSixteenPointSixteen)
+{
+	GIFRegTEX1 t = {};
+	t.K = -32;
+
+	const int k = static_cast<int>(t.K) << 12;
+
+	EXPECT_EQ(k, -131072);
+	EXPECT_FLOAT_EQ(static_cast<float>(k) / 65536.0f, t.KLevels());
+}
+
+// The console's logarithm is a table, and the table has a shape the capture pinned
+// exactly. These tests are on the table itself rather than on a scanline, because
+// a wrong entry is a wrong level everywhere and the scanline suites would only
+// show it where their own cases happen to land.
+TEST(LevelOfDetailTable, TheThirdRowIsTheTrueLogarithmRounded)
+{
+	for (int i = 0; i < GS_LOD_TABLE_SIZE; i++)
+	{
+		const double exact = std::log2(1.0 + i / 128.0) * 128.0;
+
+		EXPECT_EQ(GSLevelOfDetailTable[3][i], static_cast<s32>(std::lround(exact))) << "index " << i;
+	}
+}
+
+TEST(LevelOfDetailTable, TheSecondRowIsTheThirdHalvedUpwards)
+{
+	for (int i = 0; i < GS_LOD_TABLE_SIZE; i++)
+	{
+		const s32 t3 = GSLevelOfDetailTable[3][i];
+
+		EXPECT_EQ(GSLevelOfDetailTable[2][i], (t3 + 1) / 2) << "index " << i;
+	}
+}
+
+// ⚠️ Index 115 -- mantissa 1.8984375 -- steps BACKWARDS in the two shallow rows,
+// in both byte-identical console runs and at sixteen independent K values. It is
+// reproduced on purpose: a level can fall and rise again inside one Q ramp, and a
+// monotone table would be a smoothing of the hardware, not a fix to it.
+TEST(LevelOfDetailTable, TheBrokenEntryIsReproduced)
+{
+	EXPECT_EQ(GSLevelOfDetailTable[0][114], 15);
+	EXPECT_EQ(GSLevelOfDetailTable[0][115], 14);
+	EXPECT_EQ(GSLevelOfDetailTable[0][116], 15);
+
+	EXPECT_EQ(GSLevelOfDetailTable[1][114], 30);
+	EXPECT_EQ(GSLevelOfDetailTable[1][115], 29);
+	EXPECT_EQ(GSLevelOfDetailTable[1][116], 30);
+
+	// And only there, and only in those two rows.
+	for (int l = 0; l < 4; l++)
+	{
+		for (int i = 1; i < GS_LOD_TABLE_SIZE; i++)
+		{
+			if (l < 2 && i == 115)
+				continue;
+
+			EXPECT_GE(GSLevelOfDetailTable[l][i], GSLevelOfDetailTable[l][i - 1])
+				<< "row " << l << " index " << i;
+		}
+	}
+}
+
+// The index is the top seven fractional bits of Q's MANTISSA, and the exponent
+// enters only through the shift -- which is what makes the table repeat per octave
+// exactly. gs-lod separated the two: a table on 1/Q's mantissa would step at
+// values that are not dyadic in Q, and every measured step lands on a multiple of
+// 1/128 of Q's.
+TEST(LevelOfDetailTable, TheIndexIsQsMantissaAndTheTableRepeatsPerOctave)
+{
+	for (int i = 0; i < GS_LOD_TABLE_SIZE; i++)
+	{
+		const float m = 1.0f + static_cast<float>(i) / 128.0f;
+
+		u32 bits;
+		std::memcpy(&bits, &m, sizeof(bits));
+		EXPECT_EQ(GSLevelOfDetailIndex(bits), static_cast<u32>(i)) << "index " << i;
+		EXPECT_EQ(GSLevelOfDetailExponent(bits), 0) << "index " << i;
+
+		// The same mantissa two octaves down: same index, exponent lower by two, so
+		// the level of detail is exactly 2 * 2^(4+L) of a level deeper.
+		const float q = m / 4.0f;
+		const s32 a = GSLevelOfDetail16(m, GSLevelOfDetailTable[1], 0, 5);
+		const s32 b = GSLevelOfDetail16(q, GSLevelOfDetailTable[1], 0, 5);
+
+		EXPECT_EQ(b - a, 2 * 32) << "index " << i;
+	}
+}
+
+// TEX1.K is already in sixteenths of a level, so it enters the sum unscaled, and
+// the round-off mode is (LOD16 + 8) >> 4 with ties going UP -- measured at K = -8,
+// +8, +24, +40, +56 and +72.
+TEST(LevelOfDetailTable, KIsSixteenthsAndATieRoundsUp)
+{
+	// Mantissa 1.0, exponent 0: the table returns 0, so LOD16 is K exactly.
+	const float one = 1.0f;
+
+	for (const s32 k : {-8, 8, 24, 40, 56, 72})
+	{
+		const s32 lod16 = GSLevelOfDetail16(one, GSLevelOfDetailTable[0], k, 4);
+		EXPECT_EQ(lod16, k);
+
+		// What the scanline then does, on the 16.16 it carries the level in.
+		const s32 rounded = ((lod16 << 12) + 0x8000) >> 16;
+		EXPECT_EQ(rounded, (k + 8) >> 4) << "K = " << k;
+	}
+
+	// A tie takes the higher level, not the nearer even one.
+	EXPECT_EQ((8 + 8) >> 4, 1);
+	EXPECT_EQ((24 + 8) >> 4, 2);
 }
 
 } // namespace

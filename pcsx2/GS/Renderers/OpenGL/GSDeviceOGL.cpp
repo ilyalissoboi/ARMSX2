@@ -3,9 +3,12 @@
 
 #include "GS/Renderers/OpenGL/GLContext.h"
 #include "GS/Renderers/OpenGL/GSDeviceOGL.h"
+#include "GS/Renderers/OpenGL/GLLibretro.h"
 #include "GS/Renderers/OpenGL/GLState.h"
 #include "GS/Renderers/Common/GSFramebufferFetchPolicy.h"
 #include "GS/Renderers/Common/GSGPUProfile.h"
+#include "GS/Renderers/Common/GSHeadlessPresent.h"
+#include "GS/DriverReport/GSDriverReport.h"
 #include "GS/GSState.h"
 #include "GS/Renderers/Common/GSRenderer.h"
 #include "GS/GSGL.h"
@@ -31,6 +34,15 @@
 #include <cinttypes>
 #include <fstream>
 #include <sstream>
+
+#ifdef __ANDROID__
+#include "glad/egl.h"
+#include <android/hardware_buffer.h>
+#include <chrono>
+#include <cstring>
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 static constexpr u32 g_vs_pc_index        = 4;
 static constexpr u32 g_vs_ib_index        = 3;
@@ -69,6 +81,80 @@ namespace ReplaceGL
 
 } // namespace ReplaceGL
 
+namespace Emulate_DSA_EXT
+{
+	// Texture entry point
+	static void GLAPIENTRY BindTextureUnit(GLuint unit, GLuint texture)
+	{
+		glBindMultiTextureEXT(GL_TEXTURE0 + unit, GL_TEXTURE_2D, texture);
+	}
+
+	static void GLAPIENTRY CreateTexture(GLenum target, GLsizei n, GLuint* textures)
+	{
+		glGenTextures(n, textures);
+	}
+
+	static void GLAPIENTRY TextureStorage(
+		GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height)
+	{
+		glTextureStorage2DEXT(texture, GL_TEXTURE_2D, levels, internalformat, width, height);
+	}
+
+	static void GLAPIENTRY TextureSubImage(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
+		GLsizei height, GLenum format, GLenum type, const void* pixels)
+	{
+		glTextureSubImage2DEXT(texture, GL_TEXTURE_2D, level, xoffset, yoffset, width, height, format, type, pixels);
+	}
+
+	static void GLAPIENTRY CopyTextureSubImage(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
+	{
+		glCopyTextureSubImage2DEXT(texture, GL_TEXTURE_2D, level, xoffset, yoffset, x, y, width, height);
+	}
+
+	static void GLAPIENTRY CompressedTextureSubImage(GLuint texture, GLint level, GLint xoffset, GLint yoffset,
+		GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void* data)
+	{
+		glCompressedTextureSubImage2DEXT(texture, GL_TEXTURE_2D, level, xoffset, yoffset, width, height, format, imageSize, data);
+	}
+
+	static void GLAPIENTRY GetTexureImage(
+		GLuint texture, GLint level, GLenum format, GLenum type, GLsizei bufSize, void* pixels)
+	{
+		glGetTextureImageEXT(texture, GL_TEXTURE_2D, level, format, type, pixels);
+	}
+
+	static void GLAPIENTRY TextureParameteri(GLuint texture, GLenum pname, GLint param)
+	{
+		glTextureParameteriEXT(texture, GL_TEXTURE_2D, pname, param);
+	}
+
+	static void GLAPIENTRY GenerateTextureMipmap(GLuint texture)
+	{
+		glGenerateTextureMipmapEXT(texture, GL_TEXTURE_2D);
+	}
+
+	// Misc entry point
+	static void GLAPIENTRY CreateSamplers(GLsizei n, GLuint* samplers)
+	{
+		glGenSamplers(n, samplers);
+	}
+
+	// Replace function pointer to emulate DSA EXT behavior
+	static void Init()
+	{
+		glBindTextureUnit = BindTextureUnit;
+		glCreateTextures = CreateTexture;
+		glTextureStorage2D = TextureStorage;
+		glTextureSubImage2D = TextureSubImage;
+		glCopyTextureSubImage2D = CopyTextureSubImage;
+		glCompressedTextureSubImage2D = CompressedTextureSubImage;
+		glGetTextureImage = GetTexureImage;
+		glTextureParameteri = TextureParameteri;
+		glGenerateTextureMipmap = GenerateTextureMipmap;
+		glCreateSamplers = CreateSamplers;
+	}
+} // namespace Emulate_DSA_EXT
+
 namespace Emulate_DSA
 {
 	// Texture entry point
@@ -80,7 +166,7 @@ namespace Emulate_DSA
 
 	static void GLAPIENTRY CreateTexture(GLenum target, GLsizei n, GLuint* textures)
 	{
-		glGenTextures(1, textures);
+		glGenTextures(n, textures);
 	}
 
 	static void GLAPIENTRY TextureStorage(
@@ -599,6 +685,7 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 				return false;
 			m_interlace.ps[i].SetFormattedName("Merge pipe %zu", i);
 			m_interlace.ps[i].RegisterUniform("ZrH");
+			m_interlace.ps[i].RegisterUniform("FieldPad");
 		}
 	}
 
@@ -675,7 +762,7 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	// This extension allow FS depth to range from -1 to 1. So
 	// gl_position.z could range from [0, 1]
 	// Change depth convention
-	if (GLAD_GL_ARB_clip_control)
+	if (GLAD_GL_VERSION_4_5 || GLAD_GL_ARB_clip_control)
 		glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
 	else if (m_is_gles && GLAD_GL_EXT_clip_control)
 		// GLES has no ARB_clip_control; GL_EXT_clip_control (advertised by Adreno, and
@@ -727,12 +814,68 @@ bool GSDeviceOGL::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	static_assert(sizeof(OMColorMaskSelector) == 1, "Wrong OMColorMaskSelector size");
 
 	Console.WriteLn("@@ANDROID_GL_INIT@@ stage=create_done");
+#ifdef __ANDROID__
+	GSRemotePlay::g_renderer_captures.store(true, std::memory_order_release);
+#endif
 	return true;
 }
 
-void GSDeviceOGL::Destroy()
+bool GSDeviceOGL::AbandonContext(bool still_valid)
 {
-	// Frees GL objects, so it has to run before the context is dropped below.
+	// Runs on: the GS thread, through MTGS::RunOnGSThread, because the context
+	// being given up is current on that thread and nowhere else.
+	if (!m_gl_context)
+		return false;
+	if (m_gl_context->IsAbandoned())
+		return m_context_released;
+
+	// Nothing more goes to the frontend: the context its present path publishes
+	// into is the one going away. Cleared here rather than by the caller
+	// because this is the GS thread, which is the thread that reads it.
+	GLLibretro::Deactivate();
+	GLLibretro::AbortPacing();
+
+	if (still_valid)
+	{
+		// Retire what is already queued while the context can still run it,
+		// then free everything this device built on it. That has to happen here
+		// rather than at Destroy(): this is the last moment a context is
+		// current to delete through, and the frontend finishes by terminating
+		// the display those objects belong to, so a later teardown would be
+		// glDelete* into a driver with no context to delete from.
+		glFinish();
+		DestroyDeviceObjects();
+		m_gl_context->DoneCurrent();
+		m_context_released = true;
+	}
+	else
+	{
+		// The display is already gone, so the ordinary unbind - which needs it -
+		// is the call that hangs inside the driver. Ask the platform whether it
+		// has any way to let go from here; on EGL it has none.
+		m_context_released = m_gl_context->ReleaseThread();
+	}
+
+	m_gl_context->Abandon();
+	return m_context_released;
+}
+
+// Everything this device owns in the GL context, freed in one place so that both
+// the ordinary teardown and the context-loss one delete through a live context.
+// Runs once: whichever of the two gets here first does the work.
+void GSDeviceOGL::DestroyDeviceObjects()
+{
+	if (m_objects_destroyed)
+		return;
+	m_objects_destroyed = true;
+
+#ifdef __ANDROID__
+	GSRemotePlay::g_renderer_captures.store(false, std::memory_order_release);
+	// With the context still there to delete through, as everything below.
+	if (m_gl_context)
+		RemotePlayRelease();
+#endif
+
 	DestroyShaderChain();
 
 	GSDevice::Destroy();
@@ -742,8 +885,21 @@ void GSDeviceOGL::Destroy()
 		DestroyTimestampQueries();
 		DestroyPipelineStatisticsQueries();
 		DestroyResources();
+	}
+}
 
-		m_gl_context->DoneCurrent();
+void GSDeviceOGL::Destroy()
+{
+	// On the context-loss path this is already done - it happened at the
+	// abandon, while there was still a context to delete through - and what is
+	// left here is the context object itself. The unbind is for the live case
+	// only: the abandoned one has no display behind it any more.
+	DestroyDeviceObjects();
+
+	if (m_gl_context)
+	{
+		if (!m_gl_context->IsAbandoned())
+			m_gl_context->DoneCurrent();
 		m_gl_context.reset();
 	}
 }
@@ -782,9 +938,9 @@ bool GSDeviceOGL::CreateTextureFX()
 
 bool GSDeviceOGL::CheckFeatures()
 {
-	//bool vendor_id_amd = false;
-	//bool vendor_id_nvidia = false;
-	//bool vendor_id_intel = false;
+	bool vendor_id_amd = false;
+	bool vendor_id_nvidia = false;
+	bool vendor_id_intel = false;
 
 	memset(&m_bugs, 0, sizeof(m_bugs));
 
@@ -805,18 +961,18 @@ bool GSDeviceOGL::CheckFeatures()
 		std::strstr(vendor_str, "ATI"))
 	{
 		Console.WriteLn(Color_StrongRed, "GL: AMD GPU detected.");
-		//vendor_id_amd = true;
+		vendor_id_amd = true;
 	}
 	else if (std::strstr(vendor_str, "NVIDIA Corporation"))
 	{
 		Console.WriteLn(Color_StrongGreen, "GL: NVIDIA GPU detected.");
-		//vendor_id_nvidia = true;
+		vendor_id_nvidia = true;
 		m_bugs.broken_blend_coherency = true;
 	}
 	else if (std::strstr(vendor_str, "Intel"))
 	{
 		Console.WriteLn(Color_StrongBlue, "GL: Intel GPU detected.");
-		//vendor_id_intel = true;
+		vendor_id_intel = true;
 	}
 	else if (std::strstr(vendor_str, "ARM") || std::strstr(renderer_str, "Mali"))
 	{
@@ -865,7 +1021,6 @@ bool GSDeviceOGL::CheckFeatures()
 	SetMobileGPUIdentity(profile_selection.gpu);
 	SetMobileGSTuning(profile_selection.gs_tuning);
 	SetMobileDriverProfile(profile_selection.driver);
-	SetMediaTekSoC(profile_selection.is_mediatek_soc);
 	Console.WriteLn("GL: GPU profile override='%s' resolved='%s' driver='%s' version=%u.%u.%u.%u "
 					"rules=%u bugs=%016llx workarounds=%016llx.",
 		GpuProfileDetector::OverrideToConfigString(profile_selection.override_mode),
@@ -878,6 +1033,11 @@ bool GSDeviceOGL::CheckFeatures()
 		static_cast<unsigned>(profile_selection.driver.matched_rule_count),
 		static_cast<unsigned long long>(profile_selection.driver.bugs),
 		static_cast<unsigned long long>(profile_selection.driver.workarounds));
+	Console.WriteLn("GL: GPU profile rules matched: %s",
+		GpuProfileDetector::DescribeMatchedRules(profile_selection.driver).c_str());
+	Console.WriteLn("GL: GPU profile bugs: %s", GpuProfileDetector::DescribeBugs(profile_selection.driver.bugs).c_str());
+	Console.WriteLn("GL: GPU profile workarounds: %s",
+		GpuProfileDetector::DescribeWorkarounds(profile_selection.driver.workarounds).c_str());
 	DevCon.WriteLn("GL: GPU profile hints: %s", profile_selection.hints.c_str());
 	bool use_mali_profile = IsMaliGPUProfile();
 	bool use_adreno_profile = IsAdrenoGPUProfile();
@@ -927,7 +1087,7 @@ bool GSDeviceOGL::CheckFeatures()
 			extensions.append(ext);
 		}
 	}
-	DevCon.WriteLn(std::move(extensions));
+	DbgConWriter.WriteLn(std::move(extensions));
 
 	if (!m_is_gles) {
 		if (!GLAD_GL_ARB_shading_language_420pack)
@@ -956,7 +1116,6 @@ bool GSDeviceOGL::CheckFeatures()
 	{
 		glScissorIndexed = ReplaceGL::ScissorIndexed;
 		glViewportIndexedf = ReplaceGL::ViewportIndexedf;
-		Console.Warning("GL_ARB_viewport_array is not supported! Function pointer will be replaced.");
 	}
 
 	if (!GLAD_GL_ARB_texture_barrier)
@@ -974,10 +1133,12 @@ bool GSDeviceOGL::CheckFeatures()
 		}
 	}
 
-	if (!GLAD_GL_ARB_direct_state_access)
+	if (!GLAD_GL_VERSION_4_5 && !GLAD_GL_ARB_direct_state_access)
 	{
-		Console.Warning("GL_ARB_direct_state_access is not supported, this will reduce performance.");
-		Emulate_DSA::Init();
+		if (GLAD_GL_EXT_direct_state_access)
+			Emulate_DSA_EXT::Init();
+		else
+			Emulate_DSA::Init();
 	}
 
 	// glDrawElementsBaseVertex entered core in GL ES 3.2. ANGLE-over-Vulkan caps its context at
@@ -996,6 +1157,20 @@ bool GSDeviceOGL::CheckFeatures()
 			glDrawElementsBaseVertex = glDrawElementsBaseVertexEXT;
 		else
 			Console.Error("GL: glDrawElementsBaseVertex is unavailable (no core/OES/EXT) — draws will fail.");
+	}
+
+	// Same ES 3.2-vs-3.1 gap for the ranged variant. The draws over the index stream buffer pass the
+	// index range so the driver doesn't have to scan for it: without a range, Mali scans the indices
+	// and caches the result per (buffer, offset, count) in CPU memory, and since the stream buffer is
+	// never respecified and every draw lands at a new offset, that cache grows for the whole session
+	// (320 MB in a single allocation, killed by lmkd after ~2 h on a 4 GB device). If no variant is
+	// available, DrawElementsInRange() falls back to the unranged call.
+	if (!glDrawRangeElementsBaseVertex)
+	{
+		if (GLAD_GL_OES_draw_elements_base_vertex && glDrawRangeElementsBaseVertexOES)
+			glDrawRangeElementsBaseVertex = glDrawRangeElementsBaseVertexOES;
+		else if (GLAD_GL_EXT_draw_elements_base_vertex && glDrawRangeElementsBaseVertexEXT)
+			glDrawRangeElementsBaseVertex = glDrawRangeElementsBaseVertexEXT;
 	}
 
 	// glColorMaski (indexed color mask) is core in GLSL ES 3.2 but only extension-provided on
@@ -1049,7 +1224,7 @@ bool GSDeviceOGL::CheckFeatures()
 	// API. See the matching gate in GSDeviceVK::CheckFeatures for the measurements. Mali is
 	// deliberately not included: the Vulkan path opts it out for early-ZS, but that has not been
 	// tested on a Mali GL driver.
-	m_features.no_ps2_z_quantization = GSConfig.DisablePS2DepthQuantization || vendor_id_apple;
+	m_features.no_ps2_z_quantization = vendor_id_apple;
 
 	// GLES may omit dual-source blending (GL_EXT/ARB_blend_func_extended); desktop GL always has it.
 	// When absent, GSRendererHW emulates SRC1 blend equations in-shader per-draw rather than forcing
@@ -1061,21 +1236,11 @@ bool GSDeviceOGL::CheckFeatures()
 	// GSFramebufferFetchPolicy.h for why it is a separate pure function). Nothing below may write
 	// m_features.framebuffer_fetch -- read `fbfetch` instead if you need to know what was decided.
 	//
-	// Which drivers cannot survive the in-tile read is a fact about the DRIVER, so it lives in the
-	// driver-bug database with the rest of them rather than in a substring test here.
-	// UseRenderTargetCopyForFeedback is the same workaround the Vulkan backend keys its RT-copy
-	// fallback on -- fetch and the texture barrier are two spellings of one in-tile read, so a
-	// driver that fails the read fails both, and one bit answers for both APIs. Note that no GL
-	// rule sets it today: the r44p1 GL rule was deliberately lifted (2.6.6.4 field evidence beat
-	// the MGS3 corruption report -- the full account sits above the GL rules in
-	// GSGPUDriverProfile.cpp), while r44p1's Vulkan rule remains because there the read is a
-	// device loss, and on Vulkan the RT copy is an ordinary image copy rather than a tile flush.
-	//
-	// This replaced a hand-rolled search for "r44p1" in GL_VERSION. The database matches a PARSED
-	// driver revision instead, which is what lets a rule say "exactly r44p1" rather than "contains
-	// r44p1" -- and what would let the next bad blob be a table row. gs_gpu_driver_profile_tests
-	// pins the real device string through the resolver, because a rule that silently matches
-	// nothing would put the device straight back on the faulting path with no diagnostic.
+	// Which drivers cannot survive the in-tile read is a fact about the driver, so it lives in the
+	// driver-bug database. UseRenderTargetCopyForFeedback is the bit the Vulkan backend keys its
+	// render-target copy on: fetch and the texture barrier are two spellings of one in-tile read,
+	// so one bit answers for both APIs. No GL rule sets it today; GSGPUDriverProfile.cpp says why
+	// r44p1 has a Vulkan rule and no GL one.
 	const bool fbfetch_driver_blocklisted =
 		GetMobileDriverProfile().UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback);
 	const GSFramebufferFetchDecision fbfetch = DecideGLFramebufferFetch(GLAD_GL_ARM_shader_framebuffer_fetch,
@@ -1091,7 +1256,7 @@ bool GSDeviceOGL::CheckFeatures()
 	switch (fbfetch.veto)
 	{
 		case GSFramebufferFetchVeto::DriverBlocklist:
-			Console.WriteLn("Mali r44p1: disabling framebuffer fetch (GL context-lost workaround; matches the Vulkan gate).");
+			Console.WriteLn("GL: framebuffer fetch disabled for this driver build by the driver-bug database.");
 			break;
 		case GSFramebufferFetchVeto::UserSetting:
 			Host::AddOSDMessage(
@@ -1106,7 +1271,7 @@ bool GSDeviceOGL::CheckFeatures()
 		m_features.texture_barrier = m_features.framebuffer_fetch; // Force Disabled
 		m_features.multidraw_fb_copy = false;
 		Host::AddOSDMessage(
-			"Texture Barrier is disabled, blending will not be accurate.", Host::OSD_ERROR_DURATION);
+			"Texture Barriers are disabled, blending will not be accurate.", Host::OSD_ERROR_DURATION);
 	}
 	else if (GSConfig.OverrideTextureBarriers == 1)
 	{
@@ -1124,7 +1289,7 @@ bool GSDeviceOGL::CheckFeatures()
 
 		// Pick the blend fallback's shape now that we know whether there is a barrier. GLES always
 		// arrives here with multidraw_fb_copy set (there is no ARB/NV texture barrier), and on a
-		// device where fetch is also off -- the r44p1 blocklist, the user's setting, or simply no
+		// device where fetch is also off -- a driver-bug database veto, the user's setting, or no
 		// fetch extension -- that leaves the per-primitive render-target copy as the blend path,
 		// which on a tiler means a tile flush and resolve per primitive group. See
 		// GLUsesPerPrimitiveFbCopy for the measurement; the short version is 0.33 fps.
@@ -1165,28 +1330,6 @@ bool GSDeviceOGL::CheckFeatures()
 		m_features.depth_feedback |= GSConfig.DepthFeedbackMode == GSDepthFeedbackMode::Auto;
 	}
 
-	// ARMSX2 (Adreno GLES only; inert on every other GPU/profile). Adreno's driver
-	// rejects a fragment shader declaring TWO framebuffer-fetch `inout` outputs (o_col0
-	// colour + o_col1 depth), which the depth-as-colour SW-Z path emits for accurate-
-	// alpha-test draws -> link failure -> garbage (Everybody's Golf 4 / Minna no Golf 4).
-	// Route depth feedback through the depth path (a single fetch output) so it links, and
-	// read prior depth via the coherent ARM depth-stencil fetch (gl_LastFragDepthARM) when
-	// available -- the mode-1 depth sampler read is incoherent on GLES (no barrier on a
-	// sampled depth attachment) and makes occluded triangles poke through as white shards.
-	// Only overrides Auto; an explicit DepthFeedbackMode choice is honoured. The GPU
-	// profile is already resolved above (SetRuntimeGPUProfile), so IsAdrenoGPUProfile()
-	// is valid here.
-	if (m_features.framebuffer_fetch && IsAdrenoGPUProfile() &&
-		GSConfig.DepthFeedbackMode == GSDepthFeedbackMode::Auto)
-	{
-		m_features.depth_feedback = true;
-		m_arm_depth_fetch = GLAD_GL_ARM_shader_framebuffer_fetch_depth_stencil;
-		Console.WriteLn(m_arm_depth_fetch
-			? "GL: Adreno - depth feedback via coherent ARM depth-stencil fetch (gl_LastFragDepthARM)."
-			: "GL: Adreno - routing depth feedback through the depth sampler "
-			  "(avoids the dual framebuffer-fetch output link failure).");
-	}
-
 	// Mobile tile-based GPU profiles. Both Mali and Adreno prefer fresh
 	// textures over reused ones (avoids tile-flush stalls on partial
 	// writes), so the texture-pool hint is shared. Mali additionally
@@ -1220,7 +1363,7 @@ bool GSDeviceOGL::CheckFeatures()
 		// ⚠️ This block must NOT re-enable framebuffer fetch, and nothing here may write
 		// m_features.framebuffer_fetch. It used to set it unconditionally true off the raw
 		// GLAD_GL_ARM_shader_framebuffer_fetch extension rather than the decision made ~100 lines
-		// above, which resurrected fetch after both the r44p1 driver guard and the user's
+		// above, which resurrected fetch after both the driver-bug database veto and the user's
 		// DisableFramebufferFetch setting -- so on Mali GL there was no way to turn fetch off at
 		// all. Demotion stays keyed on the extension because that is what it has always meant (a
 		// Mali profile that cannot reach the ARM shader path is on the wrong profile), but fetch
@@ -1255,29 +1398,16 @@ bool GSDeviceOGL::CheckFeatures()
 	{
 		Console.WriteLn(Color_Cyan, "GL: Adreno profile active (EXT/PLS framebuffer fetch).");
 
-		// Adreno's GLES driver rejects a fragment shader that declares TWO
-		// framebuffer-fetch `inout` outputs. The depth-as-colour feedback path
-		// (DEPTH_FEEDBACK_SUPPORT 2) emits exactly that whenever the colour output
-		// already needs fetch AND a SW-Z depth draw is in flight -- o_col0 (colour
-		// fetch) at location 0 and o_col1 (depth fetch) at location 1 both become
-		// `inout`. That combination is produced by the accurate-alpha-test RGB-only
-		// + depth-write path, so any game carrying accurateAlphaTest (e.g. Everybody's
-		// Golf 4 / Minna no Golf 4, SCKA-20057 / SCPS-15059) fails to link those draws
-		// -> "Output o_col1 location or component exceeds max allowed" -> garbage
-		// (black-boxed faces, a floating RT rectangle, blue bars). Vulkan is unaffected
-		// (real depth attachment, no second fetch output). Route depth feedback through
-		// the real depth sampler (DEPTH_FEEDBACK_SUPPORT 1) so only o_col0 is a fetch
-		// output and the program links. test_and_sample_depth is already true above,
-		// and texture_barrier==true here keeps the DS-clone path (bind at ~3402) inert.
-		// Only override Auto -- an explicit DepthFeedbackMode choice is honoured.
+		// Adreno's GLES driver will not link a fragment shader with two framebuffer-fetch outputs.
+		// The depth-as-colour path (DEPTH_FEEDBACK_SUPPORT 2) emits two whenever a draw needs the
+		// colour fetch and a software depth write at once, as accurate alpha test does. Depth
+		// feedback goes through the depth attachment instead (DEPTH_FEEDBACK_SUPPORT 1), leaving
+		// colour the only fetch output. An explicit DepthFeedbackMode is honoured.
 		if (m_features.framebuffer_fetch && GSConfig.DepthFeedbackMode == GSDepthFeedbackMode::Auto)
 		{
 			m_features.depth_feedback = true;
-			// The mode-1 depth SAMPLER read is incoherent on GLES (no texture_barrier
-			// for a sampled depth attachment) -> stale reads make occluded/interior
-			// triangles poke through as white shards. When the coherent ARM depth-
-			// stencil fetch extension is present, read prior depth via gl_LastFragDepthARM
-			// instead (tile-local, one output, no sampler, no feedback-loop bind).
+			// The depth sampler read is not coherent on GLES. The ARM depth-stencil fetch is, so
+			// prior depth comes from gl_LastFragDepthARM where the extension exists.
 			m_arm_depth_fetch = GLAD_GL_ARM_shader_framebuffer_fetch_depth_stencil;
 			Console.WriteLn(m_arm_depth_fetch
 				? "GL: Adreno - depth feedback via coherent ARM depth-stencil fetch (gl_LastFragDepthARM)."
@@ -1308,15 +1438,13 @@ bool GSDeviceOGL::CheckFeatures()
 			active_fetch_backend, fetch_veto_reason);
 	}
 
-	if (GLAD_GL_ARB_shader_storage_buffer_object)
+	if (GLAD_GL_VERSION_4_3 || GLAD_GL_ARB_shader_storage_buffer_object)
 	{
 		GLint max_vertex_ssbos = 0;
 		glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &max_vertex_ssbos);
 		DevCon.WriteLn("GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS: %d", max_vertex_ssbos);
-		m_features.vs_expand = (!GSConfig.DisableVertexShaderExpand && max_vertex_ssbos > 0 && GLAD_GL_ARB_gpu_shader5);
+		m_features.vs_expand = (!GSConfig.DisableVertexShaderExpand && max_vertex_ssbos > 0);
 	}
-	if (!m_features.vs_expand)
-		Console.Warning("GL: Vertex expansion is not supported. This will reduce performance.");
 
 	GLint point_range[2] = {};
 	glGetIntegerv(GL_ALIASED_POINT_SIZE_RANGE, point_range);
@@ -1328,18 +1456,118 @@ bool GSDeviceOGL::CheckFeatures()
 	glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
 	m_max_texture_size = std::max(1024u, static_cast<u32>(max_texture_size));
 
-	Console.WriteLn("GL: Using %s for point expansion, %s for line expansion and %s for sprite expansion.",
-		m_features.point_expand ? "hardware" : (m_features.vs_expand ? "vertex expanding" : "UNSUPPORTED"),
-		m_features.line_expand ? "hardware" : (m_features.vs_expand ? "vertex expanding" : "UNSUPPORTED"),
-		m_features.vs_expand ? "vertex expanding" : "CPU");
+	// Unlikely to be supported on Windows if device is stuck on GL 3.3 which is usually equivalent to feature level 10.0.
+	// This should also target any proprietary drivers on linux.
+	// Open source drivers shouldn't be hit since they have different vendor names.
+	if ((vendor_id_amd || vendor_id_nvidia || vendor_id_intel) && GLAD_GL_VERSION_3_3 && !GLAD_GL_VERSION_4_0)
+		m_rgba16_unorm_hw_blend = false;
+	else
+		m_rgba16_unorm_hw_blend = true;
 
-	if (!GLAD_GL_ARB_conservative_depth)
-	{
-		Console.Warning("GLAD_GL_ARB_conservative_depth is not supported. This will reduce performance.");
-	}
-	
 	m_features.aa1 = GSConfig.HWAA1 && m_features.vs_expand && m_features.feedback_loops();
-	
+
+	// Log the extension support.
+
+	constexpr int LABEL_WIDTH = 26;
+	constexpr int STATUS_WIDTH = 15;
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Viewport Array:",
+		STATUS_WIDTH, GLAD_GL_ARB_viewport_array ? "Supported" : "Fallback",
+		GLAD_GL_ARB_viewport_array ? "GL_ARB_viewport_array" : "Emulation");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Direct State Access:",
+		STATUS_WIDTH, GLAD_GL_VERSION_4_5 || GLAD_GL_ARB_direct_state_access || GLAD_GL_EXT_direct_state_access ? "Supported" : "Fallback",
+		GLAD_GL_VERSION_4_5             ? "OpenGL 4.5 Core" :
+		GLAD_GL_ARB_direct_state_access ? "GL_ARB_direct_state_access" :
+		GLAD_GL_EXT_direct_state_access ? "GL_EXT_direct_state_access" :
+										  "Emulation");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Copy Image:",
+		STATUS_WIDTH, GLAD_GL_VERSION_4_3 || GLAD_GL_ARB_copy_image || GLAD_GL_EXT_copy_image || GLAD_GL_NV_copy_image ? "Supported" : "Fallback",
+		GLAD_GL_VERSION_4_3    ? "OpenGL 4.3 Core" :
+		GLAD_GL_ARB_copy_image ? "GL_ARB_copy_image" :
+		GLAD_GL_EXT_copy_image ? "GL_EXT_copy_image" :
+								 "Framebuffer Copy");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Clip Control:",
+		STATUS_WIDTH, GLAD_GL_VERSION_4_5 || GLAD_GL_ARB_clip_control ? "Supported" : "Fallback",
+		GLAD_GL_VERSION_4_5      ? "OpenGL 4.5 Core" :
+		GLAD_GL_ARB_clip_control ? "GL_ARB_clip_control" :
+								   "Shader Fallback");
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Conservative Depth:",
+		STATUS_WIDTH, GLAD_GL_VERSION_4_2 || GLAD_GL_ARB_conservative_depth || GLAD_GL_AMD_conservative_depth ? "Supported" : "Not Supported",
+		GLAD_GL_VERSION_4_2            ? "OpenGL 4.2 Core" :
+		GLAD_GL_ARB_conservative_depth ? "GL_ARB_conservative_depth" :
+		GLAD_GL_AMD_conservative_depth ? "GL_AMD_conservative_depth" :
+										 "None");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Texture Barriers:",
+		STATUS_WIDTH, GSConfig.OverrideTextureBarriers == 0 ? "Forced Disabled" : GSConfig.OverrideTextureBarriers == 1 ? "Forced Enabled" :
+																														  "Auto",
+		GSConfig.OverrideTextureBarriers == 0 ? "Disabled" :
+		GSConfig.OverrideTextureBarriers == 1 ?
+												(!GLAD_GL_ARB_texture_barrier && !GLAD_GL_NV_texture_barrier &&
+															GLAD_GL_ARB_shader_image_load_store ?
+														"Memory Barrier (GL_ARB_shader_image_load_store)" :
+													GLAD_GL_ARB_texture_barrier ? "GL_ARB_texture_barrier" :
+													GLAD_GL_NV_texture_barrier  ? "GL_NV_texture_barrier" :
+																				  "No Barriers") :
+		m_features.framebuffer_fetch ? "Framebuffer Fetch" :
+		GLAD_GL_ARB_texture_barrier  ? "GL_ARB_texture_barrier" :
+		GLAD_GL_NV_texture_barrier   ? "GL_NV_texture_barrier" :
+									   "Framebuffer Copy");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "RGBA16 HW Blending:",
+		STATUS_WIDTH, m_rgba16_unorm_hw_blend ? "Supported" : "Fallback",
+		m_rgba16_unorm_hw_blend ? "RGBA16 UNORM" : "RGBA16F Fallback");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Point Expansion:",
+		STATUS_WIDTH, m_features.point_expand ? "Supported" : (m_features.vs_expand ? "Fallback" : "Not Supported"),
+		m_features.point_expand ? "Hardware" : (m_features.vs_expand ? "Vertex Expansion" : "None"));
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Line Expansion:",
+		STATUS_WIDTH, m_features.line_expand ? "Supported" : (m_features.vs_expand ? "Fallback" : "Not Supported"),
+		m_features.line_expand ? "Hardware" : (m_features.vs_expand ? "Vertex Expansion" : "None"));
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "Sprite Expansion:",
+		STATUS_WIDTH, m_features.vs_expand ? "Supported" : "Fallback",
+		m_features.vs_expand ? "Vertex Expansion" : "CPU");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "DXTn Texture Compression:",
+		STATUS_WIDTH, m_features.dxt_textures ? "Supported" : "Not Supported",
+		GLAD_GL_EXT_texture_compression_s3tc ? "GL_EXT_texture_compression_s3tc" : "None");
+
+	Console.WriteLnFmt(
+		"GL: {1:<{0}} {3:<{2}} => Using: {4}",
+		LABEL_WIDTH, "BC6/7 Texture Compression:",
+		STATUS_WIDTH, m_features.bptc_textures ? "Supported" : "Not Supported",
+		GLAD_GL_VERSION_4_2                  ? "OpenGL 4.2 Core" :
+		GLAD_GL_ARB_texture_compression_bptc ? "GL_ARB_texture_compression_bptc" :
+		GLAD_GL_EXT_texture_compression_bptc ? "GL_EXT_texture_compression_bptc" :
+											   "None");
+
 	return true;
 }
 
@@ -1373,6 +1601,13 @@ void GSDeviceOGL::SetSwapInterval()
 void GSDeviceOGL::DestroyResources()
 {
 	m_shader_cache.Close();
+
+	// Before anything else: the frontend may still be holding the last
+	// published texture, so stop handing it new ones first.
+	GLLibretro::AbortPacing();
+	for (std::unique_ptr<GSTextureOGL>& bb : m_libretro_bb)
+		bb.reset();
+	m_libretro_bb_idx = 0;
 
 	if (m_palette_ss != 0)
 		glDeleteSamplers(1, &m_palette_ss);
@@ -1485,6 +1720,17 @@ bool GSDeviceOGL::UpdateWindow()
 
 void GSDeviceOGL::ResizeWindow(u32 new_window_width, u32 new_window_height, float new_window_scale)
 {
+	if (GLLibretro::Active)
+	{
+		// The "window" is the backbuffer texture rendered for the frontend, so
+		// just adopt the new size - DoBeginPresent builds one to match on the
+		// next frame.
+		m_window_info.surface_width = new_window_width;
+		m_window_info.surface_height = new_window_height;
+		m_window_info.surface_scale = new_window_scale;
+		return;
+	}
+
 	m_window_info.surface_scale = new_window_scale;
 	if (m_window_info.type == WindowInfo::Type::Surfaceless ||
 		(m_window_info.surface_width == new_window_width &&
@@ -1519,18 +1765,84 @@ std::string GSDeviceOGL::GetDriverInfo() const
 		"OpenGL Context:\n{}\n{} {}\nGLSL: {}", gl_version, gl_vendor, gl_renderer, gl_shading_language_version);
 }
 
+void GSDeviceOGL::CollectDriverReport(GSDriverReport::BackendReport& out) const
+{
+	using namespace GSDriverReport;
+	GSDevice::CollectDriverReport(out);
+
+	// GL has no driver identity beyond its strings; they and the extension list are the evidence.
+	out.steps.Run("gl.strings", [&](std::string&) {
+		const auto str = [](GLenum name) {
+			const char* s = reinterpret_cast<const char*>(glGetString(name));
+			return std::string(s ? s : "");
+		};
+		JsonWriter w;
+		w.BeginObject();
+		w.KeyString("vendor", str(GL_VENDOR));
+		w.KeyString("renderer", str(GL_RENDERER));
+		w.KeyString("version", str(GL_VERSION));
+		w.KeyString("shading_language_version", str(GL_SHADING_LANGUAGE_VERSION));
+		GLint count = 0;
+		glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+		w.Key("extensions");
+		w.BeginArray();
+		for (GLint i = 0; i < count; i++)
+		{
+			const char* e = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
+			if (e)
+				w.String(e);
+		}
+		w.EndArray();
+		w.EndObject();
+		out.gl_json = w.TakeString();
+		return true;
+	});
+}
+
 GSDevice::PresentResult GSDeviceOGL::DoBeginPresent(bool frame_skip)
 {
-	if (frame_skip || m_window_info.type == WindowInfo::Type::Surfaceless)
+	if (frame_skip)
+		return PresentResult::FrameSkipped;
+
+	// Libretro: a real present, aimed at a backbuffer texture instead of a
+	// window, so the whole normal path - the aspect-correct PresentRect, the TV
+	// shaders, the ImGui overlay in EndPresent - works unchanged. The frontend's
+	// own FBO is not an option: FBOs are not shared between contexts, and this
+	// thread's context is a share of the frontend's rather than the same one.
+	// EndPresent publishes the finished texture, and retro_run blits it.
+	// Headless (GSHeadless) is the same present with no frontend to publish to; the host reads it back.
+	const bool libretro = GLLibretro::Active ||
+		(GSHeadless::IsEnabled() && m_window_info.type == WindowInfo::Type::Surfaceless);
+	if (!libretro && m_window_info.type == WindowInfo::Type::Surfaceless)
 		return PresentResult::FrameSkipped;
 
 	// Get the pipeline statistics for this frame before postprocessing.
 	if (m_gpu_pipeline_statistics_enabled)
 		PopPipelineStatisticsQuery();
 
-	// Not necessarily zero: a libretro frontend hands the core its own FBO to
-	// draw the finished frame into.
-	OMSetFBO(m_gl_context->GetDefaultFramebuffer());
+	const GSVector2i present_size = GetWindowSize();
+
+	if (libretro)
+	{
+		std::unique_ptr<GSTextureOGL>& bb = m_libretro_bb[m_libretro_bb_idx];
+		if (!bb || bb->GetWidth() != present_size.x || bb->GetHeight() != present_size.y)
+		{
+			bb = std::make_unique<GSTextureOGL>(
+				GSTexture::RenderTarget, present_size.x, present_size.y, 1, GSTexture::Format::Color);
+			if (!bb->GetID())
+			{
+				bb.reset();
+				return PresentResult::FrameSkipped;
+			}
+		}
+
+		OMSetRenderTargets(bb.get(), nullptr, nullptr);
+	}
+	else
+	{
+		OMSetFBO(m_gl_context->GetDefaultFramebuffer());
+	}
+
 	OMSetColorMaskState();
 
 	// On TBDR, hint that the default framebuffer's prior content is throwaway
@@ -1539,7 +1851,10 @@ GSDevice::PresentResult GSDeviceOGL::DoBeginPresent(bool frame_skip)
 	// used at all on the system framebuffer. Default-FBO uses GL_COLOR / DEPTH
 	// / STENCIL (not GL_*_ATTACHMENT). Pure TBDR tile-bandwidth win and inert on
 	// desktop immediate renderers, so gated to GLES to keep the desktop path canonical.
-	if (m_is_gles)
+	// GL_COLOR and friends name the default framebuffer's attachments, so this
+	// is only right when that is what is bound - a backbuffer texture wants the
+	// GL_COLOR_ATTACHMENT0 spelling, and nothing here would gain from it.
+	if (m_is_gles && !libretro)
 	{
 		const GLenum attachments[] = {GL_COLOR, GL_DEPTH, GL_STENCIL};
 		glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, std::size(attachments), attachments);
@@ -1550,9 +1865,8 @@ GSDevice::PresentResult GSDeviceOGL::DoBeginPresent(bool frame_skip)
 	glClear(GL_COLOR_BUFFER_BIT);
 	glEnable(GL_SCISSOR_TEST);
 
-	const GSVector2i size = GetWindowSize();
-	SetViewport(size);
-	SetScissor(GSVector4i::loadh(size));
+	SetViewport(present_size);
+	SetScissor(GSVector4i::loadh(present_size));
 
 	return PresentResult::OK;
 }
@@ -1564,17 +1878,41 @@ void GSDeviceOGL::EndPresent()
 	if (m_gpu_timing_enabled)
 		PopTimestampQuery();
 
-	// Discard the default framebuffer's depth/stencil before the swap. We
-	// never wrote anything meaningful to them, so on TBDR drivers writing
-	// the tile back to system memory at SwapBuffers is wasted bandwidth.
-	// Color is preserved (it's what gets presented). GLES/TBDR-only (inert on desktop).
-	if (m_is_gles)
+	if (GLLibretro::Active)
 	{
-		const GLenum attachments[] = {GL_DEPTH, GL_STENCIL};
-		glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, std::size(attachments), attachments);
-	}
+		// The frontend reads this texture from its own context, on its own
+		// thread, so the ordering has to be spelled out: a fence it can wait
+		// on, and a flush, without which the fence may never be submitted and
+		// the wait never completes.
+		GSTextureOGL* bb = m_libretro_bb[m_libretro_bb_idx].get();
+		GLLibretro::Frame frame;
+		frame.texture = bb->GetID();
+		frame.width = static_cast<u32>(bb->GetWidth());
+		frame.height = static_cast<u32>(bb->GetHeight());
+		frame.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+		glFlush();
 
-	m_gl_context->SwapBuffers();
+		m_libretro_bb_idx = (m_libretro_bb_idx + 1) % kLibretroBackbuffers;
+		GLLibretro::PublishFrame(frame);
+	}
+	else if (GSHeadless::IsEnabled() && m_window_info.type == WindowInfo::Type::Surfaceless)
+	{
+		GSHeadless::NotePresented(m_libretro_bb[m_libretro_bb_idx].get());
+	}
+	else
+	{
+		// Discard the default framebuffer's depth/stencil before the swap. We
+		// never wrote anything meaningful to them, so on TBDR drivers writing
+		// the tile back to system memory at SwapBuffers is wasted bandwidth.
+		// Color is preserved (it's what gets presented). GLES/TBDR-only (inert on desktop).
+		if (m_is_gles)
+		{
+			const GLenum attachments[] = {GL_DEPTH, GL_STENCIL};
+			glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, std::size(attachments), attachments);
+		}
+
+		m_gl_context->SwapBuffers();
+	}
 
 	if (m_gpu_timing_enabled)
 		KickTimestampQuery();
@@ -1609,37 +1947,42 @@ void GSDeviceOGL::PopTimestampQuery()
 {
 	while (m_waiting_timestamp_queries > 0)
 	{
-#if defined(__ANDROID__)
-		// GLES doesn't expose glGetQueryObjectiv / glGetQueryObjectui64v; both
-		// availability and result use the u32 form. Caps at ~4.29s of
-		// nanoseconds — fine for per-frame timing. Provided by the
-		// EXT_disjoint_timer_query extension (GL_TIME_ELAPSED_EXT === 0x88BF
-		// === GL_TIME_ELAPSED here).
+		// Which reader exists is a property of the context, not of the platform
+		// this was compiled for. GLES has no glGetQueryObjectiv and no
+		// glGetQueryObjectui64v - both availability and result come back
+		// through the u32 form - and asking GLAD for the missing ones returns
+		// null, which is a call through address zero on the GS thread. That
+		// used to be gated on __ANDROID__, which held only while Android was
+		// the one GLES host; a GLES build on any other system took the desktop
+		// branch and crashed in EndPresent the first time a frame ended.
 		//
-		// Prior version of this branch was broken: it called glBeginQuery on
-		// the read slot then immediately tried to read its result (always 0,
-		// query never ended) and incremented m_waiting_timestamp_queries
-		// instead of decrementing — accumulator stayed stuck at 0 in HW
-		// renderer OSD ("GPU: 0%" symptom).
-		GLuint available = 0;
-		glGetQueryObjectuiv(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT_AVAILABLE, &available);
-		if (!available)
-			break;
+		// The u32 result caps at ~4.29s of nanoseconds, which is fine for
+		// per-frame timing, and comes from EXT_disjoint_timer_query
+		// (GL_TIME_ELAPSED_EXT is GL_TIME_ELAPSED here).
+		if (m_is_gles)
+		{
+			GLuint available = 0;
+			glGetQueryObjectuiv(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT_AVAILABLE, &available);
+			if (!available)
+				break;
 
-		GLuint result = 0;
-		glGetQueryObjectuiv(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT, &result);
-		m_accumulated_gpu_time += static_cast<float>(static_cast<double>(result) / 1000000.0);
-#else
-		GLint available = 0;
-		glGetQueryObjectiv(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT_AVAILABLE, &available);
+			GLuint result = 0;
+			glGetQueryObjectuiv(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT, &result);
+			m_accumulated_gpu_time += static_cast<float>(static_cast<double>(result) / 1000000.0);
+		}
+		else
+		{
+			GLint available = 0;
+			glGetQueryObjectiv(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT_AVAILABLE, &available);
 
-		if (!available)
-			break;
+			if (!available)
+				break;
 
-		u64 result = 0;
-		glGetQueryObjectui64v(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT, &result);
-		m_accumulated_gpu_time += static_cast<float>(static_cast<double>(result) / 1000000.0);
-#endif
+			u64 result = 0;
+			glGetQueryObjectui64v(m_timestamp_queries[m_read_timestamp_query], GL_QUERY_RESULT, &result);
+			m_accumulated_gpu_time += static_cast<float>(static_cast<double>(result) / 1000000.0);
+		}
+
 		m_read_timestamp_query = (m_read_timestamp_query + 1) % NUM_TIMESTAMP_QUERIES;
 		m_waiting_timestamp_queries--;
 	}
@@ -1664,6 +2007,13 @@ void GSDeviceOGL::KickTimestampQuery()
 
 bool GSDeviceOGL::SetGPUTimingEnabled(bool enabled)
 {
+	// Timed queries on GLES are EXT_disjoint_timer_query and nothing else, so
+	// a context without it has no GL_TIME_ELAPSED to begin and no result to
+	// read. Refusing here is what stops the frame path from starting queries
+	// that can only fail.
+	if (enabled && m_is_gles && !GLAD_GL_EXT_disjoint_timer_query)
+		return false;
+
 	if (m_gpu_timing_enabled == enabled)
 		return true;
 
@@ -1802,10 +2152,20 @@ void GSDeviceOGL::DrawIndexedPrimitive()
 	DrawIndexedPrimitive(0, m_index.count);
 }
 
+// Every index of the draw is in [0, vertex_count), relative to base_vertex. Passing that range keeps
+// the driver from scanning the indices and caching the result (see the note in CheckFeatures()).
+static void DrawElementsInRange(GLenum mode, u32 vertex_count, GLsizei count, const void* indices, GLint base_vertex)
+{
+	if (glDrawRangeElementsBaseVertex && vertex_count > 0)
+		glDrawRangeElementsBaseVertex(mode, 0, vertex_count - 1, count, GL_UNSIGNED_SHORT, indices, base_vertex);
+	else
+		glDrawElementsBaseVertex(mode, count, GL_UNSIGNED_SHORT, indices, base_vertex);
+}
+
 void GSDeviceOGL::DrawIndexedPrimitive(int offset, int count)
 {
 	g_perfmon.Put(GSPerfMon::DrawCalls, 1);
-	glDrawElementsBaseVertex(m_draw_topology, count, GL_UNSIGNED_SHORT,
+	DrawElementsInRange(m_draw_topology, m_vertex.count, count,
 		reinterpret_cast<void*>((static_cast<u32>(m_index.start) + static_cast<u32>(offset)) * sizeof(u16)),
 		static_cast<GLint>(m_vertex.start));
 }
@@ -2116,8 +2476,6 @@ std::string GSDeviceOGL::GenGlslHeader(const std::string_view entry, GLenum type
 		{
 			header = "#version 330 core\n";
 			header += "#extension GL_ARB_shading_language_420pack : require\n";
-			if (GLAD_GL_ARB_gpu_shader5)
-				header += "#extension GL_ARB_gpu_shader5 : require\n";
 			if (m_features.vs_expand)
 				header += "#extension GL_ARB_shader_storage_buffer_object: require\n";
 		}
@@ -2156,9 +2514,17 @@ std::string GSDeviceOGL::GenGlslHeader(const std::string_view entry, GLenum type
 	header += fmt::format("#define DRIVER_STORE_BITWISE_NEGATION_IN_TEMPORARY {}\n",
 		UsesMobileDriverWorkaround(DriverWorkaround::StoreBitwiseNegationInTemporary) ? 1 : 0);
 
-	if (GLAD_GL_ARB_conservative_depth)
+	if (GLAD_GL_VERSION_4_2 || GLAD_GL_ARB_conservative_depth || GLAD_GL_AMD_conservative_depth)
 	{
-		header += "#extension GL_ARB_conservative_depth : enable\n";
+		if (!GLAD_GL_VERSION_4_2 && GLAD_GL_ARB_conservative_depth)
+		{
+			header += "#extension GL_ARB_conservative_depth : enable\n";
+		}
+		else if (!GLAD_GL_VERSION_4_2 && GLAD_GL_AMD_conservative_depth)
+		{
+			header += "#extension GL_AMD_conservative_depth : enable\n";
+		}
+
 		header += "#define PS_HAS_CONSERVATIVE_DEPTH 1\n";
 	}
 	else
@@ -2180,7 +2546,7 @@ std::string GSDeviceOGL::GenGlslHeader(const std::string_view entry, GLenum type
 	}
 
 	// Must match the glClipControl(EXT) enable above: desktop ARB, or GLES with EXT.
-	if (GLAD_GL_ARB_clip_control || (m_is_gles && GLAD_GL_EXT_clip_control))
+	if (GLAD_GL_VERSION_4_5 || GLAD_GL_ARB_clip_control || (m_is_gles && GLAD_GL_EXT_clip_control))
 		header += "#define HAS_CLIP_CONTROL 1\n";
 	else
 		header += "#define HAS_CLIP_CONTROL 0\n";
@@ -2331,6 +2697,7 @@ std::string GSDeviceOGL::GetPSSource(const PSSelector& sel)
 		+ fmt::format("#define PS_DATE {}\n", sel.date)
 		+ fmt::format("#define PS_TCOFFSETHACK {}\n", sel.tcoffsethack)
 		+ fmt::format("#define PS_REGION_RECT {}\n", sel.region_rect)
+		+ fmt::format("#define PS_NATIVE_TEXEL_GRID {}\n", sel.native_texel_grid)
 		+ fmt::format("#define PS_BLEND_A {}\n", sel.blend_a)
 		+ fmt::format("#define PS_BLEND_B {}\n", sel.blend_b)
 		+ fmt::format("#define PS_BLEND_C {}\n", sel.blend_c)
@@ -2349,6 +2716,7 @@ std::string GSDeviceOGL::GetPSSource(const PSSelector& sel)
 		+ fmt::format("#define PS_COLCLIP_HW {}\n", sel.colclip_hw)
 		+ fmt::format("#define PS_RTA_CORRECTION {}\n", sel.rta_correction)
 		+ fmt::format("#define PS_RTA_SRC_CORRECTION {}\n", sel.rta_source_correction)
+		+ fmt::format("#define PS_REPLACEMENT_ALPHA_SNAP {}\n", sel.replacement_alpha_snap)
 		+ fmt::format("#define PS_DITHER {}\n", sel.dither)
 		+ fmt::format("#define PS_DITHER_ADJUST {}\n", sel.dither_adjust)
 		+ fmt::format("#define PS_ZCLAMP {}\n", sel.zclamp)
@@ -2762,7 +3130,7 @@ void GSDeviceOGL::DoMultiStretchRects(const MultiStretchRect* rects, u32 num_rec
 	DrawIndexedPrimitive();
 }
 
-void GSDeviceOGL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex, GSVector4* dRect, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c, const Filter filter)
+void GSDeviceOGL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex, GSVector4* dRect, const MergeTopBand* top_band, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c, const Filter filter)
 {
 	GL_PUSH("DoMerge");
 
@@ -2782,6 +3150,8 @@ void GSDeviceOGL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
 		// 2nd output is enabled and selected. Copy it to destination so we can blend it with 1st output
 		// Note: value outside of dRect must contains the background color (c)
 		StretchRect(sTex[1], sRect[1], dTex, PMODE.SLBG ? dRect[2] : dRect[1], ShaderConvert::COPY, filter);
+		if (top_band[1].enabled)
+			StretchRect(sTex[1], top_band[1].src, dTex, top_band[1].dst, ShaderConvert::COPY, filter);
 	}
 
 	// Upload constant to select YUV algo
@@ -2812,11 +3182,15 @@ void GSDeviceOGL::DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex,
 			m_merge_obj.ps[1].Bind();
 			m_merge_obj.ps[1].Uniform4fv(0, GSVector4::unorm8(c).v);
 			DoStretchRect(sTex[0], sRect[0], dTex, dRect[0], m_merge_obj.ps[1], true, OMColorMaskSelector(), filter);
+			if (top_band[0].enabled)
+				DoStretchRect(sTex[0], top_band[0].src, dTex, top_band[0].dst, m_merge_obj.ps[1], true, OMColorMaskSelector(), filter);
 		}
 		else
 		{
 			// Blend with 2 * input alpha
 			DoStretchRect(sTex[0], sRect[0], dTex, dRect[0], m_merge_obj.ps[0], true, OMColorMaskSelector(), filter);
+			if (top_band[0].enabled)
+				DoStretchRect(sTex[0], top_band[0].src, dTex, top_band[0].dst, m_merge_obj.ps[0], true, OMColorMaskSelector(), filter);
 		}
 	}
 
@@ -2830,6 +3204,7 @@ void GSDeviceOGL::DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture
 
 	m_interlace.ps[static_cast<int>(shader)].Bind();
 	m_interlace.ps[static_cast<int>(shader)].Uniform4fv(0, cb.ZrH.F32);
+	m_interlace.ps[static_cast<int>(shader)].Uniform4fv(1, cb.FieldPad.F32);
 
 	DoStretchRect(sTex, sRect, dTex, dRect, m_interlace.ps[static_cast<int>(shader)], filter);
 }
@@ -3378,7 +3753,7 @@ void GSDeviceOGL::RenderImGui()
 {
 	ImGui::Render();
 	const ImDrawData* draw_data = ImGui::GetDrawData();
-	if (draw_data->CmdListsCount == 0)
+	if (draw_data->CmdLists.Size == 0)
 		return;
 
 	UpdateImGuiTextures();
@@ -3409,7 +3784,7 @@ void GSDeviceOGL::RenderImGui()
 	GSVector4i last_scissor = GSVector4i::xffffffff();
 
 	// Render command lists
-	for (int n = 0; n < draw_data->CmdListsCount; n++)
+	for (int n = 0; n < draw_data->CmdLists.Size; n++)
 	{
 		const ImDrawList* cmd_list = draw_data->CmdLists[n];
 
@@ -3450,8 +3825,10 @@ void GSDeviceOGL::RenderImGui()
 				glBindTextureUnit(0, texture_id);
 			}
 
-			glDrawElementsBaseVertex(GL_TRIANGLES, (GLsizei)pcmd->ElemCount, GL_UNSIGNED_SHORT,
-				(void*)(intptr_t)((pcmd->IdxOffset + m_index.start) * sizeof(ImDrawIdx)), pcmd->VtxOffset + vertex_start);
+			// VtxOffset is folded into the base vertex, so the indices reach at most the end of VtxBuffer.
+			DrawElementsInRange(GL_TRIANGLES, static_cast<u32>(cmd_list->VtxBuffer.Size) - pcmd->VtxOffset,
+				(GLsizei)pcmd->ElemCount, (void*)(intptr_t)((pcmd->IdxOffset + m_index.start) * sizeof(ImDrawIdx)),
+				pcmd->VtxOffset + vertex_start);
 		}
 
 		g_perfmon.Put(GSPerfMon::DrawCalls, cmd_list->CmdBuffer.Size);
@@ -3774,7 +4151,7 @@ void GSDeviceOGL::DoRenderHW(GSHWDrawConfig& config)
 		{
 			config.colclip_update_area = config.drawarea;
 
-			colclip_rt = CreateFeedbackTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false);
+			colclip_rt = CreateFeedbackTarget(rtsize.x, rtsize.y, m_rgba16_unorm_hw_blend ? GSTexture::Format::ColorClip : GSTexture::Format::ColorHDR, false);
 
 			if (!colclip_rt)
 			{
@@ -3782,8 +4159,6 @@ void GSDeviceOGL::DoRenderHW(GSHWDrawConfig& config)
 
 				return;
 			}
-
-			OMSetRenderTargets(colclip_rt, nullptr, config.ds, nullptr);
 
 			g_gs_device->SetColorClipTexture(colclip_rt);
 
@@ -4030,9 +4405,7 @@ void GSDeviceOGL::DoRenderHW(GSHWDrawConfig& config)
 		{
 			OMSetBlendState();
 		}
-		psel.ps.no_color1 = config.blend_multi_pass.no_color1;
-		psel.ps.blend_hw = config.blend_multi_pass.blend_hw;
-		psel.ps.dither = config.blend_multi_pass.dither;
+		config.blend_multi_pass.ApplyTo(psel.ps);
 		SetupPipeline(psel);
 		Draw(config);
 	}
@@ -4326,3 +4699,372 @@ void GSDeviceOGL::InsertDebugMessage(DebugMessageCategory category, const char* 
 		glDebugMessageInsert(GL_DEBUG_SOURCE_APPLICATION, type, id, severity, buf.size(), buf.c_str());
 #endif
 }
+
+#ifdef __ANDROID__
+
+// ---- Remote play ---------------------------------------------------------------------------------
+//
+// The stream's frames (GS/GSRemotePlay.h), as GSDeviceVK makes them, on OpenGL ES: every presented
+// frame drawn at the stream's size, then copied into a free slot. Where the driver can share buffers
+// the copy goes into the slot's AHardwareBuffer, bound to a texture through an EGLImage, and a native
+// fence says when it is in: the app's thread waits on the fence's file descriptor, with no GL of its
+// own. Otherwise the frame is read into a pixel buffer, and copied out for the app at a later frame
+// once the GPU has finished, since only this thread's context can map the buffer.
+
+void GSDeviceOGL::RemotePlayVSync(GSTexture* src, const GSVector4& src_uv, const GSVector4& area)
+{
+	const u32 max_size = GSRemotePlay::g_max_size.load(std::memory_order_acquire);
+	if (max_size == 0)
+	{
+		if (m_rp_published || m_rp_frame || m_rp_read_fbo != 0)
+			RemotePlayRelease();
+		return;
+	}
+
+	// Readbacks the GPU has finished go to the app first, so their slots can be counted as taken.
+	RemotePlayFinishReadbacks();
+
+	GSRemotePlay::g_frames.fetch_add(1, std::memory_order_relaxed);
+
+	GSRemotePlay::Ring& ring = m_rp_ring;
+	u32 index = 0;
+	while (index < ring.slots.size() &&
+		   ring.slots[index].state.load(std::memory_order_acquire) != GSRemotePlay::SlotFree)
+	{
+		index++;
+	}
+	if (index == ring.slots.size())
+	{
+		GSRemotePlay::g_skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	GSRemotePlay::Slot& slot = ring.slots[index];
+
+	// The stream's full size whatever the game's is, as GSDeviceVK explains.
+	const u32 width = std::max(4u, (max_size >> 16) & ~3u);
+	const u32 height = std::max(2u, (max_size & 0xffffu) & ~1u);
+
+	if (!m_rp_frame || static_cast<u32>(m_rp_frame->GetWidth()) != width ||
+		static_cast<u32>(m_rp_frame->GetHeight()) != height)
+	{
+		m_rp_frame.reset(CreateSurface(GSTexture::Usage::RenderTarget, width, height, 1, GSTexture::Format::Color));
+		if (!m_rp_frame)
+		{
+			GSRemotePlay::g_skipped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+
+	if (m_rp_read_fbo == 0)
+	{
+		glGenFramebuffers(1, &m_rp_read_fbo);
+		glGenFramebuffers(1, &m_rp_draw_fbo);
+	}
+
+	RemotePlayHardware& hardware = m_rp_hardware[index];
+	RemotePlayReadback& readback = m_rp_readback[index];
+	bool use_hardware = GSRemotePlay::g_hardware.load(std::memory_order_acquire) && !m_rp_hardware_failed &&
+						GLAD_EGL_ANDROID_get_native_client_buffer && GLAD_EGL_ANDROID_image_native_buffer &&
+						GLAD_EGL_KHR_image_base && GLAD_EGL_ANDROID_native_fence_sync && GLAD_GL_OES_EGL_image;
+
+	if (use_hardware && (!hardware.buffer || hardware.width != width || hardware.height != height))
+	{
+		RemotePlayHardware created;
+		const bool ok = RemotePlayCreateHardware(created, width, height);
+		{
+			// The app takes its own reference to a slot's buffer under the lock.
+			std::lock_guard lock(GSRemotePlay::g_mutex);
+			RemotePlayDestroyHardware(hardware);
+			if (ok)
+				hardware = created;
+			slot.hardware_buffer = ok ? hardware.buffer : nullptr;
+			slot.generation = ok ? GSRemotePlay::g_generation.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+		}
+		if (!ok)
+		{
+			m_rp_hardware_failed = true;
+			use_hardware = false;
+			Console.Warning("GL: Remote play: no shared frame buffers on this device, reading frames back instead.");
+		}
+	}
+
+	const u32 rgba_size = width * height * 4;
+	if (!use_hardware && (readback.pbo == 0 || readback.size < rgba_size))
+	{
+		if (readback.pbo != 0)
+			glDeleteBuffers(1, &readback.pbo);
+		glGenBuffers(1, &readback.pbo);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, readback.pbo);
+		glBufferData(GL_PIXEL_PACK_BUFFER, rgba_size, nullptr, GL_STREAM_READ);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		readback.data = std::make_unique<u8[]>(rgba_size);
+		readback.size = rgba_size;
+		slot.data = readback.data.get();
+	}
+
+	if (!m_rp_published)
+	{
+		std::lock_guard lock(GSRemotePlay::g_mutex);
+		ring.markers = nullptr;
+		ring.is_done = &GSDeviceOGL::RemotePlayIsDone;
+		ring.prepare_read = nullptr;
+		ring.context = this;
+		GSRemotePlay::g_ring = &ring;
+		m_rp_published = true;
+	}
+
+	// The picture where it goes, black around it, full alpha from the clear (see GSDeviceVK).
+	ClearRenderTarget(m_rp_frame.get(), 0xFF000000u);
+	if (src)
+	{
+		const float fw = static_cast<float>(width);
+		const float fh = static_cast<float>(height);
+		const GSVector4 dst(area.x * fw, area.y * fh, (area.x + area.z) * fw, (area.y + area.w) * fh);
+		StretchRect(src, src_uv, m_rp_frame.get(), dst, ShaderConvertSelector(ShaderConvert::COPY, 0x7), Biln);
+	}
+	else
+	{
+		CommitClear(m_rp_frame.get(), false);
+	}
+
+	// Out of the frame: a blit into the shared buffer, or a read into the pixel buffer. Rows go across
+	// as they are; the frame's first row is the top of the picture here too (DrawStretchRect).
+	GLint read_fbo = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+	glDisable(GL_SCISSOR_TEST);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_rp_read_fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+		static_cast<GSTextureOGL*>(m_rp_frame.get())->GetID(), 0);
+
+	int fence_fd = -1;
+	if (use_hardware)
+	{
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_rp_draw_fbo);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hardware.texture, 0);
+		glBlitFramebuffer(0, 0, static_cast<GLint>(width), static_cast<GLint>(height), 0, 0,
+			static_cast<GLint>(width), static_cast<GLint>(height), GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, GLState::fbo);
+
+		// Signals once the copy is in. Its file descriptor exists once the commands before it are
+		// flushed, which is also what gets them to the GPU now rather than at the present.
+		const EGLDisplay display = eglGetCurrentDisplay();
+		const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID, EGL_NONE};
+		const EGLSyncKHR sync = eglCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
+		glFlush();
+		if (sync != EGL_NO_SYNC_KHR)
+		{
+			fence_fd = eglDupNativeFenceFDANDROID(display, sync);
+			eglDestroySyncKHR(display, sync);
+		}
+		if (fence_fd < 0)
+		{
+			// Nothing to wait on: this frame waits here, and the next ones are read back.
+			glFinish();
+			m_rp_hardware_failed = true;
+			Console.Warning("GL: Remote play: no native fences, reading frames back instead.");
+		}
+	}
+	else
+	{
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, readback.pbo);
+		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		glReadPixels(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		readback.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	}
+
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read_fbo));
+	glEnable(GL_SCISSOR_TEST);
+
+	if (++m_rp_seq == 0)
+		++m_rp_seq;
+
+	if (m_rp_fence_fds[index] >= 0)
+		close(m_rp_fence_fds[index]);
+	m_rp_fence_fds[index] = fence_fd;
+
+	slot.seq = m_rp_seq;
+	slot.width = width;
+	slot.height = height;
+	slot.hardware = use_hardware;
+	slot.recorded_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+
+	if (use_hardware)
+	{
+		slot.state.store(GSRemotePlay::SlotRecorded, std::memory_order_release);
+		GSRemotePlay::NotifyRecorded();
+	}
+	else
+	{
+		// This thread's until the pixel buffer is copied out (RemotePlayFinishReadbacks).
+		slot.state.store(GSRemotePlay::SlotPending, std::memory_order_release);
+	}
+}
+
+// Readbacks whose fence has signalled: copied out of the pixel buffer for the app, which can then
+// take them. GS thread, with this context current.
+void GSDeviceOGL::RemotePlayFinishReadbacks()
+{
+	bool any = false;
+	for (u32 i = 0; i < m_rp_ring.slots.size(); i++)
+	{
+		GSRemotePlay::Slot& slot = m_rp_ring.slots[i];
+		RemotePlayReadback& readback = m_rp_readback[i];
+		if (slot.state.load(std::memory_order_acquire) != GSRemotePlay::SlotPending || !readback.fence)
+			continue;
+
+		const GLenum status = glClientWaitSync(readback.fence, 0, 0);
+		if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED)
+			continue;
+
+		glDeleteSync(readback.fence);
+		readback.fence = nullptr;
+
+		const u32 size = slot.width * slot.height * 4;
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, readback.pbo);
+		const void* map = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, size, GL_MAP_READ_BIT);
+		if (map)
+		{
+			std::memcpy(readback.data.get(), map, size);
+			glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+		}
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+		slot.state.store(map ? GSRemotePlay::SlotRecorded : GSRemotePlay::SlotFree, std::memory_order_release);
+		any |= (map != nullptr);
+	}
+	if (any)
+		GSRemotePlay::NotifyRecorded();
+}
+
+// An AHardwareBuffer the GPU can render into and the encoder's GL can read, bound to a texture of
+// this context through an EGLImage. False, with nothing left allocated, when any step fails.
+bool GSDeviceOGL::RemotePlayCreateHardware(RemotePlayHardware& hardware, u32 width, u32 height)
+{
+	AHardwareBuffer_Desc desc = {};
+	desc.width = width;
+	desc.height = height;
+	desc.layers = 1;
+	desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+	// CPU_READ_RARELY although the CPU never reads it: a plain linear layout, which the encoder's
+	// driver is sure to read the way this one wrote it (see GSDeviceVK).
+	desc.usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+				 AHARDWAREBUFFER_USAGE_CPU_READ_RARELY;
+	if (AHardwareBuffer_allocate(&desc, &hardware.buffer) != 0 || !hardware.buffer)
+	{
+		hardware.buffer = nullptr;
+		return false;
+	}
+
+	const EGLDisplay display = eglGetCurrentDisplay();
+	const EGLClientBuffer client = eglGetNativeClientBufferANDROID(hardware.buffer);
+	const EGLint attributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+	const EGLImageKHR image = client ?
+		eglCreateImageKHR(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, client, attributes) : EGL_NO_IMAGE_KHR;
+	if (image == EGL_NO_IMAGE_KHR)
+	{
+		RemotePlayDestroyHardware(hardware);
+		return false;
+	}
+	hardware.image = image;
+
+	// Through the scratch unit the emulated DSA calls use, and given back to what it held.
+	while (glGetError() != GL_NO_ERROR)
+	{
+	}
+	glGenTextures(1, &hardware.texture);
+	glActiveTexture(GL_TEXTURE7);
+	glBindTexture(GL_TEXTURE_2D, hardware.texture);
+	glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, static_cast<GLeglImageOES>(image));
+	const bool bound = glGetError() == GL_NO_ERROR;
+	glBindTexture(GL_TEXTURE_2D, GLState::tex_unit[7]);
+	if (!bound)
+	{
+		RemotePlayDestroyHardware(hardware);
+		return false;
+	}
+
+	hardware.width = width;
+	hardware.height = height;
+	return true;
+}
+
+// The buffer itself lives on for as long as the encoder's GL still holds an image of it.
+void GSDeviceOGL::RemotePlayDestroyHardware(RemotePlayHardware& hardware)
+{
+	if (hardware.texture != 0)
+		glDeleteTextures(1, &hardware.texture);
+	if (hardware.image)
+		eglDestroyImageKHR(eglGetCurrentDisplay(), static_cast<EGLImageKHR>(hardware.image));
+	if (hardware.buffer)
+		AHardwareBuffer_release(hardware.buffer);
+	hardware = {};
+}
+
+// The app's video thread, under GSRemotePlay::g_mutex: whether a recorded slot's frame is in. A
+// hardware frame is when its fence has signalled; a readback frame only becomes recorded once it is.
+bool GSDeviceOGL::RemotePlayIsDone(void* context, u32 index)
+{
+	const GSDeviceOGL* const device = static_cast<const GSDeviceOGL*>(context);
+	const int fd = device->m_rp_fence_fds[index];
+	if (fd < 0)
+		return true;
+
+	pollfd pfd = {fd, POLLIN, 0};
+	return poll(&pfd, 1, 0) > 0;
+}
+
+// Everything remote play allocated goes once it stops, or with the device. GS thread, with this
+// context current. GL keeps an object the GPU still uses until it is done with it.
+void GSDeviceOGL::RemotePlayRelease()
+{
+	GSRemotePlay::Ring& ring = m_rp_ring;
+	{
+		// The app's side reads slots under this lock, so once the ring is withdrawn nothing reads it.
+		std::lock_guard lock(GSRemotePlay::g_mutex);
+		if (GSRemotePlay::g_ring == &ring)
+			GSRemotePlay::g_ring = nullptr;
+
+		for (GSRemotePlay::Slot& slot : ring.slots)
+		{
+			slot.state.store(GSRemotePlay::SlotFree, std::memory_order_relaxed);
+			slot.data = nullptr;
+			slot.hardware_buffer = nullptr;
+			slot.generation = 0;
+			slot.hardware = false;
+		}
+	}
+	m_rp_published = false;
+
+	for (u32 i = 0; i < ring.slots.size(); i++)
+	{
+		RemotePlayDestroyHardware(m_rp_hardware[i]);
+
+		RemotePlayReadback& readback = m_rp_readback[i];
+		if (readback.fence)
+			glDeleteSync(readback.fence);
+		if (readback.pbo != 0)
+			glDeleteBuffers(1, &readback.pbo);
+		readback = {};
+
+		if (m_rp_fence_fds[i] >= 0)
+			close(m_rp_fence_fds[i]);
+		m_rp_fence_fds[i] = -1;
+	}
+
+	if (m_rp_read_fbo != 0)
+	{
+		glDeleteFramebuffers(1, &m_rp_read_fbo);
+		glDeleteFramebuffers(1, &m_rp_draw_fbo);
+		m_rp_read_fbo = 0;
+		m_rp_draw_fbo = 0;
+	}
+
+	m_rp_frame.reset();
+}
+
+#endif // __ANDROID__

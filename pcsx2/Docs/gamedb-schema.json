@@ -208,7 +208,7 @@
               "minimum": 0,
               "maximum": 1
             },
-            "rewriteLargeST": {
+            "rewriteLargeSTCoords": {
               "type": "integer",
               "minimum": 0,
               "maximum": 1
@@ -318,6 +318,11 @@
               "minimum": 0,
               "maximum": 5
             },
+            "copyRoadMaximumBlendingLevel": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5
+            },
             "recommendedBlendingLevel": {
               "type": "integer",
               "minimum": 0,
@@ -366,6 +371,11 @@
               "type": "integer",
               "minimum": -3,
               "maximum": 3
+            },
+            "iopThread": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1
             }
           },
           "additionalProperties": false

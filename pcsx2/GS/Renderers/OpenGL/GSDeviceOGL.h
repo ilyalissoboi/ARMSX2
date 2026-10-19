@@ -13,6 +13,13 @@
 
 #include "common/HashCombine.h"
 
+#ifdef __ANDROID__
+#include "GS/GSRemotePlay.h"
+#include <memory>
+#endif
+
+#include <array>
+
 class GLContext;
 
 class GSDepthStencilOGL
@@ -176,6 +183,32 @@ private:
 	// GL_ARM_shader_framebuffer_fetch_depth_stencil extension is present.
 	bool m_arm_depth_fetch = false;
 
+	// Libretro: there is no window to present into, so the present pass draws
+	// into one of these instead and hands it to the frontend. Rotated rather
+	// than reused, because the blit the frontend issues from its own context is
+	// not ordered against the GS thread's next frame.
+	static constexpr u32 kLibretroBackbuffers = 3;
+	std::array<std::unique_ptr<GSTextureOGL>, kLibretroBackbuffers> m_libretro_bb;
+	u32 m_libretro_bb_idx = 0;
+	bool m_context_released = false;
+	bool m_objects_destroyed = false;
+	bool m_rgba16_unorm_hw_blend = false;
+
+public:
+	// Libretro: the frontend threw away the context this device's own context
+	// shares with, taking the EGL display - and the driver state that lives in
+	// it - with it. Give the context up: afterwards this device can only be
+	// destroyed, never drawn with.
+	//
+	// still_valid says whether the frontend has yet to do the deed, which is
+	// the difference between unbinding the context properly and not daring to
+	// touch it at all.
+	//
+	// Returns whether the thread's binding was actually given up, and so
+	// whether a replacement device can be built on this thread at all.
+	bool AbandonContext(bool still_valid);
+
+private:
 	GLuint m_fbo = 0; // frame buffer container
 	GLuint m_fbo_read = 0; // frame buffer container only for reading
 	GLuint m_fbo_write = 0;	// frame buffer container only for writing
@@ -291,6 +324,7 @@ private:
 
 	void SetSwapInterval();
 	void DestroyResources();
+	void DestroyDeviceObjects();
 
 	void CreateTimestampQueries();
 	void DestroyTimestampQueries();
@@ -304,7 +338,7 @@ private:
 
 	GSTexture* CreateSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format) override;
 
-	void DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex, GSVector4* dRect, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c, const Filter filter) override;
+	void DoMerge(GSTexture* sTex[3], GSVector4* sRect, GSTexture* dTex, GSVector4* dRect, const MergeTopBand* top_band, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c, const Filter filter) override;
 	void DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb) override;
 
 	bool CompileFXAAProgram();
@@ -381,6 +415,7 @@ public:
 	bool SupportsExclusiveFullscreen() const override;
 	void DestroySurface() override;
 	std::string GetDriverInfo() const override;
+	void CollectDriverReport(GSDriverReport::BackendReport& out) const override;
 
 	void SetVSyncMode(GSVSyncMode mode, bool allow_present_throttle) override;
 
@@ -475,4 +510,52 @@ public:
 	void SetupOM(OMDepthStencilSelector dssel);
 	GLuint GetSamplerID(PSSamplerSelector ssel);
 	GLuint GetPaletteSamplerID();
+
+#ifdef __ANDROID__
+	// ---- Remote play (GSRemotePlay.h). GS thread, apart from what the ring publishes. ----
+public:
+	void RemotePlayVSync(GSTexture* src, const GSVector4& src_uv, const GSVector4& area) override;
+
+private:
+	/// A slot's shared buffer, bound to a texture of this context through an EGLImage.
+	struct RemotePlayHardware
+	{
+		AHardwareBuffer* buffer = nullptr;
+		void* image = nullptr; // EGLImageKHR
+		GLuint texture = 0;
+		u32 width = 0;
+		u32 height = 0;
+	};
+
+	/// A slot's readback: the pixel buffer the frame is read into, its fence, and the copy the app reads.
+	struct RemotePlayReadback
+	{
+		GLuint pbo = 0;
+		GLsync fence = nullptr;
+		std::unique_ptr<u8[]> data;
+		u32 size = 0;
+	};
+
+	void RemotePlayFinishReadbacks();
+	bool RemotePlayCreateHardware(RemotePlayHardware& hardware, u32 width, u32 height);
+	void RemotePlayDestroyHardware(RemotePlayHardware& hardware);
+	void RemotePlayRelease();
+	static bool RemotePlayIsDone(void* context, u32 index);
+
+	GSRemotePlay::Ring m_rp_ring;
+	std::array<RemotePlayHardware, 4> m_rp_hardware{};
+	std::array<RemotePlayReadback, 4> m_rp_readback{};
+
+	/// Per slot: the native fence that signals once its hardware frame is in, or -1.
+	std::array<int, 4> m_rp_fence_fds{-1, -1, -1, -1};
+
+	/// The stream's frame, drawn from the game's at the stream's size; each slot gets a copy.
+	std::unique_ptr<GSTexture> m_rp_frame;
+
+	GLuint m_rp_read_fbo = 0;
+	GLuint m_rp_draw_fbo = 0;
+	u32 m_rp_seq = 0;
+	bool m_rp_published = false;
+	bool m_rp_hardware_failed = false;
+#endif
 };

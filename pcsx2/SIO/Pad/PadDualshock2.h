@@ -51,17 +51,17 @@ public:
 private:
 	struct Analogs
 	{
-		u8 lx = Pad::ANALOG_NEUTRAL_POSITION;
-		u8 ly = Pad::ANALOG_NEUTRAL_POSITION;
-		u8 rx = Pad::ANALOG_NEUTRAL_POSITION;
-		u8 ry = Pad::ANALOG_NEUTRAL_POSITION;
+		SharedWord::Relaxed<u8> lx{Pad::ANALOG_NEUTRAL_POSITION};
+		SharedWord::Relaxed<u8> ly{Pad::ANALOG_NEUTRAL_POSITION};
+		SharedWord::Relaxed<u8> rx{Pad::ANALOG_NEUTRAL_POSITION};
+		SharedWord::Relaxed<u8> ry{Pad::ANALOG_NEUTRAL_POSITION};
 		bool lxInvert = false;
 		bool lyInvert = false;
 		bool rxInvert = false;
 		bool ryInvert = false;
 	};
 
-	u32 buttons = 0xffffffffu;
+	SharedWord::Relaxed<u32> buttons{0xffffffffu};
 	Analogs analogs;
 	// Analog button can be held without changing its state.
 	// We track here if it is currently held down, to avoid flipping in
@@ -72,6 +72,8 @@ private:
 	std::array<u8, VIBRATION_MOTORS> vibrationMotors = {};
 	float axisScale = 1.0f;
 	float axisDeadzone = 0.0f;
+	// Determines if inputs from the host should be corrected from square pickup zone to circular
+	bool useDiagonalScaleCorrection = false;
 	std::array<float, 2> vibrationScale = {1.0f, 1.0f};
 	// When the pressure modifier binding is activated, this is multiplied against
 	// all values in pressures, to artificially reduce pressures and give players
@@ -134,12 +136,18 @@ public:
 		return (index == Inputs::PAD_L2 || index == Inputs::PAD_R2);
 	}
 
+	/// The analog button's toggle: flips the analog light and the mode with it, and says so on the OSD. The IOP's
+	/// mode-switch command writes the same two fields (ModeSwitch), so with the IOP on its own thread the
+	/// toggle runs there: Set() posts it through the IOP thread's host command queue.
+	void ToggleAnalogLight();
+
 	Pad::ControllerType GetType() const override;
 	const Pad::ControllerInfo& GetInfo() const override;
 	void Set(u32 index, float value) override;
 	void SetRawAnalogs(const std::tuple<u8, u8> left, const std::tuple<u8, u8> right) override;
 	void SetRawPressureButton(u32 index, const std::tuple<bool, u8> value) override;
 	void SetAxisScale(float deadzone, float scale) override;
+	void SetDiagonalScaleCorrection(bool enabled) override;
 	float GetVibrationScale(u32 motor) const override;
 	void SetVibrationScale(u32 motor, float scale) override;
 	float GetPressureModifier() const override;

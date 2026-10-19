@@ -62,6 +62,25 @@ static constexpr mVU_MacWeights mVUmakeMacWeights()
 	return t;
 }
 
+// bySSShift for a single-scalar result held in lane 1, 2 or 3 instead of lane
+// 0 (allocReg's natural slots): the same weight, taken from that lane.
+// Indexed [variant][lane][shift]; the lane-0 row is bySSShift's and unused.
+struct mVU_SSLaneWeights
+{
+	u32 w[4][4][4][4];
+};
+
+static constexpr mVU_SSLaneWeights mVUmakeSSLaneWeights()
+{
+	mVU_SSLaneWeights t{};
+	for (int v = 0; v < 4; v++)
+		for (int at = 0; at < 4; at++)
+			for (int shift = 0; shift < 4; shift++)
+				t.w[v][at][shift][at] = armPackLaneWeight(0, 1, false, shift,
+					(v & mVUmacW_ZSU) != 0, (v & mVUmacW_ZSO) != 0);
+	return t;
+}
+
 struct mVU_Globals
 {
 #define __four(val) { val, val, val, val }
@@ -110,14 +129,21 @@ struct mVU_Globals
 	// (x86/microVU_Clamp.inl): row 0 = single-lane (SS) — real bound in lane
 	// 0, sentinel no-op bounds (INT_MAX for SMIN, UINT_MAX for UMIN) in
 	// lanes 1-3 so anything parked there survives; row 1 = all-lane (PS).
-	// Appended at the end of the struct so existing [x25, #imm] offsets in
-	// emitted code keep their values.
-	u32 signMaxvals[2][4] = {{0x7f7fffff, 0x7fffffff, 0x7fffffff, 0x7fffffff},
-	                         {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff}};
-	u32 signMinvals[2][4] = {{0xff7fffff, 0xffffffff, 0xffffffff, 0xffffffff},
-	                         {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff}};
+	// A row's max comes first and its min second, which is the order and the
+	// adjacency mVUclamp2's Ldp wants. Appended at the end of the struct so
+	// existing [x25, #imm] offsets in emitted code keep their values.
+	u32 signBounds[2][2][4] = {{{0x7f7fffff, 0x7fffffff, 0x7fffffff, 0x7fffffff},
+	                            {0xff7fffff, 0xffffffff, 0xffffffff, 0xffffffff}},
+	                           {{0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff},
+	                            {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff}}};
 	// Also appended at the end — see mVU_MacWeights.
 	mVU_MacWeights macWeights = mVUmakeMacWeights();
+	// CLIP's six result bits, one weight per comparison lane in the order
+	// mVU_CLIP's UZP1 leaves them: the four +component lanes then the four
+	// -component ones, w weightless in both. Appended for the reason above.
+	u16 clipWeights[8] = {1, 4, 16, 0, 2, 8, 32, 0};
+	// Appended for the reason above — see mVU_SSLaneWeights.
+	mVU_SSLaneWeights ssLaneWeights = mVUmakeSSLaneWeights();
 #undef __four
 };
 
@@ -127,9 +153,41 @@ alignas(32) static constexpr struct mVU_Globals mVUglob;
 // a 16-byte boundary and never straddles a cache line.
 static_assert(offsetof(mVU_Globals, macWeights) % 16 == 0,
 	"mVUglob.macWeights must stay 16-byte aligned for Ldr q [x25, #imm]");
+static_assert(offsetof(mVU_Globals, clipWeights) % 16 == 0,
+	"mVUglob.clipWeights must stay 16-byte aligned for Ldr q [x25, #imm]");
+static_assert(offsetof(mVU_Globals, ssLaneWeights) % 16 == 0,
+	"mVUglob.ssLaneWeights must stay 16-byte aligned for Ldr q [x25, #imm]");
+
+// mVUemitClampConsts takes both clamp bounds in one Ldp.
+static_assert(offsetof(mVU_Globals, maxvals) == offsetof(mVU_Globals, minvals) + 16,
+	"mVUglob.maxvals must follow minvals for the clamp-bound Ldp");
+
+// So does mVUclamp2, off whichever row it selects.
+static_assert(offsetof(mVU_Globals, signBounds) % 32 == 0,
+	"mVUglob.signBounds rows must be 32-byte aligned for Ldp q [x25, #imm]");
+
+// mVUclamp2's all-lane row is not loaded at all: it reads the registers
+// mVUemitClampConsts fills from maxvals and minvals, so the two tables have to
+// hold the same words.
+static constexpr bool mVUsignBoundsAllLaneRowIsClampPair()
+{
+	for (int lane = 0; lane < 4; lane++)
+	{
+		if (mVUglob.signBounds[1][0][lane] != mVUglob.maxvals[lane] ||
+			mVUglob.signBounds[1][1][lane] != mVUglob.minvals[lane])
+			return false;
+	}
+	return true;
+}
+static_assert(mVUsignBoundsAllLaneRowIsClampPair(),
+	"mVUglob.signBounds[1] must equal maxvals then minvals, the pair q25/q26 hold");
 
 // Weight vector for one mVUupdateFlags pack. `shift` is non-zero only on the
 // single-scalar path, which always keeps lane 0 alone in forward bit order.
+// The single-scalar weight (keepMask 1, not reversed) for a result in lane
+// `ssLane`; lane 0 is mVUmacWeightVec's own.
+__fi static const void* mVUmacWeightVec(u32 keepMask, bool reverse, int shift, int variant, int ssLane);
+
 __fi static const void* mVUmacWeightVec(u32 keepMask, bool reverse, int shift, int variant)
 {
 	pxAssert(variant >= 0 && variant < 4);
@@ -139,6 +197,14 @@ __fi static const void* mVUmacWeightVec(u32 keepMask, bool reverse, int shift, i
 		return &mVUglob.macWeights.bySSShift[variant][shift][0];
 	}
 	return &mVUglob.macWeights.byMask[variant][reverse ? 1 : 0][keepMask & 0xF][0];
+}
+
+__fi static const void* mVUmacWeightVec(u32 keepMask, bool reverse, int shift, int variant, int ssLane)
+{
+	if (ssLane == 0)
+		return mVUmacWeightVec(keepMask, reverse, shift, variant);
+	pxAssert(keepMask == 1 && !reverse && shift >= 0 && shift < 4 && ssLane < 4);
+	return &mVUglob.ssLaneWeights.w[variant][ssLane][shift][0];
 }
 
 static const uint _Ibit_ = 1 << 31;
@@ -209,7 +275,7 @@ static const char branchSTR[16][8] = {
 #define isVU0       (mVU.index == 0)
 #define getIndex    (isVU1 ? 1 : 0)
 #define getVUmem(x) (((isVU1) ? (x & 0x3ff) : ((x >= 0x400) ? (x & 0x43f) : (x & 0xff))) * 16)
-#define offsetSS    ((_X) ? (0) : ((_Y) ? (4) : ((_Z) ? 8 : 12)))
+#define offsetSS    ((s32)VuIlwLaneOffset(mVU.code))
 #define offsetReg   ((_X) ? (0) : ((_Y) ? (1) : ((_Z) ? 2 :  3)))
 
 //------------------------------------------------------------------
@@ -228,6 +294,13 @@ static const char branchSTR[16][8] = {
 
 // P/Q packed register (replaces x86 xmmPQ=xmm15)
 #define qmmPQ  a64::q28
+
+// The mVUclamp1 bounds, resident for the length of a block: +fMax in every
+// lane and -fMax. mVUemitClampConsts writes them, microRegAlloc keeps both out
+// of the VF pool. The COP2 macro path holds the same two values in the same
+// two registers (SL-13, iCOP2-arm64.cpp).
+#define qmmClampMax a64::q25
+#define qmmClampMin a64::q26
 
 // GPR scratch registers
 #define gprT1  a64::w9
@@ -260,6 +333,44 @@ __fi static a64::MemOperand mVUstateMem(int64_t off)
 {
 	return a64::MemOperand(gprVUState, off);
 }
+
+// How far VU1's data memory sits past the VURegs gprVUState points at; VU.h
+// puts the two in one object for exactly this. VU0's is not in it.
+static constexpr int64_t kVU1MemFromState = offsetof(VuStateStore, vu1Mem) - sizeof(VURegs);
+
+// Micro mode only: &VU.Mem[0], the VU's data memory, pinned by the dispatcher
+// (mVUdispatcherAB) so a load or store whose index is already a byte offset
+// addresses [gprVUMem, index] with no add in front of it. In COP2 macro mode
+// x29 is the EE recompiler's $v0 pin and is never touched.
+#define gprVUMem a64::x29
+
+// Where a VU load or store's address ended up: a base register and the
+// displacement the access itself has to carry -- or, with `index`, a base and
+// an index register whose sum is the address, which takes no displacement.
+struct mVUmemRef
+{
+	a64::Register base;
+	int64_t disp;
+	a64::Register index = a64::NoReg;
+
+	// The operand for the access `off` bytes in.
+	a64::MemOperand at(int64_t off = 0) const
+	{
+		if (index.IsValid())
+		{
+			pxAssert(disp == 0 && off == 0);
+			return a64::MemOperand(base, index);
+		}
+		return a64::MemOperand(base, disp + off);
+	}
+};
+
+// How far the unsigned-offset load/store forms reach, by operand width: imm12
+// scaled by the operand's own size. A site passes the reach of its narrowest
+// access, less the largest lane offset it adds on top.
+static constexpr int64_t kDispReachH = 4095 * 2;
+static constexpr int64_t kDispReachW = 4095 * 4;
+static constexpr int64_t kDispReachQ = 4095 * 16;
 
 // mVU shadow-flag base pointer (callee-saved). Pinned at mVUdispatcherAB
 // entry to `&mVU.macFlag[0]`. The `microVU` struct lays out
@@ -294,6 +405,15 @@ __fi static a64::MemOperand mVUneonBackupMem(int neonReg)
 {
 	return a64::MemOperand(gprMVUFlag, 48 + neonReg * 16);
 }
+
+// Flag-queue reorder accounting for vu_flag_queue_reorder_tests: how many
+// reorders mVUshuffleFlagQueue skipped as identities, how many it emitted, and
+// the most instructions any one of them took.
+#ifdef PCSX2_RECOMPILER_TESTS
+inline u32 g_mvuFlagQueueIdentities = 0;
+inline u32 g_mvuFlagQueueReorders = 0;
+inline u32 g_mvuFlagQueueWorst = 0;
+#endif
 
 // mVUglob constants base pointer (callee-saved). Pinned at mVUdispatcherAB
 // entry to `&mVUglob`. The mVU_Globals struct (~512 bytes of compile-time

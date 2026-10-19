@@ -226,10 +226,29 @@ target_link_libraries(savers log GLESv2 m)
 
 add_subdirectory(3rdparty/adrenotools)
 
+# miniupnpc, for remote play's online hosting: asks the host's router to open the stream's port
+# (remote_play_upnp.cpp). The static library only: the Android Gradle plugin packages every shared
+# library and builds every executable it finds, so the samples, tests and shared build stay off.
+set(UPNPC_BUILD_STATIC ON)
+set(UPNPC_BUILD_SHARED OFF)
+set(UPNPC_BUILD_TESTS OFF)
+set(UPNPC_BUILD_SAMPLE OFF)
+set(UPNPC_NO_INSTALL ON)
+add_subdirectory(3rdparty/miniupnpc EXCLUDE_FROM_ALL)
+
 # pcsx2-gsrunner as an on-demand NDK executable for adb-shell replay runs on Android
 # devices. EXCLUDE_FROM_ALL keeps every APK build unchanged; build it explicitly with
 # --target pcsx2-gsrunner.
 add_subdirectory("${ARMSX2_ROOT}/pcsx2-gsrunner" "${CMAKE_BINARY_DIR}/pcsx2-gsrunner" EXCLUDE_FROM_ALL)
+
+# armsx2-driverdiag, the driver report as an adb-shell tool. Behind an option, not only
+# EXCLUDE_FROM_ALL: the Android Gradle plugin builds every executable target it finds, whatever
+# EXCLUDE_FROM_ALL says, so an app build must not see this target at all. It is never packaged.
+# Build it with -DARMSX2_BUILD_DRIVERDIAG=ON and --target armsx2-driverdiag.
+option(ARMSX2_BUILD_DRIVERDIAG "Add the armsx2-driverdiag command-line tool (never part of the app)" OFF)
+if(ARMSX2_BUILD_DRIVERDIAG)
+	add_subdirectory("${ARMSX2_ROOT}/pcsx2-driverdiag" "${CMAKE_BINARY_DIR}/pcsx2-driverdiag" EXCLUDE_FROM_ALL)
+endif()
 
 # librashader: RetroArch (.slangp) shader chains for the GS post-process path, for BOTH
 # the Vulkan and OpenGL(ES) renderers. Rust-built and fetched at configure time from a
@@ -293,6 +312,8 @@ set(ARMSX2_EMUCORE_LIBRARY_NAME "emucore_4k" CACHE STRING "Android emucore share
 
 add_library(${ARMSX2_EMUCORE_LIBRARY_NAME} SHARED
 	native-lib.cpp
+	remote_play.cpp
+	remote_play_upnp.cpp
 )
 
 # The Discord bridge is its OWN shared library, and emucore must never link it.
@@ -328,7 +349,10 @@ target_link_libraries(${ARMSX2_EMUCORE_LIBRARY_NAME} PRIVATE
 	vixl
 	adrenotools
 	Zstd::Zstd
+	libminiupnpc-static
 	android
+	EGL
+	GLESv2
 	log
 )
 

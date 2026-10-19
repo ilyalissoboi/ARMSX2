@@ -30,12 +30,17 @@
 // (mVUemitMulUO / mVUemitAddSubO). They ride the same single ADDV as sign and
 // zero: the weight vector gains their two nibbles and armEmitPackSignZeroBits
 // an SLI apiece. Only their reduction to STATUS costs anything else.
+//
+// `ssLane`: the lane a single-scalar result sits in, 0 unless the body
+// computed it in place (allocReg's natural slots). The weights then take it
+// from there, and the flags come out bit for bit as from lane 0.
 static void mVUupdateFlags(mV, const a64::VRegister& reg,
 	const a64::VRegister& regT1in = a64::NoVReg,
 	const a64::VRegister& regT2in = a64::NoVReg,
 	bool modXYZW = true,
 	const a64::VRegister& vUnderflow = a64::NoVReg,
-	const a64::VRegister& vOverflow = a64::NoVReg)
+	const a64::VRegister& vOverflow = a64::NoVReg,
+	int ssLane = 0)
 {
 	const a64::Register& mReg = gprT1;
 	const a64::Register& sReg = getFlagReg(sFLAG.write);
@@ -78,9 +83,12 @@ static void mVUupdateFlags(mV, const a64::VRegister& reg,
 
 	if (sFLAG.doFlag)
 	{
-		mVUallocSFLAGa(sReg, sFLAG.lastWrite);
+		// The non-sticky clear reads the previous instance straight out of its
+		// register, rather than copying it over and clearing the copy.
 		if (sFLAG.doNonSticky)
-			armAsm->And(sReg.W(), sReg.W(), 0xfffc00ffu);
+			armAsm->And(sReg.W(), getFlagReg(sFLAG.lastWrite).W(), 0xfffc00ffu);
+		else
+			mVUallocSFLAGa(sReg, sFLAG.lastWrite);
 	}
 
 	//--------- Sign bits → [7:4], zero bits → [3:0], in one horizontal add ------
@@ -88,7 +96,7 @@ static void mVUupdateFlags(mV, const a64::VRegister& reg,
 
 	armEmitPackSignZeroBits(mReg.W(), reg, RQSCRATCH3, regT1, RQSCRATCH3,
 		[&](const a64::VRegister& w) {
-			armAsm->Ldr(w, mVUglobMem(mVUmacWeightVec(AND_XYZW, macPath, foldShift, weightVariant)));
+			armAsm->Ldr(w, mVUglobMem(mVUmacWeightVec(AND_XYZW, macPath, foldShift, weightVariant, ssLane)));
 		},
 		vUnderflow, vOverflow);
 
@@ -108,7 +116,7 @@ static void mVUupdateFlags(mV, const a64::VRegister& reg,
 		armAsm->Cmge(regT1.V4S(), regT1.V4S(), RQSCRATCH3.V4S()); // all-1s where |x| >= FLT_MAX
 		// Reuse the shared weight vector: on an all-1s lane it contributes both
 		// nibbles, so the mask falls out of the low one.
-		armAsm->Ldr(RQSCRATCH3, mVUglobMem(mVUmacWeightVec(AND_XYZW, macPath, 0, mVUmacW_ZS)));
+		armAsm->Ldr(RQSCRATCH3, mVUglobMem(mVUmacWeightVec(AND_XYZW, macPath, 0, mVUmacW_ZS, ssLane)));
 		armAsm->And(regT1.V16B(), regT1.V16B(), RQSCRATCH3.V16B());
 		armAsm->Addv(a64::VRegister(regT1.GetCode(), 32), regT1.V4S());
 		armAsm->Fmov(gprT2, a64::VRegister(regT1.GetCode(), 32));
@@ -428,21 +436,29 @@ static __fi void mVUsetFlags(mV, microFlagCycles& mFC)
 #define getFlagReg3(x) ((gFlag == x) ? gprT1 : getFlagReg(x))
 #define getFlagReg4(x) ((gFlag == x) ? gprT1 : gprT2)
 
-// Emit NEON lane-shuffle equivalent to x86's SHUF.PS xmm, xmm, pattern.
-// bFlag[i] names the source lane that should end up in dest lane i.
-// Clobbers one temp NEON register.
-static __fi void mVUshuffleFlagVec(a64::VRegister vec, const int* bFlag, a64::VRegister tmp)
+// Reorder one flag queue in place: the four instances at `mem` become
+// { q[bFlag[0]], q[bFlag[1]], q[bFlag[2]], q[bFlag[3]] }. The gather lands in
+// `tmp` and is stored from there, which leaves `vec` holding the instances
+// every element insert reads and lets the opening shuffle write a whole
+// register rather than copy one first.
+static __fi void mVUshuffleFlagQueue(const a64::MemOperand& mem, const int* bFlag,
+	a64::VRegister vec, a64::VRegister tmp)
 {
-	// If already identity, nothing to do.
+	// An identity reorder would store back the bytes it just loaded.
 	if (bFlag[0] == 0 && bFlag[1] == 1 && bFlag[2] == 2 && bFlag[3] == 3)
-		return;
-	// Copy source so we can read lanes before overwriting them.
-	armAsm->Mov(tmp.V16B(), vec.V16B());
-	for (int i = 0; i < 4; i++)
 	{
-		if (bFlag[i] != i)
-			armAsm->Ins(vec.V4S(), i, tmp.V4S(), bFlag[i]);
+#ifdef PCSX2_RECOMPILER_TESTS
+		g_mvuFlagQueueIdentities++;
+#endif
+		return;
 	}
+	armAsm->Ldr(vec, mem);
+	[[maybe_unused]] const int emitted = armEmitLaneGather32(tmp, vec, bFlag);
+	armAsm->Str(tmp, mem);
+#ifdef PCSX2_RECOMPILER_TESTS
+	g_mvuFlagQueueReorders++;
+	g_mvuFlagQueueWorst = std::max(g_mvuFlagQueueWorst, static_cast<u32>(emitted));
+#endif
 }
 
 // Recompiles code for proper flags on block linkings (equivalent to x86's mVUsetupFlags).
@@ -513,17 +529,13 @@ static __fi void mVUsetupFlags(mV, microFlagCycles& mFC)
 	{
 		int bMac[4];
 		sortFlag(mFC.xMac, bMac, mFC.cycles);
-		armAsm->Ldr(qmmT1, a64::MemOperand(gprMVUFlag));
-		mVUshuffleFlagVec(qmmT1, bMac, qmmT2);
-		armAsm->Str(qmmT1, a64::MemOperand(gprMVUFlag));
+		mVUshuffleFlagQueue(a64::MemOperand(gprMVUFlag), bMac, qmmT1, qmmT2);
 	}
 
 	if (doCFlagInsts && __Clip)
 	{
 		int bClip[4];
 		sortFlag(mFC.xClip, bClip, mFC.cycles);
-		armAsm->Ldr(qmmT2, a64::MemOperand(gprMVUFlag, 16));
-		mVUshuffleFlagVec(qmmT2, bClip, qmmT1);
-		armAsm->Str(qmmT2, a64::MemOperand(gprMVUFlag, 16));
+		mVUshuffleFlagQueue(a64::MemOperand(gprMVUFlag, 16), bClip, qmmT2, qmmT1);
 	}
 }

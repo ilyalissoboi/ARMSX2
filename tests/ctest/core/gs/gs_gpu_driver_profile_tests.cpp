@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <bitset>
 #include <string>
 
 namespace
@@ -50,7 +51,8 @@ GpuProfileSelection ResolveGL(const char* vendor, const char* renderer, const ch
 }
 
 GpuProfileSelection ResolveMaliVK(const char* device_name, u32 packed_version,
-	std::string_view platform_hints = std::string_view())
+	std::string_view platform_hints = std::string_view(), std::string_view driver_info = std::string_view(),
+	bool roaa_color_access = false)
 {
 	MobileDriverContext context;
 	context.api = MobileGpuApi::Vulkan;
@@ -58,7 +60,9 @@ GpuProfileSelection ResolveMaliVK(const char* device_name, u32 packed_version,
 	context.driver_id = kArmDriverId;
 	context.driver_version = packed_version;
 	context.driver_name = "ARM proprietary";
+	context.driver_info = driver_info;
 	context.platform_hints = platform_hints;
+	context.roaa_color_access = roaa_color_access;
 	return GpuProfileDetector::Resolve("auto", std::string_view(), device_name, context);
 }
 
@@ -70,6 +74,13 @@ GpuProfileSelection ResolveMaliVK(const char* device_name, u32 packed_version,
 constexpr const char* kMt6897AndroidHints = "ro.soc.manufacturer=Mediatek | ro.soc.model=MT6897 | "
 										   "ro.board.platform=mt6897";
 constexpr const char* kMt6897LinuxHints = "anbernic,rg477v mediatek,mt6897";
+// Arm's driverInfo for an r44p1 blob: "v1.r<release>p<patch>-<build>.<hash>". Not malisx2's.
+constexpr const char* kMaliR44p1DriverInfo = "v1.r44p1-01eac0.abc";
+// malisx2's driverInfo: Arm's "v1.r44p1-" revision text, then our own name. The old packs say
+// "libmali" where this says "malisx2". Every other field it reports (vendorID, driverID, 44.1.0) is
+// Arm's, so the rows written for the r44p1 blob see it.
+constexpr const char* kMaliSX2DriverInfo = "v1.r44p1-malisx2.0.2.s0123abcd";
+constexpr const char* kMaliSX2OldPackDriverInfo = "v1.r44p1-libmali.0.1.s0123abcd";
 // A MediaTek part that is NOT the one we measured: the deny list still applies there.
 constexpr const char* kOtherMediaTekHints = "ro.soc.manufacturer=Mediatek | ro.soc.model=MT6985 | "
 										   "ro.board.platform=mt6985";
@@ -98,6 +109,18 @@ constexpr const char* kRg477vDeviceHints2026_09_03 =
 constexpr const char* kMt6895BoardHints2026_09_03 =
 	"ro.soc.manufacturer=Mediatek | ro.soc.model=MT6895 | ro.board.platform=mt6895 | "
 	"ro.hardware=mt6895 | ro.product.board=k6895v1_64";
+
+// The table row with this id, as the bit index MobileDriverProfile::matched_rules uses.
+u32 RowOf(const char* id)
+{
+	for (u32 row = 0; row < GpuProfileDetector::DriverRuleCount(); row++)
+	{
+		if (std::string_view(GpuProfileDetector::DriverRuleId(row)) == id)
+			return row;
+	}
+	ADD_FAILURE() << "no rule row named " << id;
+	return 0;
+}
 
 bool DeniesRoaaDestinationRead(const GpuProfileSelection& sel)
 {
@@ -544,19 +567,124 @@ TEST(GSGpuDriverProfile, AutoResolvesToVulkanOnMt6897)
 		kMaliR44p1GlVendor, kMaliR44p1GlRenderer, kMaliR44p1GlVersion, kMt6897LinuxHints));
 }
 
-// The other polarity, which is the one that costs a whole device class if it is wrong: every other
-// Mali part keeps OpenGL, including the same driver revision on a different MediaTek SoC and the
-// same strings with no SoC hint at all. Sending an unmeasured Mali to Vulkan re-ships the 2.6.6.5
-// complaint in the opposite direction -- the GL fetch path there is the fast one.
-TEST(GSGpuDriverProfile, AutoStaysOnOpenGLForEveryOtherMaliPart)
+// The other polarity, which is the one that costs a whole device class if it is wrong: a Mali part
+// outside Valhall v9 and v11 keeps OpenGL. That is v10 (G310/G510/G610/G710), Bifrost, and the
+// 5th-gen parts, whose names read like v11 and are not (G620/G720 are arch 12, G625/G725 arch 13).
+// The GL fetch path is the fast one there, and none of these were measured on Vulkan.
+TEST(GSGpuDriverProfile, AutoStaysOnOpenGLForTheMaliPartsOutsideValhallV9AndV11)
 {
-	EXPECT_FALSE(AutoPrefersVulkan(
-		kMaliR44p1GlVendor, kMaliR44p1GlRenderer, kMaliR44p1GlVersion, kOtherMediaTekHints));
-	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, kMaliR44p1GlRenderer, kMaliR44p1GlVersion));
-	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G715",
-		"OpenGL ES 3.2 v1.r46p0-01eac0.deadbeefdeadbeefdeadbeefdeadbeef", kOtherMediaTekHints));
-	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G57 MC2",
-		"OpenGL ES 3.2 v1.r32p1-01eac0.deadbeefdeadbeefdeadbeefdeadbeef"));
+	for (const char* renderer : {"Mali-G310 MC2", "Mali-G510 MC4", "Mali-G610 MC6", "Mali-G710 MC10",
+			 "Mali-G52 MC2", "Mali-G76 MC12", "Mali-G71 MP20", "Mali-G31 MP2", "Mali-G620 MC4",
+			 "Mali-G720 MC7", "Mali-G625 MC6", "Mali-G725 MC6", "Immortalis-G925 MC12", "Mali-T880 MP12"})
+	{
+		EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, renderer, kMaliR44p1GlVersion)) << renderer;
+		EXPECT_STREQ(GSUtil::AndroidAutoRendererReason(), "no rule steers this device to Vulkan") << renderer;
+		// A MediaTek SoC that was not measured makes no difference to a part the architecture rule
+		// does not cover.
+		EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, renderer, kMaliR44p1GlVersion, kOtherMediaTekHints))
+			<< renderer;
+	}
+}
+
+// Auto runs Vulkan on Mali Valhall v9 (G57, G68, G77, G78) and v11 (G615, G715, Immortalis
+// included), whatever the GL driver revision and with no SoC hint to go on. The answer comes from
+// the GL strings alone, so it cannot depend on which Vulkan driver is installed -- Arm's or our
+// malisx2 pack -- because no Vulkan device exists when Auto is decided.
+TEST(GSGpuDriverProfile, AutoResolvesToVulkanOnMaliValhallV9AndV11)
+{
+	struct Case
+	{
+		const char* renderer;
+		const char* expected_reason;
+	};
+	const Case cases[] = {
+		{"Mali-G57 MC2", "Mali-G57 MC2 is Valhall v9, which Auto runs on Vulkan"},
+		{"Mali-G68 MC4", "Mali-G68 MC4 is Valhall v9, which Auto runs on Vulkan"},
+		{"Mali-G77 MC9", "Mali-G77 MC9 is Valhall v9, which Auto runs on Vulkan"},
+		{"Mali-G78 MC14", "Mali-G78 MC14 is Valhall v9, which Auto runs on Vulkan"},
+		{"Mali-G615 MC2", "Mali-G615 MC2 is Valhall v11, which Auto runs on Vulkan"},
+		{"Mali-G715 MC7", "Mali-G715 MC7 is Valhall v11, which Auto runs on Vulkan"},
+		{"Mali-G715-Immortalis MC11", "Immortalis-G715 MC11 is Valhall v11, which Auto runs on Vulkan"},
+	};
+	// Four Arm GL revisions, old to new. Arm's revision is not a term of this rule.
+	for (const char* version :
+		{"OpenGL ES 3.2 v1.r32p1-01eac0.deadbeefdeadbeefdeadbeefdeadbeef", kMaliR44p1GlVersion,
+			"OpenGL ES 3.2 v1.r46p0-01eac0.deadbeefdeadbeefdeadbeefdeadbeef",
+			"OpenGL ES 3.2 v1.r52p0-01eac0.deadbeefdeadbeefdeadbeefdeadbeef"})
+	{
+		for (const Case& c : cases)
+		{
+			EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, c.renderer, version)) << c.renderer << " " << version;
+			EXPECT_STREQ(GSUtil::AndroidAutoRendererReason(), c.expected_reason) << c.renderer;
+			// An SoC the database has no opinion on does not change it either.
+			EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, c.renderer, version, kOtherMediaTekHints))
+				<< c.renderer << " " << version;
+		}
+	}
+}
+
+// Every Valhall v9 and v11 name a user can meet, in the two places it comes from: Arm's stock
+// GL_RENDERER (MC<n>, or MP<n> on some phones) and the bare and MC<n> names our malisx2 Vulkan
+// driver reports. Auto keys on the GL string alone, but a name that parsed as the wrong
+// architecture here would send a whole device class to the wrong renderer, so each one is pinned.
+TEST(GSGpuDriverProfile, AutoResolvesToVulkanForEveryKnownValhallV9AndV11Name)
+{
+	for (const char* renderer : {"Mali-G57", "Mali-G57 MC2", "Mali-G57 MC4", "Mali-G57 MC6", "Mali-G68",
+			 "Mali-G68 MC4", "Mali-G77 MC7", "Mali-G77 MC9", "Mali-G78", "Mali-G78 MC14", "Mali-G78 MP14",
+			 "Mali-G78AE", "Mali-G78AE MC10", "Mali-G615", "Mali-G615 MC6", "Mali-G715", "Mali-G715 MC7",
+			 "Mali-G715-Immortalis MC11"})
+	{
+		EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, renderer, kMaliR44p1GlVersion)) << renderer;
+		EXPECT_NE(std::string(GSUtil::AndroidAutoRendererReason()).find("Valhall v"), std::string::npos)
+			<< renderer << ": " << GSUtil::AndroidAutoRendererReason();
+	}
+}
+
+// Parts whose names sit one digit away from a v9 or v11 part. Each pair is decided by the whole
+// model number, so a prefix match (G71 inside G715, G31 inside G310, G72 inside G720) or a near
+// miss (G610 against G615, G710 against G715) would send one of them the wrong way.
+TEST(GSGpuDriverProfile, AutoDecidesByTheWholeMaliModelNumber)
+{
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G610 MC6", kMaliR44p1GlVersion));
+	EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G615 MC6", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G710 MC10", kMaliR44p1GlVersion));
+	EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G715 MC10", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G71 MP8", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G720 MC7", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G31 MP2", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G310 MC2", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G51 MP4", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G52 MC2", kMaliR44p1GlVersion));
+	EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G57 MC2", kMaliR44p1GlVersion));
+	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Mali-G510 MC4", kMaliR44p1GlVersion));
+	// The Immortalis name written with the brand first, as a tool that rebuilds the name would.
+	EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, "Immortalis-G715 MC11", kMaliR44p1GlVersion));
+}
+
+// Nothing outside Mali moves. Adreno keeps its own reason (a model number that happens to match a
+// Mali one must not change who answered), and a GPU that is not identified at all stays on OpenGL.
+TEST(GSGpuDriverProfile, TheMaliArchitectureRuleLeavesOtherVendorsAlone)
+{
+	EXPECT_TRUE(AutoPrefersVulkan("Qualcomm", "Adreno (TM) 615", "OpenGL ES 3.2 V@0676.0"));
+	EXPECT_NE(std::string(GSUtil::AndroidAutoRendererReason()).find("Adreno"), std::string::npos);
+
+	EXPECT_FALSE(AutoPrefersVulkan("Imagination Technologies", "PowerVR Rogue GE8320", "OpenGL ES 3.2 build 1.9@4850625"));
+	EXPECT_STREQ(GSUtil::AndroidAutoRendererReason(), "no rule steers this device to Vulkan");
+	EXPECT_FALSE(AutoPrefersVulkan("Samsung Electronics", "Samsung Xclipse 920", "OpenGL ES 3.2"));
+	EXPECT_FALSE(AutoPrefersVulkan("", "", ""));
+	EXPECT_STREQ(GSUtil::AndroidAutoRendererReason(), "no rule steers this device to Vulkan");
+}
+
+// The policy on its own: v9 and v11 only. 0 is "not Valhall", which is what Bifrost and the 5th-gen
+// parts report.
+TEST(GSGpuDriverProfile, OnlyValhallV9AndV11PreferVulkan)
+{
+	EXPECT_FALSE(GSUtil::MaliValhallArchPrefersVulkan(0));
+	EXPECT_TRUE(GSUtil::MaliValhallArchPrefersVulkan(9));
+	EXPECT_FALSE(GSUtil::MaliValhallArchPrefersVulkan(10));
+	EXPECT_TRUE(GSUtil::MaliValhallArchPrefersVulkan(11));
+	EXPECT_FALSE(GSUtil::MaliValhallArchPrefersVulkan(12));
+	EXPECT_FALSE(GSUtil::MaliValhallArchPrefersVulkan(13));
 }
 
 // Adreno was steered to Vulkan long before any of this and must still be, for its own reason. The
@@ -617,10 +745,11 @@ TEST(GSGpuDriverProfile, Rg477vAdbStrings20260903ResolveAutoToVulkan)
 	EXPECT_STREQ(GSUtil::AndroidAutoRendererReason(), "the driver database prefers Vulkan on this SoC");
 }
 
-// The same strings with the SoC changed to a part nobody measured. This is the case that decides
-// how far the flip travels: the GPU, the driver revision and the vendor are identical, so if the
-// rule keyed on any of those instead of on the SoC, this device would move too.
-TEST(GSGpuDriverProfile, Rg477vAdbStrings20260903OnAnMt6895BoardStayOnOpenGL)
+// The same strings with the SoC changed to a part nobody measured. The database's SoC-keyed
+// preference does not travel with the SoC, so the database rule stays off and the match count stays
+// level. Auto still says Vulkan, because the GPU is a G615 and the architecture rule answers for it;
+// the reason says so, instead of crediting the database.
+TEST(GSGpuDriverProfile, Rg477vAdbStrings20260903OnAnMt6895BoardResolvesToVulkanByArchitecture)
 {
 	const GpuProfileSelection other_soc = ResolveGL(kMaliR44p1GlVendor, kMaliR44p1GlRenderer,
 		kMaliR44p1GlVersion, kMt6895BoardHints2026_09_03);
@@ -633,9 +762,9 @@ TEST(GSGpuDriverProfile, Rg477vAdbStrings20260903OnAnMt6895BoardStayOnOpenGL)
 	EXPECT_FALSE(DatabasePrefersVulkan(other_soc));
 	EXPECT_EQ(other_soc.driver.matched_rule_count, without_soc.driver.matched_rule_count);
 
-	EXPECT_FALSE(AutoPrefersVulkan(kMaliR44p1GlVendor, kMaliR44p1GlRenderer, kMaliR44p1GlVersion,
+	EXPECT_TRUE(AutoPrefersVulkan(kMaliR44p1GlVendor, kMaliR44p1GlRenderer, kMaliR44p1GlVersion,
 		kMt6895BoardHints2026_09_03));
-	EXPECT_STREQ(GSUtil::AndroidAutoRendererReason(), "no rule steers this device to Vulkan");
+	EXPECT_STREQ(GSUtil::AndroidAutoRendererReason(), "Mali-G615 MC6 is Valhall v11, which Auto runs on Vulkan");
 }
 
 // The forced-bug override, which is how a test harness reaches a workaround road on a machine
@@ -665,4 +794,612 @@ TEST(GSGpuDriverProfile, ForcedBugsRideOnTopOfTheDatabaseAndAreNotCountedAsRules
 
 	GpuProfileDetector::SetForcedBugs(0);
 	EXPECT_FALSE(resolve().driver.HasBug(DriverBug::BrokenBlendConstant));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The declared-feedback-loop ordering fact, and the build tag it is parsed out of.
+//
+// This is the one fact in the database that is not a rule-table match, and it is the one whose
+// consequence is dropping barriers rather than adding work. Everything else in this file guards a
+// rule that stops firing; these guard a rule that fires when it should not, which is the direction
+// that renders wrong instead of slow.
+//
+// The tag: our Turnip builds pass MESA_GIT_SHA1_OVERRIDE, which Mesa pastes onto the package
+// version, so a build tagged `axfl1-005` reports driverInfo "Mesa 26.1.2 (git-axfl1-005)". A stock
+// distro Turnip is built from a release tarball and reports plain "Mesa 26.1.2" with no git sha at
+// all. The convention and the build register are in
+// README.ARMSX2.md in github.com/bmdhacks/armsx2-turnip.
+namespace
+{
+	constexpr const char* kFixedTurnipDriverInfo = "Mesa 26.1.2 (git-axfl1-005)";
+	constexpr const char* kStockTurnipDriverInfo = "Mesa 26.1.2";
+
+	GpuProfileSelection ResolveAdrenoVKWithInfo(const char* device_name, u32 driver_id,
+		const char* driver_name, u32 packed_version, const char* driver_info)
+	{
+		MobileDriverContext context;
+		context.api = MobileGpuApi::Vulkan;
+		context.vendor_id = kAdrenoVendorId;
+		context.driver_id = driver_id;
+		context.driver_version = packed_version;
+		context.driver_name = driver_name;
+		context.driver_info = driver_info;
+		return GpuProfileDetector::Resolve("auto", std::string_view(), device_name, context);
+	}
+
+	bool OrdersDeclaredLoop(const GpuProfileSelection& sel)
+	{
+		return sel.driver.orders_declared_feedback_loop;
+	}
+} // namespace
+
+TEST(GSGpuDriverProfile, TheFixTagParsesToItsGeneration)
+{
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration(kFixedTurnipDriverInfo), 1u);
+	// Any generation, and the tag does not have to sit at the end of the string.
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (git-axfl7-012)"), 7u);
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 27.0.0 (git-axfl12-a) extra"), 12u);
+	// Mesa emits it lowercase; accepting either spelling costs nothing and removes a way to be
+	// wrong for a reason nobody would look for.
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (GIT-AXFL3-001)"), 3u);
+}
+
+TEST(GSGpuDriverProfile, AMalformedFixTagIsNoTagAtAll)
+{
+	// Generation 0 is not a generation: the convention counts from 1, so a 0 is a build tagged by
+	// something that is not this convention.
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (git-axfl0-005)"), 0u);
+	// No digit at all, and the prefix on its own.
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (git-axfl-005)"), 0u);
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (git-axfl)"), 0u);
+	// The convention puts a hyphen after the generation; without it this is somebody's branch name
+	// that happens to start the same way.
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (git-axfl1)"), 0u);
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (git-axfl2beta-1)"), 0u);
+	// The tag has to start a token. A longer word that ends in "git-axfl1-" is not our tag.
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (notgit-axfl1-005)"), 0u);
+	// The tags that predate the convention, which are exactly the builds that do NOT have the fix.
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration("Mesa 26.1.2 (git-armsx2-003)"), 0u);
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration(kStockTurnipDriverInfo), 0u);
+	EXPECT_EQ(GpuProfileDetector::ParseDeclaredLoopFixGeneration(std::string_view()), 0u);
+}
+
+// A well-formed tag first, then everything that has to be true besides the tag. The device the
+// fix was measured on: SD865 / Adreno 650 / Turnip, carrying a generation-1 build.
+TEST(GSGpuDriverProfile, ATaggedTurnipOnAdreno6xxOrdersTheDeclaredLoop)
+{
+	const GpuProfileSelection sel = ResolveAdrenoVKWithInfo("Adreno (TM) 650", kTurnipDriverId,
+		"turnip", PackVulkanVersion(26, 1, 2), kFixedTurnipDriverInfo);
+
+	EXPECT_EQ(sel.driver.driver, MobileGpuDriver::MesaTurnip);
+	EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno6xx);
+	EXPECT_EQ(sel.driver.declared_loop_fix_generation, 1u);
+	EXPECT_TRUE(OrdersDeclaredLoop(sel));
+	// The fact is not a rule, so it must not look like one.
+	EXPECT_EQ(sel.driver.matched_rule_count,
+		ResolveAdrenoVKWithInfo("Adreno (TM) 650", kTurnipDriverId, "turnip", PackVulkanVersion(26, 1, 2),
+			kStockTurnipDriverInfo)
+			.driver.matched_rule_count);
+}
+
+// The stock driver on the same device, which is what every user has until they install the pack.
+TEST(GSGpuDriverProfile, StockTurnipMakesNoOrderingClaim)
+{
+	EXPECT_FALSE(OrdersDeclaredLoop(ResolveAdrenoVKWithInfo("Adreno (TM) 650", kTurnipDriverId,
+		"turnip", PackVulkanVersion(26, 1, 2), kStockTurnipDriverInfo)));
+	// And it keeps the workaround that puts it on the copy road, because that rule is about the
+	// driver it was measured on and this is that driver.
+	EXPECT_TRUE(ResolveAdrenoVKWithInfo("Adreno (TM) 650", kTurnipDriverId, "turnip",
+		PackVulkanVersion(26, 1, 2), kStockTurnipDriverInfo)
+			.driver.UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback));
+}
+
+// a7xx is measured separately and the driver patch behind generation 1 changes emission for
+// CHIP == A6XX only, so a tagged build on an a740 carries nothing to trust. The tag still parses --
+// it IS one of our builds -- and the claim is still refused.
+TEST(GSGpuDriverProfile, ATaggedTurnipOnAdreno7xxMakesNoOrderingClaim)
+{
+	const GpuProfileSelection sel = ResolveAdrenoVKWithInfo("Adreno (TM) 740", kTurnipDriverId,
+		"turnip", PackVulkanVersion(26, 1, 2), kFixedTurnipDriverInfo);
+
+	EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno7xx);
+	EXPECT_EQ(sel.driver.declared_loop_fix_generation, 1u);
+	EXPECT_FALSE(OrdersDeclaredLoop(sel));
+}
+
+// The older a6xx parts. On an Adreno 610 (MQ65) a generation-1 build renders the declared road
+// differently from run to run -- 5 of 24 dumps, visible in
+// play on Metal Gear Solid 3 -- while the same build's copy road and stock Turnip are stable. So
+// the fact covers the class it was measured correct on, the 650 and up, and nothing below it.
+TEST(GSGpuDriverProfile, ATaggedTurnipBelowTheAdreno650ClassMakesNoOrderingClaim)
+{
+	for (const char* device : {"Adreno (TM) 610", "Adreno (TM) 618", "Adreno (TM) 630", "Adreno (TM) 640"})
+	{
+		const GpuProfileSelection sel = ResolveAdrenoVKWithInfo(device, kTurnipDriverId,
+			"turnip", PackVulkanVersion(26, 1, 2), kFixedTurnipDriverInfo);
+
+		EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno6xx) << device;
+		EXPECT_EQ(sel.driver.declared_loop_fix_generation, 1u) << device;
+		EXPECT_FALSE(OrdersDeclaredLoop(sel)) << device;
+	}
+
+	EXPECT_TRUE(OrdersDeclaredLoop(ResolveAdrenoVKWithInfo("Adreno (TM) 660", kTurnipDriverId,
+		"turnip", PackVulkanVersion(26, 1, 2), kFixedTurnipDriverInfo)));
+}
+
+// A non-Turnip driver reporting the tag. It cannot happen -- the blob has no Mesa git sha - so if
+// it does, the string is not what we think it is and the safe reading is "not our build".
+TEST(GSGpuDriverProfile, ANonTurnipDriverCarryingTheTagMakesNoOrderingClaim)
+{
+	const GpuProfileSelection sel = ResolveAdrenoVKWithInfo("Adreno (TM) 650",
+		kQualcommProprietaryDriverId, "Qualcomm", PackVulkanVersion(512, 615, 0), kFixedTurnipDriverInfo);
+
+	EXPECT_EQ(sel.driver.driver, MobileGpuDriver::QualcommProprietary);
+	EXPECT_EQ(sel.driver.declared_loop_fix_generation, 1u);
+	EXPECT_FALSE(OrdersDeclaredLoop(sel));
+}
+
+// Mali under PanVK carrying the tag: same answer, one step further out. The claim names an Adreno
+// fix, so no other vendor can inherit it however its driver string reads.
+TEST(GSGpuDriverProfile, AMaliDriverCarryingTheTagMakesNoOrderingClaim)
+{
+	MobileDriverContext context;
+	context.api = MobileGpuApi::Vulkan;
+	context.vendor_id = kMaliVendorId;
+	context.driver_id = kArmDriverId;
+	context.driver_version = PackVulkanVersion(44, 1, 0);
+	context.driver_name = "ARM proprietary";
+	context.driver_info = kFixedTurnipDriverInfo;
+
+	const GpuProfileSelection sel =
+		GpuProfileDetector::Resolve("auto", std::string_view(), "Mali-G615 MC6", context);
+	EXPECT_EQ(sel.runtime_profile, RuntimeGpuProfile::Mali);
+	EXPECT_FALSE(OrdersDeclaredLoop(sel));
+}
+
+// The OpenGL path never reaches this road -- the declaration is a Vulkan pipeline create flag and
+// an image layout -- so the fact is refused there whatever the strings say.
+TEST(GSGpuDriverProfile, TheOrderingClaimDoesNotReachTheOpenGLPath)
+{
+	MobileDriverContext context;
+	context.api = MobileGpuApi::OpenGL;
+	context.driver_name = "Turnip Adreno (TM) 650";
+	context.driver_info = kFixedTurnipDriverInfo;
+	context.api_version_string = "OpenGL ES 3.2 Mesa 26.1.2";
+
+	const GpuProfileSelection sel =
+		GpuProfileDetector::Resolve("auto", "freedreno", "Adreno (TM) 650", context);
+	EXPECT_EQ(sel.driver.declared_loop_fix_generation, 1u);
+	EXPECT_FALSE(OrdersDeclaredLoop(sel));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The a7xx preference: Turnip on an Adreno 7xx belongs on the declared feedback loop with the
+// per-draw barriers KEPT.
+//
+// Unlike the ordering fact above, this one needs no build tag. It is a fact about the PART, not
+// about a build: on an a740 both our pack build and upstream main draw the declared-with-barriers
+// road correct on every scored cell and stable over 7 reps, while the copy road the driver
+// database puts them on draws The Godfather a third wrong and NASCAR's sky wrong. The barrier-less road races there, so the two facts are genuinely
+// different claims and only one of them applies per part.
+namespace
+{
+	bool PrefersDeclaredLoopWithBarriers(const GpuProfileSelection& sel)
+	{
+		return sel.driver.prefers_declared_loop_with_barriers;
+	}
+
+	GpuProfileSelection ResolveTurnipVK(const char* device_name, const char* driver_info)
+	{
+		return ResolveAdrenoVKWithInfo(
+			device_name, kTurnipDriverId, "turnip", PackVulkanVersion(26, 1, 2), driver_info);
+	}
+} // namespace
+
+// The device this was measured on, and its bigger sibling. Stock Turnip, no tag, and it still earns
+// the preference -- that is the whole point of this fact being about the part.
+TEST(GSGpuDriverProfile, StockTurnipOnAdreno7xxPrefersTheDeclaredLoopWithBarriers)
+{
+	for (const char* device_name : {"Adreno (TM) 740", "Adreno (TM) 750", "Adreno (TM) 730"})
+	{
+		const GpuProfileSelection sel = ResolveTurnipVK(device_name, kStockTurnipDriverInfo);
+		EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno7xx) << device_name;
+		EXPECT_EQ(sel.driver.driver, MobileGpuDriver::MesaTurnip) << device_name;
+		EXPECT_TRUE(PrefersDeclaredLoopWithBarriers(sel)) << device_name;
+		// And no tag, so no ordering claim. Being on the declared road is not being ordered.
+		EXPECT_FALSE(OrdersDeclaredLoop(sel)) << device_name;
+	}
+}
+
+// Only the 730 and up. The a740 is the one part this was measured on. Our table files the 702, 710
+// and 720 -- and the 725 -- as 7xx too, but none was run, and the 702 is an a6xx-family part as far
+// as Mesa's freedreno device table is concerned. They keep origin/master's road: the RT-copy
+// workaround, no declared loop.
+TEST(GSGpuDriverProfile, TurnipBelowAdreno730DoesNotGetTheA7xxPreference)
+{
+	for (const char* device_name : {"Adreno (TM) 702", "Adreno (TM) 710", "Adreno (TM) 720", "Adreno (TM) 725"})
+	{
+		const GpuProfileSelection sel = ResolveTurnipVK(device_name, kStockTurnipDriverInfo);
+		EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno7xx) << device_name;
+		EXPECT_EQ(sel.driver.driver, MobileGpuDriver::MesaTurnip) << device_name;
+		EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(sel)) << device_name;
+		EXPECT_FALSE(OrdersDeclaredLoop(sel)) << device_name;
+		EXPECT_TRUE(sel.driver.UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback)) << device_name;
+		EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(ResolveTurnipVK(device_name, kFixedTurnipDriverInfo)))
+			<< device_name << " (tagged)";
+	}
+}
+
+// a6xx is the ordering fact's part, not this one's. Turnip on an a650 keeps the copy road unless
+// it carries the tag, which is exactly where the ordering fact left it.
+TEST(GSGpuDriverProfile, TurnipOnAdreno6xxDoesNotGetTheA7xxPreference)
+{
+	EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(ResolveTurnipVK("Adreno (TM) 650", kStockTurnipDriverInfo)));
+	EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(ResolveTurnipVK("Adreno (TM) 650", kFixedTurnipDriverInfo)));
+	EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(ResolveTurnipVK("Adreno (TM) 630", kStockTurnipDriverInfo)));
+}
+
+// The two facts are measured on different drivers on different parts, so no part may hold both.
+// A tagged build on an a740 gets the preference like any other Turnip and the ordering claim from
+// nobody -- the tag buys ordering, and ordering is what a7xx does not have.
+TEST(GSGpuDriverProfile, ATaggedTurnipOnAdreno7xxGetsThePreferenceAndNotTheOrderingClaim)
+{
+	const GpuProfileSelection sel = ResolveTurnipVK("Adreno (TM) 740", kFixedTurnipDriverInfo);
+	EXPECT_EQ(sel.driver.declared_loop_fix_generation, 1u);
+	EXPECT_TRUE(PrefersDeclaredLoopWithBarriers(sel));
+	EXPECT_FALSE(OrdersDeclaredLoop(sel));
+}
+
+// Generation 2 carries the a7xx half of the fix: the driver orders a declared loop on A7XX too.
+// On the 730 and up that buys the ordering claim, alongside the preference, and the road policy
+// lets the ordering fact win (same road, barriers dropped).
+namespace
+{
+	constexpr const char* kGen2TurnipDriverInfo = "Mesa 26.3.0-devel (git-axfl2-001)";
+}
+
+TEST(GSGpuDriverProfile, AGeneration2TurnipOnAdreno7xxOrdersTheDeclaredLoop)
+{
+	for (const char* device_name : {"Adreno (TM) 740", "Adreno (TM) 750", "Adreno (TM) 730"})
+	{
+		const GpuProfileSelection sel = ResolveTurnipVK(device_name, kGen2TurnipDriverInfo);
+		EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno7xx) << device_name;
+		EXPECT_EQ(sel.driver.declared_loop_fix_generation, 2u) << device_name;
+		EXPECT_TRUE(OrdersDeclaredLoop(sel)) << device_name;
+		EXPECT_TRUE(PrefersDeclaredLoopWithBarriers(sel)) << device_name;
+		// Within a draw, the a7xx half orders overlapping primitives only for a pipeline that asks.
+		EXPECT_TRUE(sel.driver.declared_loop_orders_overlap_on_request) << device_name;
+	}
+}
+
+// Generation 2 keeps generation 1's a6xx claim: the a6xx half of the driver is unchanged.
+TEST(GSGpuDriverProfile, AGeneration2TurnipOnAdreno650StillOrdersTheDeclaredLoop)
+{
+	EXPECT_TRUE(OrdersDeclaredLoop(ResolveTurnipVK("Adreno (TM) 650", kGen2TurnipDriverInfo)));
+	// The a6xx half orders every declared-loop draw by itself; nothing is left to request.
+	EXPECT_FALSE(ResolveTurnipVK("Adreno (TM) 650", kGen2TurnipDriverInfo).driver.declared_loop_orders_overlap_on_request);
+	EXPECT_FALSE(ResolveTurnipVK("Adreno (TM) 740", kFixedTurnipDriverInfo).driver.declared_loop_orders_overlap_on_request);
+	EXPECT_FALSE(OrdersDeclaredLoop(ResolveTurnipVK("Adreno (TM) 610", kGen2TurnipDriverInfo)));
+}
+
+// The a7xx parts below 730 were never run; a generation-2 tag does not reach them.
+TEST(GSGpuDriverProfile, AGeneration2TurnipBelowAdreno730MakesNoOrderingClaim)
+{
+	for (const char* device_name : {"Adreno (TM) 702", "Adreno (TM) 710", "Adreno (TM) 720", "Adreno (TM) 725"})
+	{
+		const GpuProfileSelection sel = ResolveTurnipVK(device_name, kGen2TurnipDriverInfo);
+		EXPECT_EQ(sel.driver.declared_loop_fix_generation, 2u) << device_name;
+		EXPECT_FALSE(OrdersDeclaredLoop(sel)) << device_name;
+	}
+}
+
+// The tag cannot be carried by the blob; if a string says so anyway, it is not our build.
+TEST(GSGpuDriverProfile, TheQualcommBlobCarryingAGeneration2TagMakesNoOrderingClaim)
+{
+	const GpuProfileSelection sel = ResolveAdrenoVKWithInfo("Adreno (TM) 740",
+		kQualcommProprietaryDriverId, "Qualcomm", PackVulkanVersion(512, 780, 0), kGen2TurnipDriverInfo);
+	EXPECT_EQ(sel.driver.declared_loop_fix_generation, 2u);
+	EXPECT_FALSE(OrdersDeclaredLoop(sel));
+}
+
+// The Qualcomm blob on the same a740. Its only in-pass road is the input attachment with barriers,
+// which was measured right on The Godfather and wrong on Splashdown; nothing here was measured on
+// it and the declared road is not its road.
+TEST(GSGpuDriverProfile, TheQualcommBlobOnAdreno7xxGetsNoPreference)
+{
+	const GpuProfileSelection sel = ResolveAdrenoVKWithInfo("Adreno (TM) 740",
+		kQualcommProprietaryDriverId, "Qualcomm", PackVulkanVersion(512, 780, 0), kStockTurnipDriverInfo);
+
+	EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno7xx);
+	EXPECT_EQ(sel.driver.driver, MobileGpuDriver::QualcommProprietary);
+	EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(sel));
+}
+
+// The OpenGL path cannot declare anything -- the declaration is a Vulkan pipeline create flag and
+// an image layout -- so freedreno on an a740 is refused for the same reason the tag is.
+TEST(GSGpuDriverProfile, TheA7xxPreferenceDoesNotReachTheOpenGLPath)
+{
+	MobileDriverContext context;
+	context.api = MobileGpuApi::OpenGL;
+	context.driver_name = "Turnip Adreno (TM) 740";
+	context.api_version_string = "OpenGL ES 3.2 Mesa 26.1.2";
+
+	const GpuProfileSelection sel =
+		GpuProfileDetector::Resolve("auto", "freedreno", "Adreno (TM) 740", context);
+	EXPECT_EQ(sel.gpu.architecture, MobileGpuArchitecture::Adreno7xx);
+	EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(sel));
+}
+
+// Mali is not an Adreno however its strings read.
+TEST(GSGpuDriverProfile, MaliGetsNoA7xxPreference)
+{
+	EXPECT_FALSE(PrefersDeclaredLoopWithBarriers(ResolveMaliVK("Mali-G615 MC6", PackVulkanVersion(44, 1, 0))));
+}
+
+// The a740 still carries the RT-copy workaround in the table. The database is not where that gets
+// resolved -- the road policy is, and it is where the fact outranks the workaround. Keeping the
+// bit is what lets a device that loses the layout extension fall back to the copy road.
+TEST(GSGpuDriverProfile, TheA7xxPreferenceDoesNotClearTheRtCopyWorkaround)
+{
+	EXPECT_TRUE(ResolveTurnipVK("Adreno (TM) 740", kStockTurnipDriverInfo)
+			.driver.UsesWorkaround(DriverWorkaround::UseRenderTargetCopyForFeedback));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Which rows matched, by id. The log used to carry only a count and two bit masks, so nobody could
+// tell from an emulog which rule had fired. The ids below are the table's own strings.
+
+// A Mali-G57 on Arm's r44p1 blob, no SoC hint. Every Arm Vulkan row that keys on the driver, the
+// r44p1 window, the pre-r52 dynamic-rendering bound or the G57 model matches; the rows that key on
+// another revision, a MediaTek SoC or an Android SDK do not. The r44p1 revision sits on the edge of
+// three version bounds ("before r44p1", "after r44p1", the r44p1 window), so this also pins which
+// side of each the packed 44.1.0 falls on.
+TEST(GSGpuDriverProfile, MatchedRulesNameEveryRowThatFiredOnAMaliG57R44p1)
+{
+	const GpuProfileSelection sel =
+		ResolveMaliVK("Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliR44p1DriverInfo);
+
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(sel.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, vk-arm-r44p1-attachment-self-read, "
+		"vk-arm-g57-roaa-destination-read");
+	EXPECT_EQ(sel.driver.matched_rule_count, 4u);
+	EXPECT_EQ(static_cast<u32>(std::bitset<64>(sel.driver.matched_rules).count()), sel.driver.matched_rule_count);
+}
+
+// The MT6897 exemptions: both the r44p1 self-read row and the MediaTek ROAA row reject this SoC in
+// their own conditions, so neither is in the record.
+TEST(GSGpuDriverProfile, MatchedRulesLeaveOutTheR44p1RowOnAnMt6897)
+{
+	const GpuProfileSelection sel = ResolveMaliVK(
+		"Mali-G57", PackVulkanVersion(44, 1, 0), kMt6897AndroidHints, kMaliR44p1DriverInfo);
+
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(sel.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, vk-arm-g57-roaa-destination-read");
+	EXPECT_EQ(sel.driver.matched_rule_count, 3u);
+}
+
+// A MediaTek part that is not the measured one: the same device as the first test, plus the
+// vendor-wide ROAA row the MT6897 exemption exists to dodge.
+TEST(GSGpuDriverProfile, MatchedRulesIncludeTheMediaTekRoaaRowOnAnUnmeasuredSoc)
+{
+	const GpuProfileSelection sel = ResolveMaliVK(
+		"Mali-G57", PackVulkanVersion(44, 1, 0), kOtherMediaTekHints, kMaliR44p1DriverInfo);
+
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(sel.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, vk-arm-r44p1-attachment-self-read, "
+		"vk-mediatek-mali-roaa-destination-read, vk-arm-g57-roaa-destination-read");
+}
+
+// Nothing matched is a sentence, not an empty line, so a log reader can tell "no rows" from "the
+// log line was cut off". The default profile has matched nothing; so does a driver nothing names.
+TEST(GSGpuDriverProfile, MatchedRulesSaysNoneWhenNothingMatched)
+{
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(MobileDriverProfile{}), "none");
+
+	MobileDriverContext context;
+	context.api = MobileGpuApi::Vulkan;
+	context.vendor_id = 0x10005u;
+	context.driver_id = 26;
+	context.driver_version = PackVulkanVersion(25, 3, 0);
+	const GpuProfileSelection sel =
+		GpuProfileDetector::Resolve("auto", std::string_view(), "Apple M2 Max (G14C B1)", context);
+	EXPECT_EQ(sel.driver.matched_rule_count, 0u);
+	EXPECT_EQ(sel.driver.matched_rules, 0u);
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(sel.driver), "none");
+}
+
+// A bit set outside the table has no id to print. It is skipped rather than read past the end of
+// the table.
+TEST(GSGpuDriverProfile, MatchedRulesIgnoresABitPastTheEndOfTheTable)
+{
+	MobileDriverProfile profile;
+	profile.matched_rules = u64{1} << 63;
+	ASSERT_GT(64u, GpuProfileDetector::DriverRuleCount());
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(profile), "none");
+}
+
+// The id is the key a log reader greps for, so two rows sharing one would make the line ambiguous.
+TEST(GSGpuDriverProfile, EveryRuleHasADistinctNonEmptyId)
+{
+	const u32 count = GpuProfileDetector::DriverRuleCount();
+	ASSERT_GT(count, 0u);
+	ASSERT_LE(count, 64u);
+	for (u32 i = 0; i < count; i++)
+	{
+		const char* id = GpuProfileDetector::DriverRuleId(i);
+		ASSERT_NE(id, nullptr);
+		EXPECT_NE(std::string_view(id), std::string_view()) << "row " << i;
+		for (u32 j = i + 1; j < count; j++)
+			EXPECT_STRNE(id, GpuProfileDetector::DriverRuleId(j)) << "rows " << i << " and " << j;
+	}
+	EXPECT_EQ(GpuProfileDetector::DriverRuleId(count), nullptr);
+}
+
+TEST(GSGpuDriverProfile, BugAndWorkaroundNamesComeFromTheSameTablesAsTheDriverReport)
+{
+	EXPECT_EQ(GpuProfileDetector::DescribeBugs(0), "none");
+	EXPECT_EQ(GpuProfileDetector::DescribeWorkarounds(0), "none");
+
+	// In enum order, whatever order the bits were set in.
+	const u64 two_bugs = GpuProfileDetector::BugMask(DriverBug::BrokenRoaaDestinationRead) |
+	                     GpuProfileDetector::BugMask(DriverBug::BrokenBufferStreaming);
+	EXPECT_EQ(GpuProfileDetector::DescribeBugs(two_bugs),
+		std::string(GpuProfileDetector::BugToString(DriverBug::BrokenBufferStreaming)) + ", " +
+			GpuProfileDetector::BugToString(DriverBug::BrokenRoaaDestinationRead));
+	const u64 two_workarounds = (u64{1} << static_cast<u8>(DriverWorkaround::PreferCachedStreamRingMemory)) |
+	                            (u64{1} << static_cast<u8>(DriverWorkaround::UseDescriptorSets));
+	EXPECT_EQ(GpuProfileDetector::DescribeWorkarounds(two_workarounds),
+		std::string(GpuProfileDetector::WorkaroundToString(DriverWorkaround::UseDescriptorSets)) + ", " +
+			GpuProfileDetector::WorkaroundToString(DriverWorkaround::PreferCachedStreamRingMemory));
+
+	// A bit past the last enumerator names nothing.
+	EXPECT_EQ(GpuProfileDetector::DescribeBugs(u64{1} << 63), "none");
+
+	// What the resolver recorded for the G57 device, named: the same set the masks carry.
+	const GpuProfileSelection sel =
+		ResolveMaliVK("Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliR44p1DriverInfo);
+	const std::string bugs = GpuProfileDetector::DescribeBugs(sel.driver.bugs);
+	EXPECT_NE(bugs.find("BrokenSubpassFeedback"), std::string::npos);
+	EXPECT_NE(bugs.find("BrokenRoaaDestinationRead"), std::string::npos);
+	const std::string workarounds = GpuProfileDetector::DescribeWorkarounds(sel.driver.workarounds);
+	EXPECT_NE(workarounds.find("UseRenderTargetCopyForFeedback"), std::string::npos);
+}
+
+// The identity predicate lives in the profile layer, because the rule resolvers key on it and the
+// driver report that also uses it sits above them. The report's own wrapper has its own test.
+TEST(GSGpuDriverProfile, IsMaliSX2DriverMatchesEitherSpellingInDriverInfo)
+{
+	EXPECT_TRUE(GpuProfileDetector::IsMaliSX2Driver("v1.r44p1-malisx2.0.2.s0123abcd"));
+	EXPECT_TRUE(GpuProfileDetector::IsMaliSX2Driver("v1.r44p1-libmali.0.1.s0123abcd"));
+
+	// Arm's own r44p1 shares the revision text but not the name.
+	EXPECT_FALSE(GpuProfileDetector::IsMaliSX2Driver(kMaliR44p1DriverInfo));
+	EXPECT_FALSE(GpuProfileDetector::IsMaliSX2Driver("Mesa 26.1.2 (git-axfl2-001)"));
+	EXPECT_FALSE(GpuProfileDetector::IsMaliSX2Driver(""));
+}
+
+// ---------------------------------------------------------------------------------------------
+// malisx2 against the rows written for Arm's r44p1 blob.
+
+// vk-arm-r44p1-attachment-self-read puts the device on the render-target copy road because the
+// blob loses the device under an in-tile self-read. That is a defect of Arm's blob, not of our
+// driver, so malisx2 is exempt without condition. The stock blob on the same device and revision is
+// the control: it keeps the row.
+TEST(GSGpuDriverProfile, MaliSX2DoesNotTakeTheR44p1SelfReadRowsCopyRoad)
+{
+	const GpuProfileSelection stock =
+		ResolveMaliVK("Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliR44p1DriverInfo);
+	EXPECT_TRUE(TakesTheRenderTargetCopyPath(stock));
+	EXPECT_TRUE(stock.driver.HasBug(DriverBug::BrokenSubpassFeedback));
+
+	for (const char* info : {kMaliSX2DriverInfo, kMaliSX2OldPackDriverInfo})
+	{
+		const GpuProfileSelection sel =
+			ResolveMaliVK("Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), info);
+		EXPECT_FALSE(TakesTheRenderTargetCopyPath(sel)) << info;
+		EXPECT_FALSE(sel.driver.HasBug(DriverBug::BrokenSubpassFeedback)) << info;
+	}
+}
+
+// The exempted row is still a matched row: the log and the report show that it fired and was
+// skipped, which is not the same as the row never matching. Only the applied rows are counted.
+TEST(GSGpuDriverProfile, MaliSX2ExemptedRowIsMatchedAndExemptButNotCounted)
+{
+	const GpuProfileSelection stock =
+		ResolveMaliVK("Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliR44p1DriverInfo);
+	EXPECT_EQ(stock.driver.exempted_rules, 0u);
+	EXPECT_EQ(stock.driver.matched_rule_count, 4u);
+
+	const GpuProfileSelection sel =
+		ResolveMaliVK("Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliSX2DriverInfo);
+	const u64 self_read = u64{1} << RowOf("vk-arm-r44p1-attachment-self-read");
+	EXPECT_NE(sel.driver.matched_rules & self_read, 0u);
+	EXPECT_EQ(sel.driver.exempted_rules, self_read);
+	EXPECT_EQ(sel.driver.matched_rule_count, 3u);
+	EXPECT_EQ(static_cast<u32>(std::bitset<64>(sel.driver.matched_rules & ~sel.driver.exempted_rules).count()),
+		sel.driver.matched_rule_count);
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(sel.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, "
+		"vk-arm-r44p1-attachment-self-read (exempt: malisx2), vk-arm-g57-roaa-destination-read");
+
+	// The rows this commit does not exempt still apply to malisx2.
+	EXPECT_TRUE(DeniesRoaaDestinationRead(sel));
+}
+
+// On the MT6897 the row's own SoC exclusion already keeps it from matching, so there is nothing for
+// the exemption to record.
+TEST(GSGpuDriverProfile, MaliSX2OnAnMt6897HasNoExemptedRowToRecord)
+{
+	const GpuProfileSelection sel = ResolveMaliVK(
+		"Mali-G57", PackVulkanVersion(44, 1, 0), kMt6897AndroidHints, kMaliSX2DriverInfo);
+	EXPECT_EQ(sel.driver.exempted_rules, 0u);
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(sel.driver).find("exempt"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The destination-read rows and malisx2. Both deny the in-tile read on parts where Arm's blob
+// returns stale colour through it. malisx2 is exempt from them only when it advertises the access
+// itself; a pack without it behaves exactly as before.
+
+TEST(GSGpuDriverProfile, MaliSX2G57KeepsTheDestinationReadRowUnlessItAdvertisesRoaa)
+{
+	const GpuProfileSelection without_roaa = ResolveMaliVK(
+		"Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliSX2DriverInfo, false);
+	EXPECT_TRUE(DeniesRoaaDestinationRead(without_roaa));
+	EXPECT_EQ(without_roaa.driver.exempted_rules, u64{1} << RowOf("vk-arm-r44p1-attachment-self-read"));
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(without_roaa.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, "
+		"vk-arm-r44p1-attachment-self-read (exempt: malisx2), vk-arm-g57-roaa-destination-read");
+
+	const GpuProfileSelection with_roaa = ResolveMaliVK(
+		"Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliSX2DriverInfo, true);
+	EXPECT_FALSE(DeniesRoaaDestinationRead(with_roaa));
+	EXPECT_EQ(with_roaa.driver.exempted_rules,
+		(u64{1} << RowOf("vk-arm-r44p1-attachment-self-read")) |
+			(u64{1} << RowOf("vk-arm-g57-roaa-destination-read")));
+	EXPECT_EQ(with_roaa.driver.matched_rule_count, 2u);
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(with_roaa.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, "
+		"vk-arm-r44p1-attachment-self-read (exempt: malisx2), "
+		"vk-arm-g57-roaa-destination-read (exempt: malisx2)");
+}
+
+// The same device and revision on Arm's blob is not exempt whatever the flag says: the flag only
+// completes a condition that malisx2 has to meet first.
+TEST(GSGpuDriverProfile, TheStockBlobKeepsTheDestinationReadRowsWhateverRoaaSays)
+{
+	const GpuProfileSelection g57 = ResolveMaliVK(
+		"Mali-G57", PackVulkanVersion(44, 1, 0), std::string_view(), kMaliR44p1DriverInfo, true);
+	EXPECT_TRUE(DeniesRoaaDestinationRead(g57));
+	EXPECT_EQ(g57.driver.exempted_rules, 0u);
+
+	const GpuProfileSelection mediatek = ResolveMaliVK(
+		"Mali-G615 MC6", PackVulkanVersion(44, 1, 0), kOtherMediaTekHints, kMaliR44p1DriverInfo, true);
+	EXPECT_TRUE(DeniesRoaaDestinationRead(mediatek));
+	EXPECT_EQ(mediatek.driver.exempted_rules, 0u);
+}
+
+TEST(GSGpuDriverProfile, MaliSX2OnAnUnmeasuredMediaTekIsExemptFromTheMediaTekRowWithRoaa)
+{
+	const GpuProfileSelection without_roaa = ResolveMaliVK(
+		"Mali-G615 MC6", PackVulkanVersion(44, 1, 0), kOtherMediaTekHints, kMaliSX2DriverInfo, false);
+	EXPECT_TRUE(DeniesRoaaDestinationRead(without_roaa));
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(without_roaa.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, "
+		"vk-arm-r44p1-attachment-self-read (exempt: malisx2), vk-mediatek-mali-roaa-destination-read");
+
+	const GpuProfileSelection with_roaa = ResolveMaliVK(
+		"Mali-G615 MC6", PackVulkanVersion(44, 1, 0), kOtherMediaTekHints, kMaliSX2DriverInfo, true);
+	EXPECT_FALSE(DeniesRoaaDestinationRead(with_roaa));
+	EXPECT_EQ(GpuProfileDetector::DescribeMatchedRules(with_roaa.driver),
+		"vk-arm-proprietary, vk-arm-dynamic-rendering-before-r52, "
+		"vk-arm-r44p1-attachment-self-read (exempt: malisx2), "
+		"vk-mediatek-mali-roaa-destination-read (exempt: malisx2)");
+	EXPECT_EQ(with_roaa.driver.matched_rule_count, 2u);
+
+	// A G57 on the same SoC meets both rows, and both are exempt.
+	const GpuProfileSelection g57 = ResolveMaliVK(
+		"Mali-G57", PackVulkanVersion(44, 1, 0), kOtherMediaTekHints, kMaliSX2DriverInfo, true);
+	EXPECT_FALSE(DeniesRoaaDestinationRead(g57));
+	EXPECT_EQ(g57.driver.matched_rule_count, 2u);
 }

@@ -16,14 +16,15 @@ val armsx2HostPageSize = providers.gradleProperty("armsx2.hostPageSize").orElse(
 // gradle invocation keeps producing exactly what it always did; the v8.2 target sets all three.
 //
 // armsx2.march is appended to CMAKE_C/CXX_FLAGS rather than set in CMake, because
-// BuildParameters.cmake only applies its own -march=armv8.1-a default when CMAKE_CXX_FLAGS does
+// BuildParameters.cmake only applies its own -march=armv8-a default when CMAKE_CXX_FLAGS does
 // not already carry one — that escape hatch (added after a casal SIGILL on a real Cortex-A53) is
 // exactly the seam this needs, and add_compile_options would land after these flags and win.
 val armsx2MinSdk = providers.gradleProperty("armsx2.minSdk").orElse("26")
 // Pinned, not left to AGP's default: the two targets must differ ONLY where we say they do, and
-// an NDK that drifts under one of them makes an A/B meaningless. 28.2 is what shipped 2.6.6.6.
-val armsx2NdkVersion = providers.gradleProperty("armsx2.ndkVersion").orElse("28.2.13676358")
-// Empty = let BuildParameters.cmake choose (armv8.1-a). The v8.2 targets pass an explicit
+// an NDK that drifts under one of them makes an A/B meaningless. 29 is what the release targets
+// and pgo/armsx2.profdata use.
+val armsx2NdkVersion = providers.gradleProperty("armsx2.ndkVersion").orElse("29.0.14206865")
+// Empty = let BuildParameters.cmake choose (armv8-a). The v8.2 targets pass an explicit
 // -march; FEAT_FP16 and FEAT_DotProd are OPTIONAL at v8.2, so they must be named, not implied.
 val armsx2March = providers.gradleProperty("armsx2.march").orElse("")
 // Extra CPU flags that must ride alongside -march, verbatim.
@@ -40,6 +41,14 @@ val armsx2MarchExtra = providers.gradleProperty("armsx2.marchExtra").orElse("")
 // interpreter bisect into the EE recompiler. Never set for a shipped build.
 val armsx2RecTestHooks = providers.gradleProperty("armsx2.recTestHooks").orElse("false")
 val armsx2ApplicationId = providers.gradleProperty("armsx2.applicationId").orElse("com.armsx2")
+// Distribution channel, baked into BuildConfig so the app knows which release stream it belongs to
+// without guessing from the version string. "nightly" builds ship a distinct applicationId and
+// label (see ci-nightly-dualcore.sh) so they install alongside the stable app instead of replacing
+// it; the updater reads CHANNEL to decide whether to follow nightly or stable releases.
+val armsx2Channel = providers.gradleProperty("armsx2.channel").orElse("stable")
+// Home-screen label. The nightly overrides this with @string/app_name_nightly so the two installs
+// are distinguishable; everything else keeps the localized default.
+val armsx2AppLabel = providers.gradleProperty("armsx2.appLabel").orElse("@string/app_name")
 val armsx2SigningPropertiesFile = rootProject.file("armsx2_keystore.properties")
 val armsx2SigningProperties = Properties().apply {
     if (armsx2SigningPropertiesFile.isFile) {
@@ -60,17 +69,31 @@ if (armsx2SigningPropertiesFile.isFile && !armsx2PlaySigningReady) {
 // src/main/assets, generate the APK's assets/resources from it at build time:
 // sync bin/resources (minus the Windows-only dx11 shaders the mobile backends
 // never compile) plus the canonical mobile GameDB overlay into a generated
-// assets root. Genuine Android-only extras (patches.zip, the Noto color emoji
-// font) stay committed under src/main/assets/resources and AGP merges the roots.
+// assets root. Genuine Android-only extras (patches.zip) stay committed under
+// src/main/assets/resources and AGP merges the roots.
 val generateSharedResources by tasks.registering(Sync::class) {
     val repoRoot = rootProject.layout.projectDirectory.dir("../..")
     from(repoRoot.dir("bin/resources")) {
         // Windows-only DX11 shaders the mobile backends never compile. The path is
         // shaders/dx11/ (relative to bin/resources), so "dx11/**" alone never matched.
         exclude("**/dx11/**")
+        // The desktop builds' emoji font. Nothing on Android loads it: the in-game overlay seeds
+        // Roboto only (ImGuiManager::LoadFontData), and the app draws emoji with the system's font.
+        exclude("fonts/Twemoji*")
     }
     from(repoRoot.file("bin/resources-overlay/armsx2_overrides.yaml"))
     into(layout.buildDirectory.dir("generated/sharedResources/resources"))
+}
+
+// The About screen's license texts. GPL.html and ThirdPartyLicenses.html are the files the desktop
+// About dialog opens; like the runtime resources above they are copied from bin/docs at build time,
+// so there is no second copy to drift. They land in assets/licenses beside android.html, the
+// Android app's own list, which is committed under src/main/assets/licenses.
+val generateLicenseDocs by tasks.registering(Sync::class) {
+    from(rootProject.layout.projectDirectory.dir("../../bin/docs")) {
+        include("GPL.html", "ThirdPartyLicenses.html")
+    }
+    into(layout.buildDirectory.dir("generated/licenseDocs/licenses"))
 }
 
 // AGP 9.2.1 rejects a Provider in assets.srcDir (the sourceSets block below uses a concrete path),
@@ -81,7 +104,7 @@ val generateSharedResources by tasks.registering(Sync::class) {
 tasks.matching { t ->
     t.name == "preBuild" || t.name.endsWith("Assets") || t.name.contains("Lint")
 }.configureEach {
-    dependsOn(generateSharedResources)
+    dependsOn(generateSharedResources, generateLicenseDocs)
 }
 
 // Private, optional Discord SDK location. Set by release CI; absent in every public clone.
@@ -98,10 +121,14 @@ android {
 
     defaultConfig {
         applicationId = armsx2ApplicationId.get()
+        manifestPlaceholders["appLabel"] = armsx2AppLabel.get()
         minSdk = armsx2MinSdk.get().toInt()
         targetSdk = 37
         versionCode = providers.gradleProperty("armsx2.versionCode").orNull?.toInt() ?: 1088
         versionName = providers.gradleProperty("armsx2.versionName").orNull ?: "2.6.1"
+        // Which release stream this APK came from: "stable" or "nightly". Read by the in-app
+        // updater instead of inferring it from versionCode magnitude.
+        buildConfigField("String", "CHANNEL", "\"${armsx2Channel.get()}\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
@@ -265,6 +292,7 @@ android {
         // `generateSharedResources.map { }` form throws "cannot add Provider instances"). The
         // task dependency that materialises this tree is wired via tasks.matching above.
         assets.srcDir(layout.buildDirectory.dir("generated/sharedResources").get().asFile)
+        assets.srcDir(layout.buildDirectory.dir("generated/licenseDocs").get().asFile)
     }
 
     compileOptions {
@@ -278,7 +306,7 @@ android {
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+            version = "3.31.6"
         }
     }
     buildFeatures {
@@ -420,11 +448,17 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
 
+    // Remote play (com.armsx2.remoteplay): video, audio and player 2's input between two devices.
+    implementation(libs.streamWebrtc)
+
     testImplementation(libs.junit)
     // Real org.json for JVM unit tests: the mockable android.jar stubs throw "not mocked", and
     // this artifact wins the classpath ordering, so catalog parsing tests exercise real behavior.
     testImplementation("org.json:json:20240303")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation(libs.androidx.compose.ui.tooling)
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

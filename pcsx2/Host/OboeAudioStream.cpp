@@ -10,6 +10,7 @@
 
 #include "oboe/Oboe.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -120,8 +121,15 @@ oboe::DataCallbackResult OboeAudioStream::onAudioReady(oboe::AudioStream* p_audi
 	}
 #endif
 
-	if (p_audioData != nullptr)
-		ReadFrames(reinterpret_cast<SampleType*>(p_audioData), p_numFrames);
+	// ReadFrames() allocas up to the request size, so keep each read bounded.
+	SampleType* out = static_cast<SampleType*>(p_audioData);
+	for (u32 left = (out != nullptr) ? static_cast<u32>(p_numFrames) : 0; left > 0;)
+	{
+		const u32 frames = std::min<u32>(left, 2048);
+		ReadFrames(out, frames);
+		out += frames * m_output_channels;
+		left -= frames;
+	}
 	return oboe::DataCallbackResult::Continue;
 }
 
@@ -136,7 +144,11 @@ bool OboeAudioStream::onError(oboe::AudioStream* oboeStream, oboe::Result error)
 		Console.Error("(Oboe) Stream disconnected, reopening...");
 		Stop();
 		Close();
-		if (!Open() || !Start())
+		// Reopen, but a paused stream stays paused: the resume starts it. Starting it here played a
+		// paused game's silence for as long as it stayed paused, and nothing paused it again since
+		// SetPaused(true) saw it already paused. In the background that kept Android's audio mixer
+		// holding a wakelock all night (#825).
+		if (!Open() || (!m_paused && !Start()))
 			Console.Error("(Oboe) Failed to reopen stream after disconnection.");
 		return true;
 	}
@@ -225,10 +237,12 @@ bool OboeAudioStream::Open()
 	builder.setSharingMode(oboe::SharingMode::Shared);
 	builder.setFormat(oboe::AudioFormat::Float);
 	builder.setSampleRate(m_sample_rate);
-	builder.setChannelCount(m_output_channels == 2 ? oboe::ChannelCount::Stereo : oboe::ChannelCount::Mono);
+	builder.setChannelCount(m_output_channels);
 	builder.setDeviceId(oboe::kUnspecified);
+	// No fixed callback size: Oboe's block adapter would drain 2048 frames (~43 ms) from a ring
+	// that targets 50 ms in one go, and Bluetooth routes pull in irregular bursts, so two such
+	// drains close together run the ring dry. Native bursts drain it as the device consumes.
 	builder.setBufferCapacityInFrames(2048 * 2);
-	builder.setFramesPerDataCallback(2048);
 	builder.setDataCallback(this);
 	builder.setErrorCallback(this);
 
@@ -239,6 +253,14 @@ bool OboeAudioStream::Open()
 		Console.Error("(Oboe) openStream() failed: %d", result);
 		return false;
 	}
+	// ReadFrames() writes m_output_channels samples per frame into the callback buffer.
+	if (m_stream->getChannelCount() != m_output_channels)
+	{
+		Console.Error("(Oboe) Stream opened with %d channels, need %d", m_stream->getChannelCount(), static_cast<int>(m_output_channels));
+		m_stream->close();
+		m_stream.reset();
+		return false;
+	}
 	return true;
 }
 
@@ -247,6 +269,9 @@ bool OboeAudioStream::Start()
 	const std::lock_guard<std::recursive_mutex> guard(m_lock);
 	if (m_playing)
 		return true;
+	// No stream after a reopen whose Open() failed. The resume path below rebuilds it.
+	if (!m_stream)
+		return false;
 
 	Console.WriteLn("(Oboe) Starting stream...");
 	m_stop_requested.store(false, std::memory_order_release);
@@ -304,7 +329,14 @@ void OboeAudioStream::SetPaused(bool paused)
 		{
 			oboe::Result result = m_stream->requestPause();
 			if (result != oboe::Result::OK)
-				Console.Error("(Oboe) requestPause() failed: %d", result);
+			{
+				// Stop it instead: left running it plays silence and keeps the device awake. Start()
+				// restarts a stopped stream the same as a paused one.
+				Console.Error("(Oboe) requestPause() failed: %d, stopping instead", result);
+				result = m_stream->requestStop();
+				if (result != oboe::Result::OK)
+					Console.Error("(Oboe) requestStop() failed: %d", result);
+			}
 		}
 		// Mark not-playing even if requestPause() failed, so the paused/
 		// playing bookkeeping can't desync and strand a later resume.

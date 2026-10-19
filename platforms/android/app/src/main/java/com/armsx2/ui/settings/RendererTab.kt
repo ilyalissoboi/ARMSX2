@@ -46,9 +46,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kr.co.iefriends.pcsx2.NativeApp
-import java.io.BufferedInputStream
 import java.io.File
-import java.util.zip.ZipInputStream
 import androidx.compose.runtime.saveable.rememberSaveable
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -114,25 +112,24 @@ fun RendererTab(state: MutableState<Settings>) {
             // one, so the control lives with the driver rather than buried lower in the tab.
             ClearShaderCacheRow()
             SettingsDivider()
-            // GS Multi-threading (GV7 front/back split), placed right under the
-            // renderer/driver picker. Off = today's single-threaded path (the
-            // default — opt-in); On = the GS runs on a dedicated back thread
-            // (Pipelined, enum value 3). The enum's Inline/Lockstep rungs (1/2)
-            // are dev-only and deliberately not exposed. Restart-required (in
-            // RestartOptionsAreEqual); native-lib snapshots the field across a
-            // live apply, so it only takes effect on the next game boot.
+            // GS Multi-threading (the GS front/back thread split), placed right under the
+            // renderer/driver picker. Off (0, the default) = single-threaded GS; on (any
+            // other value; written as 1, older builds wrote 3) = GS rendering on a second
+            // thread. Restart-required (in RestartOptionsAreEqual); native-lib snapshots the
+            // field across a live apply, so it only takes effect on the next game boot.
             ToggleRow(
                 str("renderer.gsBackThread.label"),
-                s.gsBackThreadMode >= 3,
+                s.display.gsBackThreadMode != 0,
                 description = str("renderer.gsBackThread.description"),
+                field = "gsBackThreadMode",
             ) {
-                apply(s.copy(gsBackThreadMode = if (it) 3 else 0))
+                apply(s.copy(display = s.display.copy(gsBackThreadMode = if (it) 1 else 0)))
             }
             SettingsDivider()
             // A value that matches no preset is a CUSTOM one (set below, per-game, or from an INI).
             // It used to fall back to index 0, which displayed 0.25x while the GS ran something
             // else entirely — so the row lied about the active resolution.
-            val presetIndex = UPSCALE_OPTIONS.indexOfFirst { abs(it.value - s.upscaleFloat) < 0.01f }
+            val presetIndex = UPSCALE_OPTIONS.indexOfFirst { abs(it.value - s.output.upscaleFloat) < 0.01f }
             val customIndex = UPSCALE_OPTIONS.size
             // Whether the Custom row is OPEN has to be its own state, not "the value matches no
             // preset". Picking Custom leaves the value untouched by design, so deriving it from the
@@ -158,9 +155,10 @@ fun RendererTab(state: MutableState<Settings>) {
                         val mult = UPSCALE_OPTIONS[index].value
                         // Persist scope-aware (per-game when the overlay scope is Game);
                         // the live GS apply happens in InGameOverlay's settings delta.
-                        if (abs(s.upscaleFloat - mult) >= 0.01f) apply(s.copy(upscaleFloat = mult))
+                        if (abs(s.output.upscaleFloat - mult) >= 0.01f) apply(s.copy(output = s.output.copy(upscaleFloat = mult)))
                     }
                 },
+                field = "upscaleFloat",
             )
             // Custom resolution scale, as a PERCENTAGE of native — the Dolphin-style numeric
             // control people ask for when a preset step is too coarse. The GS multiplier is a
@@ -169,14 +167,82 @@ fun RendererTab(state: MutableState<Settings>) {
             if (upscaleIndex == customIndex) {
                 IntSliderRow(
                     label = str("renderer.upscale.customScale"),
-                    value = (s.upscaleFloat * 100f).roundToInt().coerceIn(25, 800),
+                    value = (s.output.upscaleFloat * 100f).roundToInt().coerceIn(25, 800),
                     min = 25,
                     max = 800,
                     description = str("renderer.upscale.customScale.description"),
                     valueFormatter = { "$it%" },
-                    onReset = { apply(s.copy(upscaleFloat = 1.0f)) },
-                    onChange = { pct -> apply(s.copy(upscaleFloat = pct / 100f)) },
+                    onReset = { apply(s.copy(output = s.output.copy(upscaleFloat = 1.0f))) },
+                    onChange = { pct -> apply(s.copy(output = s.output.copy(upscaleFloat = pct / 100f))) },
+                    field = "upscaleFloat",
                 )
+            }
+            // Texture packs, right under the resolution they are usually paired with. They were a
+            // collapsed section near the bottom of this tab, which for one of the most-used
+            // features on the device was far too deep.
+            SettingsDivider()
+            TextureManagerRow()
+            SettingsDivider()
+            ToggleRow(
+                str("renderer.loadTexturePacks.label"),
+                s.graphics.loadTextureReplacements,
+                description = str("renderer.loadTexturePacks.description"),
+                field = "loadTextureReplacements",
+            ) {
+                apply(s.copy(graphics = s.graphics.copy(loadTextureReplacements = it)))
+            }
+            SettingsDivider()
+            ToggleRow(
+                str("renderer.asyncTextureLoading.label"),
+                s.graphics.loadTextureReplacementsAsync,
+                description = str("renderer.asyncTextureLoading.description"),
+                field = "loadTextureReplacementsAsync",
+            ) {
+                apply(s.copy(graphics = s.graphics.copy(loadTextureReplacementsAsync = it)))
+            }
+            SettingsDivider()
+            ToggleRow(
+                str("renderer.precacheTexturePacks.label"),
+                s.graphics.precacheTextureReplacements,
+                description = str("renderer.precacheTexturePacks.description"),
+                field = "precacheTextureReplacements",
+            ) {
+                apply(s.copy(graphics = s.graphics.copy(precacheTextureReplacements = it)))
+            }
+            SettingsDivider()
+            // The option index is the core's GSTextureUpscaleMode value (0 Off, 1 2x, 2 4x), so it
+            // is stored as-is, unlike the display upscaler above.
+            SegmentedRow(
+                label = str("renderer.textureUpscale.label"),
+                options = listOf(
+                    str("common.off"),
+                    str("renderer.textureUpscale.raisr2x"),
+                    str("renderer.textureUpscale.raisr4x"),
+                ),
+                selectedIndex = s.graphics.textureUpscale.coerceIn(0, 2),
+                description = str("renderer.textureUpscale.description"),
+                onChange = { apply(s.copy(graphics = s.graphics.copy(textureUpscale = it))) },
+                field = "textureUpscale",
+            )
+            SettingsDivider()
+            TexturePackImportRow()
+            SettingsDivider()
+            ToggleRow(
+                str("renderer.dumpReplaceableTextures.label"),
+                s.graphics.dumpReplaceableTextures,
+                description = str("renderer.dumpReplaceableTextures.description"),
+                field = "dumpReplaceableTextures",
+            ) {
+                apply(s.copy(graphics = s.graphics.copy(dumpReplaceableTextures = it)))
+            }
+            SettingsDivider()
+            ToggleRow(
+                str("renderer.texturePackOsd.label"),
+                s.graphics.osdShowTextureReplacements,
+                description = str("renderer.texturePackOsd.description"),
+                field = "osdShowTextureReplacements",
+            ) {
+                apply(s.copy(graphics = s.graphics.copy(osdShowTextureReplacements = it)))
             }
             SettingsDivider()
             SegmentedRow(
@@ -185,18 +251,19 @@ fun RendererTab(state: MutableState<Settings>) {
                 // EmulationMenuViewModel.setAspectRatio. A clamp left at the old maximum does not
                 // fail loudly -- it silently snaps the new choice back to the previous entry.
                 options = listOf("Stretch", "Auto", "4:3", "16:9", "10:7", "21:9", "20:9", "19.5:9", "Custom"),
-                selectedIndex = s.aspectRatio.coerceIn(0, 8),
+                selectedIndex = s.output.aspectRatio.coerceIn(0, 8),
                 description = str("renderer.displayMode.description"),
-                onChange = { apply(s.copy(aspectRatio = it)) },
+                onChange = { apply(s.copy(output = s.output.copy(aspectRatio = it))) },
+                field = "aspectRatio",
             )
             // Only meaningful for Custom (8), so it stays hidden otherwise rather than sitting there
             // inert. Shown when EITHER the main aspect or the FMV override is Custom, since the FMV
             // path reads the same ratio.
-            if (s.aspectRatio == 8 || s.fmvAspectRatio == 8) {
+            if (s.output.aspectRatio == 8 || s.output.fmvAspectRatio == 8) {
                 IntSliderRow(
                     label = str("renderer.customAspect.label"),
                     // Presented in hundredths: the slider is integral, the setting is a float.
-                    value = (s.customAspectRatio * 100f).toInt().coerceIn(50, 500),
+                    value = (s.output.customAspectRatio * 100f).toInt().coerceIn(50, 500),
                     min = 50,
                     max = 500,
                     description = str("renderer.customAspect.description"),
@@ -206,7 +273,8 @@ fun RendererTab(state: MutableState<Settings>) {
                         val r = hundredths / 100f
                         "%.2f  (%.1f:9)".format(r, r * 9f)
                     },
-                    onChange = { apply(s.copy(customAspectRatio = it / 100f)) },
+                    onChange = { apply(s.copy(output = s.output.copy(customAspectRatio = it / 100f))) },
+                    field = "customAspectRatio",
                 )
             }
             SettingsDivider()
@@ -215,9 +283,10 @@ fun RendererTab(state: MutableState<Settings>) {
             SegmentedRow(
                 label = str("renderer.fmvAspect.label"),
                 options = listOf("Off", "Auto", "4:3", "16:9", "10:7", "21:9", "20:9", "19.5:9", "Custom"),
-                selectedIndex = s.fmvAspectRatio.coerceIn(0, 8),
+                selectedIndex = s.output.fmvAspectRatio.coerceIn(0, 8),
                 description = str("renderer.fmvAspect.description"),
-                onChange = { apply(s.copy(fmvAspectRatio = it)) },
+                onChange = { apply(s.copy(output = s.output.copy(fmvAspectRatio = it))) },
+                field = "fmvAspectRatio",
             )
             SettingsDivider()
             // Emulation Screen Orientation — Android activity orientation, now scope-aware
@@ -231,12 +300,13 @@ fun RendererTab(state: MutableState<Settings>) {
                     str("renderer.orientation.portrait"),
                     str("renderer.orientation.autoRotate"),
                 ),
-                selectedIndex = s.orientation.coerceIn(0, 3),
+                selectedIndex = s.output.orientation.coerceIn(0, 3),
                 description = str("renderer.orientation.description"),
                 onChange = {
-                    apply(s.copy(orientation = it))
+                    apply(s.copy(output = s.output.copy(orientation = it)))
                     MainActivityRuntime.instance?.applyEmulationOrientation()
                 },
+                field = "orientation",
             )
             SettingsDivider()
             // GitHub #375: where the render sits in a PORTRAIT window. Top (default) frees the
@@ -245,9 +315,10 @@ fun RendererTab(state: MutableState<Settings>) {
             SegmentedRow(
                 label = str("renderer.portraitPosition.label"),
                 options = listOf(str("renderer.portraitPosition.top"), str("renderer.portraitPosition.center")),
-                selectedIndex = if (s.portraitRenderTop) 0 else 1,
+                selectedIndex = if (s.output.portraitRenderTop) 0 else 1,
                 description = str("renderer.portraitPosition.description"),
-                onChange = { apply(s.copy(portraitRenderTop = it == 0)) },
+                onChange = { apply(s.copy(output = s.output.copy(portraitRenderTop = it == 0))) },
+                field = "portraitRenderTop",
             )
             SettingsDivider()
             // Where the render sits in a LANDSCAPE window. Center is the default; Top suits
@@ -256,9 +327,10 @@ fun RendererTab(state: MutableState<Settings>) {
             SegmentedRow(
                 label = str("renderer.landscapePosition.label"),
                 options = listOf(str("renderer.landscapePosition.center"), str("renderer.landscapePosition.top")),
-                selectedIndex = if (s.landscapeRenderTop) 1 else 0,
+                selectedIndex = if (s.output.landscapeRenderTop) 1 else 0,
                 description = str("renderer.landscapePosition.description"),
-                onChange = { apply(s.copy(landscapeRenderTop = it == 1)) },
+                onChange = { apply(s.copy(output = s.output.copy(landscapeRenderTop = it == 1))) },
+                field = "landscapeRenderTop",
             )
             SettingsDivider()
             // Auto Progressive Scan — holds Triangle+Cross through boot, the combo some titles
@@ -266,10 +338,11 @@ fun RendererTab(state: MutableState<Settings>) {
             // pad hold, not a live setting), and only does anything on games that implement it.
             ToggleRow(
                 str("renderer.autoProgressive.label"),
-                s.autoProgressiveScan,
+                s.output.autoProgressiveScan,
                 description = str("renderer.autoProgressive.description"),
+                field = "autoProgressiveScan",
             ) {
-                apply(s.copy(autoProgressiveScan = it))
+                apply(s.copy(output = s.output.copy(autoProgressiveScan = it)))
             }
             SettingsDivider()
             SegmentedGridRow(
@@ -278,10 +351,11 @@ fun RendererTab(state: MutableState<Settings>) {
                     "Auto", "Off", "Weave TFF", "Weave BFF", "Bob TFF",
                     "Bob BFF", "Blend TFF", "Blend BFF", "Adapt TFF", "Adapt BFF",
                 ),
-                selectedIndex = s.deinterlaceMode.coerceIn(0, 9),
+                selectedIndex = s.output.deinterlaceMode.coerceIn(0, 9),
                 columns = 5,
                 description = str("renderer.deinterlacing.description"),
-                onChange = { apply(s.copy(deinterlaceMode = it)) },
+                onChange = { apply(s.copy(output = s.output.copy(deinterlaceMode = it))) },
+                field = "deinterlaceMode",
             )
         }
         SettingsDivider()
@@ -289,17 +363,19 @@ fun RendererTab(state: MutableState<Settings>) {
             SegmentedRow(
                 label = str("renderer.textureFiltering.label"),
                 options = listOf("Nearest", "Forced", "PS2", "Sprite"),
-                selectedIndex = s.textureFiltering.coerceIn(0, 3),
+                selectedIndex = s.graphics.textureFiltering.coerceIn(0, 3),
                 description = str("renderer.textureFiltering.description"),
-                onChange = { apply(s.copy(textureFiltering = it)) },
+                onChange = { apply(s.copy(graphics = s.graphics.copy(textureFiltering = it))) },
+                field = "textureFiltering",
             )
             SettingsDivider()
             SegmentedRow(
                 label = str("renderer.texturePreloading.label"),
                 options = listOf("Off", "Partial", "Full"),
-                selectedIndex = s.texturePreloading.coerceIn(0, 2),
+                selectedIndex = s.graphics.texturePreloading.coerceIn(0, 2),
                 description = str("renderer.texturePreloading.description"),
-                onChange = { apply(s.copy(texturePreloading = it)) },
+                onChange = { apply(s.copy(graphics = s.graphics.copy(texturePreloading = it))) },
+                field = "texturePreloading",
             )
             SettingsDivider()
             SegmentedGridRow(
@@ -308,10 +384,11 @@ fun RendererTab(state: MutableState<Settings>) {
                 // and the clamp below in sync with the enum AND with the in-game menu's copy in
                 // EmulationMenuScreen — there are two independent pickers for this setting.
                 options = listOf("Accurate", "Force Full", "No Readbacks", "Unsync", "Disabled", "Async"),
-                selectedIndex = s.hardwareDownloadMode.coerceIn(0, 5),
+                selectedIndex = s.graphics.hardwareDownloadMode.coerceIn(0, 5),
                 columns = 3,
                 description = str("renderer.hardwareDownloadMode.description"),
-                onChange = { apply(s.copy(hardwareDownloadMode = it)) },
+                onChange = { apply(s.copy(graphics = s.graphics.copy(hardwareDownloadMode = it))) },
+                field = "hardwareDownloadMode",
             )
         }
         SettingsDivider()
@@ -319,84 +396,93 @@ fun RendererTab(state: MutableState<Settings>) {
             SegmentedRow(
                 label = str("renderer.displayFilter.label"),
                 options = listOf("Nearest", "Smooth", "Sharp"),
-                selectedIndex = s.displayBilinear.coerceIn(0, 2),
+                selectedIndex = s.graphics.displayBilinear.coerceIn(0, 2),
                 description = str("renderer.displayFilter.description"),
-                onChange = { apply(s.copy(displayBilinear = it)) },
+                onChange = { apply(s.copy(graphics = s.graphics.copy(displayBilinear = it))) },
+                field = "displayBilinear",
             )
             SettingsDivider()
             SegmentedGridRow(
                 label = str("renderer.tvShader.label"),
                 options = listOf("Off", "Scanline", "Diagonal", "Tri", "Wave", "Lottes", "4xRGSS", "NxAGSS"),
-                selectedIndex = s.tvShader.coerceIn(0, 7),
+                selectedIndex = s.graphics.tvShader.coerceIn(0, 7),
                 columns = 4,
                 description = str("renderer.tvShader.description"),
-                onChange = { apply(s.copy(tvShader = it)) },
+                onChange = { apply(s.copy(graphics = s.graphics.copy(tvShader = it))) },
+                field = "tvShader",
             )
             SettingsDivider()
             ToggleRow(
                 "VSync",
-                s.vsyncEnable,
+                s.display.vsyncEnable,
                 description = str("renderer.vsync.description"),
+                field = "vsyncEnable",
             ) {
-                apply(s.copy(vsyncEnable = it))
+                apply(s.copy(display = s.display.copy(vsyncEnable = it)))
             }
             SettingsDivider()
             ToggleRow(
                 str("renderer.shadeboost.label"),
-                s.shadeBoost,
+                s.graphics.shadeBoost,
                 description = str("renderer.shadeboost.description"),
+                field = "shadeBoost",
             ) {
-                apply(s.copy(shadeBoost = it))
+                apply(s.copy(graphics = s.graphics.copy(shadeBoost = it)))
             }
-            if (s.shadeBoost) {
+            if (s.graphics.shadeBoost) {
                 SettingsDivider()
                 IntSliderRow(
                     label = str("renderer.brightness.label"),
-                    value = s.shadeBoostBrightness.coerceIn(1, 100),
+                    value = s.graphics.shadeBoostBrightness.coerceIn(1, 100),
                     min = 1,
                     max = 100,
                     description = str("renderer.shadeboost.fiftyIsNormal"),
                     valueFormatter = { "$it%" },
-                    onChange = { apply(s.copy(shadeBoostBrightness = it)) },
+                    onChange = { apply(s.copy(graphics = s.graphics.copy(shadeBoostBrightness = it))) },
+                    field = "shadeBoostBrightness",
                 )
                 SettingsDivider()
                 IntSliderRow(
                     label = str("renderer.contrast.label"),
-                    value = s.shadeBoostContrast.coerceIn(1, 100),
+                    value = s.graphics.shadeBoostContrast.coerceIn(1, 100),
                     min = 1,
                     max = 100,
                     description = str("renderer.shadeboost.fiftyIsNormal"),
                     valueFormatter = { "$it%" },
-                    onChange = { apply(s.copy(shadeBoostContrast = it)) },
+                    onChange = { apply(s.copy(graphics = s.graphics.copy(shadeBoostContrast = it))) },
+                    field = "shadeBoostContrast",
                 )
                 SettingsDivider()
                 IntSliderRow(
                     label = str("renderer.saturation.label"),
-                    value = s.shadeBoostSaturation.coerceIn(1, 100),
+                    value = s.graphics.shadeBoostSaturation.coerceIn(1, 100),
                     min = 1,
                     max = 100,
                     description = str("renderer.shadeboost.fiftyIsNormal"),
                     valueFormatter = { "$it%" },
-                    onChange = { apply(s.copy(shadeBoostSaturation = it)) },
+                    onChange = { apply(s.copy(graphics = s.graphics.copy(shadeBoostSaturation = it))) },
+                    field = "shadeBoostSaturation",
                 )
                 SettingsDivider()
                 IntSliderRow(
                     label = str("renderer.gamma.label"),
-                    value = s.shadeBoostGamma.coerceIn(1, 100),
+                    value = s.graphics.shadeBoostGamma.coerceIn(1, 100),
                     min = 1,
                     max = 100,
                     description = str("renderer.shadeboost.fiftyIsNormal"),
                     valueFormatter = { "$it%" },
-                    onChange = { apply(s.copy(shadeBoostGamma = it)) },
+                    onChange = { apply(s.copy(graphics = s.graphics.copy(shadeBoostGamma = it))) },
+                    field = "shadeBoostGamma",
                 )
             }
             SettingsDivider()
             ToggleRow(
                 str("renderer.fxaa.label"),
-                s.fxaa,
+                s.graphics.fxaa,
                 description = str("renderer.fxaa.description"),
+                field = "fxaa",
             ) {
-                apply(s.copy(fxaa = it))
+                apply(s.copy(graphics = s.graphics.copy(fxaa = it)))
             }
             SettingsDivider()
             // A picker rather than the on/off toggle this was: with SGSR there are three
@@ -407,13 +493,14 @@ fun RendererTab(state: MutableState<Settings>) {
                 Settings.UPSCALER_OFF, Settings.UPSCALER_FSR1,
                 Settings.UPSCALER_SGSR, Settings.UPSCALER_SGSR_EDGE,
             )
-            val sgsrOn = s.upscaler == Settings.UPSCALER_SGSR || s.upscaler == Settings.UPSCALER_SGSR_EDGE
-            val upscalerOn = s.upscaler == Settings.UPSCALER_FSR1 || sgsrOn
+            val sgsrOn = s.graphics.upscaler == Settings.UPSCALER_SGSR || s.graphics.upscaler == Settings.UPSCALER_SGSR_EDGE
+            val upscalerOn = s.graphics.upscaler == Settings.UPSCALER_FSR1 || sgsrOn
             SegmentedRow(
                 label = str("renderer.upscaler.label"),
                 options = listOf(str("common.off"), "FSR 1", "SGSR", "SGSR Edge"),
-                selectedIndex = upscalerValues.indexOf(s.upscaler).coerceAtLeast(0),
-                onChange = { apply(s.copy(upscaler = upscalerValues[it])) },
+                selectedIndex = upscalerValues.indexOf(s.graphics.upscaler).coerceAtLeast(0),
+                onChange = { apply(s.copy(graphics = s.graphics.copy(upscaler = upscalerValues[it]))) },
+                field = "upscaler",
             )
             // One slider per upscaler, not one shared. They are never both on screen, and the
             // ranges genuinely differ: FSR1's RCAS is natively 0..100, SGSR's edge sharpness is
@@ -424,20 +511,22 @@ fun RendererTab(state: MutableState<Settings>) {
                 if (sgsrOn) {
                     IntSliderRow(
                         label = str("renderer.sgsr.sharpness.label"),
-                        value = s.sgsrSharpness.coerceIn(0, 200),
+                        value = s.graphics.sgsrSharpness.coerceIn(0, 200),
                         min = 0,
                         max = 200,
                         valueFormatter = { "$it%" },
-                        onChange = { apply(s.copy(sgsrSharpness = it)) },
+                        onChange = { apply(s.copy(graphics = s.graphics.copy(sgsrSharpness = it))) },
+                        field = "sgsrSharpness",
                     )
                 } else {
                     IntSliderRow(
                         label = str("renderer.fsr1.sharpness.label"),
-                        value = s.fsrSharpness.coerceIn(0, 100),
+                        value = s.graphics.fsrSharpness.coerceIn(0, 100),
                         min = 0,
                         max = 100,
                         valueFormatter = { "$it%" },
-                        onChange = { apply(s.copy(fsrSharpness = it)) },
+                        onChange = { apply(s.copy(graphics = s.graphics.copy(fsrSharpness = it))) },
+                        field = "fsrSharpness",
                     )
                 }
             }
@@ -450,19 +539,21 @@ fun RendererTab(state: MutableState<Settings>) {
                 SegmentedRow(
                     label = str("renderer.cas.label"),
                     options = listOf(str("fixes.opt.off"), str("renderer.cas.sharpen"), str("renderer.cas.sharpenResize")),
-                    selectedIndex = s.casMode.coerceIn(0, 2),
+                    selectedIndex = s.graphics.casMode.coerceIn(0, 2),
                     description = str("renderer.cas.description"),
-                    onChange = { apply(s.copy(casMode = it)) },
+                    onChange = { apply(s.copy(graphics = s.graphics.copy(casMode = it))) },
+                    field = "casMode",
                 )
-                if (s.casMode != 0) {
+                if (s.graphics.casMode != 0) {
                     SettingsDivider()
                     IntSliderRow(
                         label = str("renderer.cas.sharpness.label"),
-                        value = s.casSharpness.coerceIn(0, 100),
+                        value = s.graphics.casSharpness.coerceIn(0, 100),
                         min = 0,
                         max = 100,
                         valueFormatter = { "$it%" },
-                        onChange = { apply(s.copy(casSharpness = it)) },
+                        onChange = { apply(s.copy(graphics = s.graphics.copy(casSharpness = it))) },
+                        field = "casSharpness",
                     )
                 }
             }
@@ -475,12 +566,12 @@ fun RendererTab(state: MutableState<Settings>) {
             // picker (it passes its own save lambda). Tier wiring stays here in apply(),
             // like every other row on this tab — that's what gives it per-game override.
             com.armsx2.ui.common.ShaderChainSection(
-                enabled = s.shaderChainEnabled,
-                preset = s.shaderChainPreset,
-                params = s.shaderChainParams,
-                onEnabledChange = { apply(s.copy(shaderChainEnabled = it)) },
-                onPresetChange = { apply(s.copy(shaderChainPreset = it)) },
-                onParamsChange = { apply(s.copy(shaderChainParams = it)) },
+                enabled = s.graphics.shaderChainEnabled,
+                preset = s.graphics.shaderChainPreset,
+                params = s.graphics.shaderChainParams,
+                onEnabledChange = { apply(s.copy(graphics = s.graphics.copy(shaderChainEnabled = it))) },
+                onPresetChange = { apply(s.copy(graphics = s.graphics.copy(shaderChainPreset = it))) },
+                onParamsChange = { apply(s.copy(graphics = s.graphics.copy(shaderChainParams = it))) },
             )
             SettingsDivider()
             // Where the presets above come from. Not a setting — it only puts files in
@@ -495,59 +586,14 @@ fun RendererTab(state: MutableState<Settings>) {
             OverlayArtSection()
         }
         SettingsDivider()
-        CollapsibleSection(str("renderer.section.texturePacks")) {
-            ToggleRow(
-                str("renderer.loadTexturePacks.label"),
-                s.loadTextureReplacements,
-                description = str("renderer.loadTexturePacks.description"),
-            ) {
-                apply(s.copy(loadTextureReplacements = it))
-            }
-            SettingsDivider()
-            ToggleRow(
-                str("renderer.asyncTextureLoading.label"),
-                s.loadTextureReplacementsAsync,
-                description = str("renderer.asyncTextureLoading.description"),
-            ) {
-                apply(s.copy(loadTextureReplacementsAsync = it))
-            }
-            SettingsDivider()
-            ToggleRow(
-                str("renderer.precacheTexturePacks.label"),
-                s.precacheTextureReplacements,
-                description = str("renderer.precacheTexturePacks.description"),
-            ) {
-                apply(s.copy(precacheTextureReplacements = it))
-            }
-            SettingsDivider()
-            TexturePackImportRow()
-            SettingsDivider()
-            GsDumpCaptureRow()
-            SettingsDivider()
-            ToggleRow(
-                str("renderer.dumpReplaceableTextures.label"),
-                s.dumpReplaceableTextures,
-                description = str("renderer.dumpReplaceableTextures.description"),
-            ) {
-                apply(s.copy(dumpReplaceableTextures = it))
-            }
-            SettingsDivider()
-            ToggleRow(
-                str("renderer.texturePackOsd.label"),
-                s.osdShowTextureReplacements,
-                description = str("renderer.texturePackOsd.description"),
-            ) {
-                apply(s.copy(osdShowTextureReplacements = it))
-            }
-        }
-        SettingsDivider()
         CollapsibleSection(str("renderer.section.blendingAdvanced")) {
             SegmentedRow(
                 label = str("renderer.blendingAccuracy.label"),
                 options = listOf("Min", "Basic", "Med", "High", "Full", "Max"),
-                selectedIndex = s.accurateBlendingUnit.coerceIn(0, 5),
+                selectedIndex = s.graphics.accurateBlendingUnit.coerceIn(0, 5),
                 description = str("renderer.blendingAccuracy.description"),
-                onChange = { apply(s.copy(accurateBlendingUnit = it)) },
+                onChange = { apply(s.copy(graphics = s.graphics.copy(accurateBlendingUnit = it))) },
+                field = "accurateBlendingUnit",
             )
             // Blending-accuracy companion features (match upstream's grouping under
             // Blending Accuracy). ROV + Accurate Alpha Test apply live; AA1 needs a
@@ -555,28 +601,22 @@ fun RendererTab(state: MutableState<Settings>) {
             SettingsDivider()
             ToggleRow(
                 str("renderer.rov.label"),
-                s.hwRov,
+                s.display.hwRov,
                 description = str("renderer.rov.description"),
+                field = "hwRov",
             ) {
-                apply(s.copy(hwRov = it))
+                apply(s.copy(display = s.display.copy(hwRov = it)))
             }
             SettingsDivider()
             // Every Android GPU is a tiler, so this is aimed at us even though it landed with
             // only a desktop UI. Default OFF because it is brand new, not because it is risky.
             ToggleRow(
                 str("renderer.coalesceRenderPasses.label"),
-                s.coalesceRenderPasses,
+                s.display.coalesceRenderPasses,
                 description = str("renderer.coalesceRenderPasses.description"),
+                field = "coalesceRenderPasses",
             ) {
-                apply(s.copy(coalesceRenderPasses = it))
-            }
-            SettingsDivider()
-            ToggleRow(
-                str("renderer.accurateBlendingFastPath.label"),
-                s.adrenoFbFetch,
-                description = str("renderer.accurateBlendingFastPath.description"),
-            ) {
-                apply(s.copy(adrenoFbFetch = it))
+                apply(s.copy(display = s.display.copy(coalesceRenderPasses = it)))
             }
             SettingsDivider()
             // MediaTek Mali / Mali-G57 escape hatch: those drivers are force-excluded from
@@ -584,60 +624,66 @@ fun RendererTab(state: MutableState<Settings>) {
             // GPU with no dual-source blend. Default OFF — on is a test, not a fix.
             ToggleRow(
                 str("renderer.forceMaliFbFetch.label"),
-                s.forceMaliFbFetch,
+                s.display.forceMaliFbFetch,
                 description = str("renderer.forceMaliFbFetch.description"),
+                field = "forceMaliFbFetch",
             ) {
-                apply(s.copy(forceMaliFbFetch = it))
+                apply(s.copy(display = s.display.copy(forceMaliFbFetch = it)))
             }
             SettingsDivider()
             // ANGLE for the OpenGL renderer now lives in the graphics-API driver picker
             // (AngleDriverSection), shown when OpenGL is selected — see RendererBackendSection.
             ToggleRow(
                 str("renderer.accurateAlphaTest.label"),
-                s.hwAccurateAlphaTest,
+                s.display.hwAccurateAlphaTest,
                 description = str("renderer.accurateAlphaTest.description"),
+                field = "hwAccurateAlphaTest",
             ) {
-                apply(s.copy(hwAccurateAlphaTest = it))
+                apply(s.copy(display = s.display.copy(hwAccurateAlphaTest = it)))
             }
             SettingsDivider()
             ToggleRow(
                 str("renderer.hwAa1.label"),
-                s.hwAa1,
+                s.display.hwAa1,
                 description = str("renderer.hwAa1.description"),
+                field = "hwAa1",
             ) {
-                apply(s.copy(hwAa1 = it))
+                apply(s.copy(display = s.display.copy(hwAa1 = it)))
             }
             // Hardware & upscaling compatibility fixes now live in the dedicated
             // "Fixes" tab (FixesTab) to keep Render focused on quality/display.
             SettingsDivider()
             ToggleRow(
                 str("renderer.hwMipmapping.label"),
-                s.hwMipmap,
+                s.graphics.hwMipmap,
                 description = str("renderer.hwMipmapping.description"),
+                field = "hwMipmap",
             ) {
-                apply(s.copy(hwMipmap = it))
+                apply(s.copy(graphics = s.graphics.copy(hwMipmap = it)))
             }
             SettingsDivider()
             // TriFilter is signed (-1 = Auto). Map enum range onto 0..3.
             val triLabels = listOf("Auto", "Off", "PS2", "Forced")
-            val triIdx = (s.triFilter + 1).coerceIn(0, 3)
+            val triIdx = (s.hwFixes.triFilter + 1).coerceIn(0, 3)
             SegmentedRow(
                 label = str("renderer.trilinear.label"),
                 options = triLabels,
                 selectedIndex = triIdx,
                 description = str("renderer.trilinear.description"),
-                onChange = { apply(s.copy(triFilter = it - 1)) },
+                onChange = { apply(s.copy(hwFixes = s.hwFixes.copy(triFilter = it - 1))) },
+                field = "triFilter",
             )
             SettingsDivider()
             val anisoLabels = listOf("Off", "2x", "4x", "8x", "16x")
             val anisoVals = listOf(0, 2, 4, 8, 16)
-            val anisoIdx = anisoVals.indexOf(s.maxAnisotropy).coerceAtLeast(0)
+            val anisoIdx = anisoVals.indexOf(s.hwFixes.maxAnisotropy).coerceAtLeast(0)
             SegmentedRow(
                 label = str("renderer.anisotropic.label"),
                 options = anisoLabels,
                 selectedIndex = anisoIdx,
                 description = str("renderer.anisotropic.description"),
-                onChange = { apply(s.copy(maxAnisotropy = anisoVals[it])) },
+                onChange = { apply(s.copy(hwFixes = s.hwFixes.copy(maxAnisotropy = anisoVals[it]))) },
+                field = "maxAnisotropy",
             )
             SettingsDivider()
             // GPU profile override. Auto resolves at device init via
@@ -654,11 +700,57 @@ fun RendererTab(state: MutableState<Settings>) {
             SegmentedRow(
                 label = str("renderer.gpuProfile.label"),
                 options = listOf("Auto", "Mali", "Adreno", "PowerVR", "Xclipse"),
-                selectedIndex = s.gpuProfile.coerceIn(0, 4),
+                selectedIndex = s.hwFixes.gpuProfile.coerceIn(0, 4),
                 description = str("renderer.gpuProfile.description"),
                 onChange = {
-                    apply(s.copy(gpuProfile = it))
+                    apply(s.copy(hwFixes = s.hwFixes.copy(gpuProfile = it)))
                 },
+                field = "gpuProfile",
+            )
+            // Here rather than among the texture pack rows, where it used to sit: a GS dump is a
+            // renderer bug report. The in-game menu's Session page has the one-tap version.
+            SettingsDivider()
+            GsDumpCaptureRow()
+        }
+    }
+}
+
+/**
+ * Opens the texture pack manager: the game's installed packs, community downloads and import.
+ * Over a running game it opens in place of this screen, the way the in-game menu's button does;
+ * from the library it is its own screen.
+ */
+@Composable
+private fun TextureManagerRow() {
+    val open = {
+        if (com.armsx2.ui.WindowImpl.inGameScreen.value != null)
+            com.armsx2.ui.WindowImpl.openInGameScreen(com.armsx2.ui.InGameScreen.Textures)
+        else
+            com.armsx2.navigation.UiNavigator.navigate(com.armsx2.navigation.AppRoute.TextureManager)
+    }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(rowAura())
+            .controllerFocusable("renderer.textureManager", RoundedCornerShape(16.dp), onConfirm = open)
+            .clickable(onClick = open)
+            .padding(horizontal = 6.dp, vertical = 5.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Column {
+            Text(
+                str("renderer.section.texturePacks"),
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                str("renderer.texturePacks.manage.description"),
+                color = Colors.pasx2_blue,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
             )
         }
     }
@@ -727,7 +819,7 @@ private fun TexturePackImportRow() {
                 )
             }
         }
-        // .zip import — extracts the archive into the same per-game replacements folder.
+        // .zip / .tar.zst import — extracts the archive into the same per-game replacements folder.
         Box(
             Modifier
                 .fillMaxWidth()
@@ -971,9 +1063,15 @@ private fun ClearShaderCacheRow() {
             .clip(RoundedCornerShape(16.dp))
             .background(rowAura())
             .clickable {
+                // A running renderer holds the caches open and would write its pipelines back after
+                // the files were deleted, so the clear waits until the game is shut down.
+                if (MainActivityRuntime.eState.value != com.armsx2.EmuState.STOPPED) {
+                    Toast.makeText(context, I18n.get("renderer.clearShaderCache.stopGameFirst"), Toast.LENGTH_LONG).show()
+                    return@clickable
+                }
                 val n = clearShaderCache(File(MainActivityRuntime.assetCopyRoot(context), "cache"))
                 status.value = if (n > 0)
-                    "Cleared $n shader-cache file${if (n == 1) "" else "s"} — restart the game to rebuild."
+                    "Cleared $n shader-cache file${if (n == 1) "" else "s"}. Restart the game to rebuild."
                 else
                     I18n.get("renderer.clearShaderCache.alreadyEmpty")
                 Toast.makeText(context, status.value, Toast.LENGTH_SHORT).show()
@@ -1001,18 +1099,19 @@ private fun ClearShaderCacheRow() {
     }
 }
 
-/** Delete the on-disk compiled shader/pipeline caches (Vulkan + GL). They rebuild
- *  on the next renderer init; a stale/mismatched cache (e.g. after a driver change)
- *  can otherwise leave a game rendering corrupt. Returns how many files were removed. */
+/** Delete the on-disk compiled shader/pipeline caches: every renderer's files, their debug
+ *  variants, the per-game pipeline key lists, the frame-generation SPIR-V and any temporary file a
+ *  killed write left behind. They rebuild on the next renderer init. Same set as the core's
+ *  GSCacheFile::DeleteAll. Returns how many files were removed. */
 private fun clearShaderCache(cacheDir: File): Int {
-    val names = listOf(
-        "vulkan_pipelines.bin", "vulkan_shaders.bin", "vulkan_shaders.idx",
-        "gl_programs.bin", "gl_programs.idx",
-    )
+    val prefixes = listOf("vulkan_shaders", "vulkan_pipelines", "gl_programs", "lsfg_spirv")
     var removed = 0
-    for (name in names) {
-        val f = File(cacheDir, name)
-        if (f.isFile && runCatching { f.delete() }.getOrDefault(false)) removed++
+    cacheDir.listFiles()?.forEach { f ->
+        if (f.isFile && prefixes.any { f.name.startsWith(it) } && runCatching { f.delete() }.getOrDefault(false))
+            removed++
+    }
+    File(cacheDir, "vulkan_pipeline_keys").listFiles()?.forEach { f ->
+        if (runCatching { f.delete() }.getOrDefault(false)) removed++
     }
     return removed
 }
@@ -1073,39 +1172,11 @@ private fun importTexturePack(context: Context, uri: Uri, serial: String): Int {
     return copyDocumentTree(context, source, dest)
 }
 
-/** Extract a picked .zip of replacement textures into textures/<serial>/replacements,
- *  preserving the archive's internal folder structure. The native loader scans that
- *  directory RECURSIVELY and matches by hash filename, so a pack that nests its files
- *  (e.g. under its own "replacements/" or a pack-name folder) still resolves. Guards
- *  against Zip-Slip path traversal by rejecting any entry that escapes the dest dir. */
-private fun importTexturePackZip(context: Context, zipUri: Uri, serial: String): Int {
-    val dest = File(MainActivityRuntime.assetCopyRoot(context), "textures/$serial/replacements")
-    if (!dest.exists() && !dest.mkdirs())
-        return -1
-    val destCanon = dest.canonicalPath
-    var copied = 0
-    context.contentResolver.openInputStream(zipUri)?.use { raw ->
-        ZipInputStream(BufferedInputStream(raw)).use { zin ->
-            while (true) {
-                val e = zin.nextEntry ?: break
-                if (!e.isDirectory) {
-                    val rel = e.name.replace('\\', '/').trimStart('/')
-                    val out = File(dest, rel)
-                    // Zip-Slip guard: the resolved path must stay inside dest.
-                    val outCanon = out.canonicalPath
-                    if (outCanon == destCanon || outCanon.startsWith(destCanon + File.separator)) {
-                        out.parentFile?.mkdirs()
-                        // Per-entry guard: a mid-copy failure deletes that partial file
-                        // and lets the remaining entries still import.
-                        val ok = runCatching { out.outputStream().use { zin.copyTo(it) } }.isSuccess
-                        if (ok) copied++ else out.delete()
-                    }
-                }
-                zin.closeEntry()
-            }
-        }
-    } ?: return -1
-    return copied
+/** Installs a picked .zip or .tar.zst pack into textures/<serial>/replacements through
+ *  [com.armsx2.TexturePackInstaller.installLocal]. Returns the texture count, or -1. */
+private fun importTexturePackZip(context: Context, uri: Uri, serial: String): Int {
+    val outcome = com.armsx2.TexturePackInstaller.installLocal(context, uri, serial, onProgress = {}, isCancelled = { false })
+    return if (outcome.ok) outcome.textures else -1
 }
 
 private fun copyDocumentTree(context: Context, source: DocumentFile, dest: File): Int {

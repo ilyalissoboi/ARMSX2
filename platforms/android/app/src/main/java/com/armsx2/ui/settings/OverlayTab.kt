@@ -90,12 +90,13 @@ fun OverlayTab(state: MutableState<Settings>) {
         // "UI Size (borders)" while actually driving osdScale — two settings, one name.
         IntSliderRow(
             label = str("overlay.osdSize.label"),
-            value = s.osdScale,
+            value = s.osd.osdScale,
             min = 50,
             max = 250,
             description = str("overlay.osdSize.description"),
             valueFormatter = { "$it%" },
-            onChange = { apply(s.copy(osdScale = it)) },
+            onChange = { apply(s.copy(osd = s.osd.copy(osdScale = it))) },
+            field = "osdScale",
         )
         SettingsDivider()
 
@@ -106,9 +107,10 @@ fun OverlayTab(state: MutableState<Settings>) {
         SegmentedRow(
             label = str("overlay.osdColor.label"),
             options = OSD_COLOR_LABEL_KEYS.map { str(it) },
-            selectedIndex = OSD_COLORS.indexOf(s.osdColor).coerceAtLeast(0),
+            selectedIndex = OSD_COLORS.indexOf(s.osd.osdColor).coerceAtLeast(0),
             description = str("overlay.osdColor.description"),
-            onChange = { apply(s.copy(osdColor = OSD_COLORS[it])) },
+            onChange = { apply(s.copy(osd = s.osd.copy(osdColor = OSD_COLORS[it]))) },
+            field = "osdColor",
         )
 
         // Which corner the stats block sits in. Defaults to top-right (the core's own default),
@@ -116,9 +118,10 @@ fun OverlayTab(state: MutableState<Settings>) {
         SegmentedRow(
             label = str("overlay.osdPosition.label"),
             options = OSD_POSITION_LABEL_KEYS.map { str(it) },
-            selectedIndex = OSD_POSITIONS.indexOf(s.osdPosition).coerceAtLeast(0),
+            selectedIndex = OSD_POSITIONS.indexOf(s.osd.osdPosition).coerceAtLeast(0),
             description = str("overlay.osdPosition.description"),
-            onChange = { apply(s.copy(osdPosition = OSD_POSITIONS[it])) },
+            onChange = { apply(s.copy(osd = s.osd.copy(osdPosition = OSD_POSITIONS[it]))) },
+            field = "osdPosition",
         )
 
         // Quick-menu handedness. A plain pref, not a Settings field — see QuickMenuSide.
@@ -162,11 +165,11 @@ fun OverlayTab(state: MutableState<Settings>) {
         )
         SettingsDivider()
 
-        ToggleRow(str("overlay.toggle.gpuUsage"), s.osdShowGpu) {
-            apply(s.copy(osdShowGpu = it))
+        ToggleRow(str("overlay.toggle.gpuUsage"), s.osd.osdShowGpu, field = "osdShowGpu") {
+            apply(s.copy(osd = s.osd.copy(osdShowGpu = it)))
         }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.cpuUsage"), s.osdShowCpu) { apply(s.copy(osdShowCpu = it)) }
+        ToggleRow(str("overlay.toggle.cpuUsage"), s.osd.osdShowCpu, field = "osdShowCpu") { apply(s.copy(osd = s.osd.copy(osdShowCpu = it))) }
         // Device temperatures (Cotcho). Not a core setting like the rows around it: the core has
         // no way to read a temperature, so the app polls and pushes the values in. Off by
         // default — it is a sysfs read on a timer.
@@ -177,29 +180,29 @@ fun OverlayTab(state: MutableState<Settings>) {
             }
         }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.fps"), s.osdShowFps) { apply(s.copy(osdShowFps = it)) }
+        ToggleRow(str("overlay.toggle.fps"), s.osd.osdShowFps, field = "osdShowFps") { apply(s.copy(osd = s.osd.copy(osdShowFps = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.vps"), s.osdShowVps) { apply(s.copy(osdShowVps = it)) }
+        ToggleRow(str("overlay.toggle.vps"), s.osd.osdShowVps, field = "osdShowVps") { apply(s.copy(osd = s.osd.copy(osdShowVps = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.emulationSpeed"), s.osdShowSpeed) { apply(s.copy(osdShowSpeed = it)) }
+        ToggleRow(str("overlay.toggle.emulationSpeed"), s.osd.osdShowSpeed, field = "osdShowSpeed") { apply(s.copy(osd = s.osd.copy(osdShowSpeed = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.internalResolution"), s.osdShowResolution) { apply(s.copy(osdShowResolution = it)) }
+        ToggleRow(str("overlay.toggle.internalResolution"), s.osd.osdShowResolution, field = "osdShowResolution") { apply(s.copy(osd = s.osd.copy(osdShowResolution = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.gsStatistics"), s.osdShowGsStats) { apply(s.copy(osdShowGsStats = it)) }
+        ToggleRow(str("overlay.toggle.gsStatistics"), s.osd.osdShowGsStats, field = "osdShowGsStats") { apply(s.copy(osd = s.osd.copy(osdShowGsStats = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.frameTimesGraph"), s.osdShowFrameTimes) { apply(s.copy(osdShowFrameTimes = it)) }
+        ToggleRow(str("overlay.toggle.frameTimesGraph"), s.osd.osdShowFrameTimes, field = "osdShowFrameTimes") { apply(s.copy(osd = s.osd.copy(osdShowFrameTimes = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.hardwareInfo"), s.osdShowHardwareInfo) { apply(s.copy(osdShowHardwareInfo = it)) }
+        ToggleRow(str("overlay.toggle.hardwareInfo"), s.osd.osdShowHardwareInfo, field = "osdShowHardwareInfo") { apply(s.copy(osd = s.osd.copy(osdShowHardwareInfo = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.gpuPipelineStats"), s.osdShowGpuStats) { apply(s.copy(osdShowGpuStats = it)) }
+        ToggleRow(str("overlay.toggle.gpuPipelineStats"), s.osd.osdShowGpuStats, field = "osdShowGpuStats") { apply(s.copy(osd = s.osd.copy(osdShowGpuStats = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.emulatorVersion"), s.osdShowVersion) { apply(s.copy(osdShowVersion = it)) }
+        ToggleRow(str("overlay.toggle.emulatorVersion"), s.osd.osdShowVersion, field = "osdShowVersion") { apply(s.copy(osd = s.osd.copy(osdShowVersion = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.settingsSummary"), s.osdShowSettings) { apply(s.copy(osdShowSettings = it)) }
+        ToggleRow(str("overlay.toggle.settingsSummary"), s.osd.osdShowSettings, field = "osdShowSettings") { apply(s.copy(osd = s.osd.copy(osdShowSettings = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.controlInputs"), s.osdShowInputs) { apply(s.copy(osdShowInputs = it)) }
+        ToggleRow(str("overlay.toggle.controlInputs"), s.osd.osdShowInputs, field = "osdShowInputs") { apply(s.copy(osd = s.osd.copy(osdShowInputs = it))) }
         SettingsDivider()
-        ToggleRow(str("overlay.toggle.onScreenNotifications"), s.osdShowMessages) { apply(s.copy(osdShowMessages = it)) }
+        ToggleRow(str("overlay.toggle.onScreenNotifications"), s.osd.osdShowMessages, field = "osdShowMessages") { apply(s.copy(osd = s.osd.copy(osdShowMessages = it))) }
         SettingsDivider()
         // Android hotkey pop-ups (Fast-Forward on/off, etc.) — separate from the emulator
         // OSD, pref-backed. Cancel-previous already stops them stacking; this switches
@@ -212,6 +215,19 @@ fun OverlayTab(state: MutableState<Settings>) {
         ) {
             ffToasts.value = it
             com.armsx2.runtime.MainActivityRuntime.prefs.edit { putBoolean("ui.hotkeyToasts", it) }
+        }
+        SettingsDivider()
+        // The free-software notice each game boot shows (#453). On by default; turned off it stays
+        // off, applied at once and again at every app start.
+        val freeNotice = remember { mutableStateOf(com.armsx2.runtime.MainActivityRuntime.prefs.getBoolean("ui.freeSoftwareNotice", true)) }
+        ToggleRow(
+            str("overlay.toggle.freeSoftwareNotice"),
+            freeNotice.value,
+            description = str("overlay.toggle.freeSoftwareNotice.desc"),
+        ) {
+            freeNotice.value = it
+            com.armsx2.runtime.MainActivityRuntime.prefs.edit { putBoolean("ui.freeSoftwareNotice", it) }
+            runCatching { kr.co.iefriends.pcsx2.NativeApp.setFreeSoftwareNotice(it) }
         }
     }
 }

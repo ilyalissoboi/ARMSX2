@@ -50,15 +50,37 @@ if(WIN32)
 	)
 endif(WIN32)
 
+option(BAKE_SHADERS_IN_CPP "Bake shaders into C++ source files" OFF)
+if(BAKE_SHADERS_IN_CPP)
+	include(ShaderToCpp)
+	shader_to_cpp(SHADER_FILES SHADER_FILES_CPP CPP_OUTPUT_DIR)
+	add_custom_target(GeneratedShaders DEPENDS ${SHADER_FILES} ${SHADER_FILES_CPP})
+	add_dependencies(PCSX2 GeneratedShaders)
+	target_compile_definitions(PCSX2_FLAGS INTERFACE BAKE_SHADERS_IN_CPP=1)
+	target_include_directories(PCSX2_FLAGS INTERFACE ${CPP_OUTPUT_DIR})
+endif()
+
 # Main pcsx2 source
 set(pcsx2Sources
 	Achievements.cpp
+	Arcade/AcGameFile.cpp
+	Arcade/ArcadeFiles.cpp
+	Arcade/ArcadeInput.cpp
+	Arcade/ArcadeSetup.cpp
+	AutoTune/AutoTuneApplier.cpp
+	AutoTune/AutoTuneController.cpp
+	AutoTune/AutoTuneSampler.cpp
+	AutoTune/AutoTuneStore.cpp
+	Autosave.cpp
 	BuildVersion.cpp
 	Cache.cpp
 	COP0.cpp
 	COP2.cpp
 	Counters.cpp
 	Dmac.cpp
+	EECycleRate.cpp
+	EECycleRateController.cpp
+	EECycleRateSampler.cpp
 	GameDatabase.cpp
 	Elfheader.cpp
 	FW.cpp
@@ -85,6 +107,11 @@ set(pcsx2Sources
 	IopHw.cpp
 	IopIrq.cpp
 	IopMem.cpp
+	IopThread/IopChannels.cpp
+	IopThread/IopPlacement.cpp
+	IopThread/IopThread.cpp
+	IopThread/IopThreadMode.cpp
+	IopThread/IopThreadVm.cpp
 	PINE.cpp
 	Mdec.cpp
 	Memory.cpp
@@ -114,6 +141,7 @@ set(pcsx2Sources
 	SIO/Sio2.cpp
 	SIO/Sio0.cpp
 	SIO/Multitap/MultitapProtocol.cpp
+	SIO/Memcard/MemcardBackup.cpp
 	SIO/Memcard/MemoryCardFile.cpp
 	SIO/Memcard/MemoryCardFolder.cpp
 	SIO/Memcard/MemoryCardProtocol.cpp
@@ -147,6 +175,15 @@ set(pcsx2Sources
 # Main pcsx2 header
 set(pcsx2Headers
 	Achievements.h
+	Arcade/AcGameFile.h
+	Arcade/ArcadeFiles.h
+	Arcade/ArcadeInput.h
+	Arcade/ArcadeSetup.h
+	AutoTune/AutoTuneApplier.h
+	AutoTune/AutoTuneController.h
+	AutoTune/AutoTuneSampler.h
+	AutoTune/AutoTuneStore.h
+	Autosave.h
 	BuildVersion.h
 	Cache.h
 	Common.h
@@ -154,6 +191,9 @@ set(pcsx2Headers
 	COP0.h
 	Counters.h
 	Dmac.h
+	EECycleRate.h
+	EECycleRateController.h
+	EECycleRateSampler.h
 	EeFpuFormat.h
 	EeFpuModel.h
 	GameDatabase.h
@@ -174,6 +214,15 @@ set(pcsx2Headers
 	IopGte.h
 	IopHw.h
 	IopMem.h
+	IopThread/IopChannels.h
+	IopThread/EeBridge.h
+	IopThread/IopBridge.h
+	IopThread/IopPlacement.h
+	IopThread/IopThread.h
+	IopThread/IopThreadMode.h
+	IopThread/IopThreadVm.h
+	IopThread/OwnerAsserts.h
+	IopThread/SharedWord.h
 	LayeredSettingsInterface.h
 	PINE.h
 	Mdec.h
@@ -199,6 +248,7 @@ set(pcsx2Headers
 	SIO/Sio0.h
 	SIO/SioTypes.h
 	SIO/Multitap/MultitapProtocol.h
+	SIO/Memcard/MemcardBackup.h
 	SIO/Memcard/MemoryCardFile.h
 	SIO/Memcard/MemoryCardFolder.h
 	SIO/Memcard/MemoryCardProtocol.h
@@ -292,6 +342,17 @@ set(pcsx2SPU2Headers
 
 # DEV9 sources
 set(pcsx2DEV9Sources
+	# Namco System 246/256 arcade board (PCSX2x6); only reached during an arcade session
+	DEV9/ACATA.cpp
+	DEV9/ACATA_IO.cpp
+	DEV9/ACATA_IO_CHD.cpp
+	DEV9/ACATAPI.cpp
+	DEV9/ACCORE.cpp
+	DEV9/ACJV.cpp
+	DEV9/ACRAM.cpp
+	DEV9/ACSRAM.cpp
+	DEV9/ACUART.cpp
+	DEV9/ACUART_GLUE.cpp
 	DEV9/AdapterUtils.cpp
 	DEV9/ATA/Commands/ATA_Command.cpp
 	DEV9/ATA/Commands/ATA_CmdDMA.cpp
@@ -350,6 +411,21 @@ endif()
 
 # DEV9 headers
 set(pcsx2DEV9Headers
+	DEV9/ACATA.h
+	DEV9/ACATA_CMD_RESPONSES
+	DEV9/ACATA_internal.h
+	DEV9/ACATA_IO_CHD.h
+	DEV9/ACATA_IO_WRITES.h
+	DEV9/ACATAPI.h
+	DEV9/ACCORE.h
+	DEV9/ACDEV.h
+	DEV9/ACJV.h
+	DEV9/ACJV_Inputs.h
+	DEV9/ACMACROS.h
+	DEV9/ACRAM.h
+	DEV9/ACSRAM.h
+	DEV9/ACUART.h
+	DEV9/ACUART_GLUE.h
 	DEV9/AdapterUtils.h
 	DEV9/ATA/ATA.h
 	DEV9/ATA/HddCreate.h
@@ -512,10 +588,12 @@ endif()
 
 set(pcsx2GSSources
 	GS/GS.cpp
+	GS/GSCacheFile.cpp
 	GS/GSClut.cpp
 	GS/GSDrawingContext.cpp
 	GS/GSDrawingEnvironment.cpp
 	GS/GSDump.cpp
+	GS/GSDumpBundle.cpp
 	GS/GSLocalMemory.cpp
 	GS/GSLzma.cpp
 	GS/GSPerfMon.cpp
@@ -526,9 +604,17 @@ set(pcsx2GSSources
 	GS/GSUtil.cpp
 	GS/GSVector.cpp
 	GS/MultiISA.cpp
+	GS/DriverReport/GSDriverReport.cpp
+	GS/DriverReport/GSDriverReportActive.cpp
+	GS/DriverReport/GSDriverReportClassify.cpp
+	GS/DriverReport/GSDriverReportJson.cpp
+	GS/DriverReport/GSDriverReportProfile.cpp
+	GS/DriverReport/GSDriverReportSystem.cpp
 	GS/Renderers/Common/GSDevice.cpp
 	GS/Renderers/Common/GSDirtyRect.cpp
+	GS/Renderers/Common/GSFieldShiftDetector.cpp
 	GS/Renderers/Common/GSFunctionMap.cpp
+	GS/Renderers/Common/GSHeadlessPresent.cpp
 	# The GPU driver-bug database is keyed on the DRIVER, not the platform: Turnip, PanVK and the
 	# Qualcomm blob all ship outside Android too (ARM Linux handhelds — Rocknix, Batocera). Building
 	# these only under ANDROID made every rule dead on exactly the hardware we test on, which is how
@@ -547,22 +633,39 @@ set(pcsx2GSSources
 	GS/Renderers/Null/GSRendererNull.cpp
 	GS/Renderers/HW/GSDrawLog.cpp
 	GS/Renderers/HW/GSHwHack.cpp
+	GS/Renderers/HW/GSLineRuns.cpp
 	GS/Renderers/HW/GSRendererHW.cpp
 	GS/Renderers/HW/GSTextureCache.cpp
 	GS/Renderers/HW/GSTextureReplacementLoaders.cpp
 	GS/Renderers/HW/GSTextureReplacements.cpp
+	GS/Renderers/HW/GSTextureUpscaler.cpp
 	GS/Renderers/SW/GSTextureCacheSW.cpp
 	)
 
+# The Mali kernel-driver probe for the driver report: MIT-licensed C, Linux and Android only.
+if(UNIX AND NOT APPLE)
+	list(APPEND pcsx2GSSources GS/DriverReport/mali_kbase_probe.c)
+	set_source_files_properties(GS/DriverReport/mali_kbase_probe.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON COMPILE_OPTIONS "-std=c11")
+endif()
+
 # GS headers
 set(pcsx2GSHeaders
+	GS/DriverReport/GSDriverReport.h
+	GS/DriverReport/GSDriverReportActive.h
+	GS/DriverReport/GSDriverReportClassify.h
+	GS/DriverReport/GSDriverReportJson.h
+	GS/DriverReport/GSDriverReportProfile.h
+	GS/DriverReport/GSDriverReportSystem.h
 	GS/GSAlignedClass.h
 	GS/GSBlock.h
 	GS/GSBackQueue.h
+	GS/GSCacheFile.h
 	GS/GSClut.h
+	GS/GSCompileStats.h
 	GS/GSDrawingContext.h
 	GS/GSDrawingEnvironment.h
 	GS/GSDump.h
+	GS/GSDumpBundle.h
 	GS/GSExtra.h
 	GS/GSGL.h
 	GS/GSRegs.h
@@ -583,47 +686,72 @@ set(pcsx2GSHeaders
 	GS/GSXXH.h
 	GS/MultiISA.h
 	GS/Renderers/Common/GSBlendConstantPolicy.h
+	GS/Renderers/Common/GSBackThreadPolicy.h
+	GS/Renderers/Common/GSCopyRoadBlendingPolicy.h
+	GS/Renderers/Common/GSDynamicFeedbackLoopPolicy.h
 	GS/Renderers/Common/GSDevice.h
 	GS/Renderers/Common/GSDirtyRect.h
+	GS/Renderers/Common/GSDrawRoad.h
 	GS/Renderers/Common/GSFastList.h
-	GS/Renderers/Common/GSFeedbackLoopCarryPolicy.h
+	GS/Renderers/Common/GSHeadlessPresent.h
+	GS/Renderers/Common/GSAlphaBitLogicOp.h
+	GS/Renderers/Common/GSReplacementAlphaSnap.h
+	GS/Renderers/Common/GSFastStencilShadow.h
+	GS/Renderers/Common/GSFieldShiftDetector.h
+	GS/Renderers/Common/GSFieldShiftPolicy.h
 	GS/Renderers/Common/GSFramebufferFetchPolicy.h
+	GS/Renderers/Common/GSMeasurementOverrides.h
 	GS/Renderers/Common/GSFunctionMap.h
 	GS/Renderers/Common/GSGPUProfile.h
 	GS/Renderers/Common/GSGPUProfilePrivate.h
 	GS/Renderers/Common/GSInterlaceModePolicy.h
+	GS/Renderers/Common/GSNativeTexelGridPolicy.h
 	GS/Renderers/Common/GSPassScheduler.h
 	GS/Renderers/Common/GSPresentationPolicy.h
 	GS/Renderers/Common/GSRenderer.h
 	GS/Renderers/Common/GSSwPrimRender.h
 	GS/Renderers/Common/GSShaderEnums.h
-	GS/Renderers/Common/GSSelfReadCopyPolicy.h
+	GS/Renderers/Common/GSSelfReadRoadPolicy.h
 	GS/Renderers/Common/GSSnapshotPolicy.h
 	GS/Renderers/Common/GSStreamRingFlushRange.h
+	GS/Renderers/Common/GSStreamRingGrowth.h
 	GS/Renderers/Common/GSStreamRingMemoryPolicy.h
 	GS/Renderers/Common/GSTexture.h
 	GS/Renderers/Common/GSVertex.h
 	GS/Renderers/Common/GSVertexTrace.h
 	GS/Renderers/Null/GSDeviceNone.h
+	GS/Renderers/Null/GSNullDeviceProfile.h
 	GS/Renderers/Null/GSRendererNull.h
 	GS/Renderers/HW/GSAlphaKnownBits.h
 	GS/Renderers/HW/GSDepthCoverage.h
 	GS/Renderers/HW/GSDrawAlphaMask.h
 	GS/Renderers/HW/GSDrawLog.h
 	GS/Renderers/HW/GSHwHack.h
+	GS/Renderers/HW/GSLineRuns.h
+	GS/Renderers/HW/GSLineWalk.h
+	GS/Renderers/HW/GSPointPlace.h
 	GS/Renderers/HW/GSRendererHW.h
 	GS/Renderers/HW/GSSpriteEdgeSnap.h
+	GS/Renderers/HW/GSTexelAddressedDraw.h
 	GS/Renderers/HW/GSTextureCache.h
 	GS/Renderers/HW/GSTextureReplacements.h
+	GS/Renderers/HW/GSTextureUpscaleSupport.h
+	GS/Renderers/HW/GSTextureUpscaler.h
 	GS/Renderers/HW/GSVertexHW.h
 	GS/Renderers/SW/GSBlockWalk.h
+	GS/Renderers/SW/GSColourWalk.h
+	GS/Renderers/SW/GSCoordinateLag.h
+	GS/Renderers/SW/GSCoordinateWalk.h
 	GS/Renderers/SW/GSDepthWalk.h
+	GS/Renderers/SW/GSLevelOfDetail.h
 	GS/Renderers/SW/GSDrawScanlineCodeGenerator.all.h
 	GS/Renderers/SW/GSDrawScanline.h
 	GS/Renderers/SW/GSNewCodeGenerator.h
+	GS/Renderers/SW/GSPerspectivePlane.h
 	GS/Renderers/SW/GSRasterizer.h
 	GS/Renderers/SW/GSRendererSW.h
 	GS/Renderers/SW/GSScanlineEnvironment.h
+	GS/Renderers/SW/GSVertexQDivide.h
 	GS/Renderers/SW/GSSetupPrimCodeGenerator.all.h
 	GS/Renderers/SW/GSSwTextureDirty.h
 	GS/Renderers/SW/GSTextureCacheSW.h
@@ -666,18 +794,22 @@ if(USE_OPENGL)
 	target_link_libraries(PCSX2_FLAGS INTERFACE glad)
 
 	if(ENABLE_LIBRETRO)
-		# The context the frontend owns; picked over the platform ones below
-		# when the core installs its callbacks.
-		list(APPEND pcsx2GSSources GS/Renderers/OpenGL/GLContextLibretro.cpp)
-		list(APPEND pcsx2GSHeaders GS/Renderers/OpenGL/GLContextLibretro.h)
+		# Context sharing with the frontend, and the finished-frame handoff that
+		# goes with it.
+		list(APPEND pcsx2GSSources GS/Renderers/OpenGL/GLLibretro.cpp)
+		list(APPEND pcsx2GSHeaders GS/Renderers/OpenGL/GLLibretro.h)
 	endif()
 
 	if(WIN32)
 		list(APPEND pcsx2GSSources GS/Renderers/OpenGL/GLContextWGL.cpp)
 		list(APPEND pcsx2GSHeaders GS/Renderers/OpenGL/GLContextWGL.h)
-		target_link_libraries(PCSX2_FLAGS INTERFACE opengl32.lib WinPixEventRuntime::WinPixEventRuntime)
+		target_link_libraries(PCSX2_FLAGS INTERFACE opengl32.lib)
 	else()
-		if(X11_API OR WAYLAND_API)
+		# The libretro core builds with X11_API and WAYLAND_API off - it has no
+		# window of its own - but it still needs the EGL context class, because
+		# the context it renders on is an EGL one shared with the frontend's.
+		# (Android adds the same file further down, and CMake drops the repeat.)
+		if(X11_API OR WAYLAND_API OR ENABLE_LIBRETRO)
 			list(APPEND pcsx2GSSources GS/Renderers/OpenGL/GLContextEGL.cpp)
 			list(APPEND pcsx2GSHeaders GS/Renderers/OpenGL/GLContextEGL.h)
 		endif()
@@ -707,6 +839,7 @@ if(USE_VULKAN)
 		GS/Renderers/Vulkan/VKBuilders.cpp
 		GS/Renderers/Vulkan/VKLibretro.cpp
 		GS/Renderers/Vulkan/VKLoader.cpp
+		GS/DriverReport/GSDriverReportVulkan.cpp
 		GS/Renderers/Vulkan/VKShaderCache.cpp
 		GS/Renderers/Vulkan/VKStreamBuffer.cpp
 		GS/Renderers/Vulkan/VKSwapChain.cpp
@@ -801,14 +934,21 @@ if(USE_VULKAN)
 		target_link_libraries(PCSX2_FLAGS INTERFACE Shaderc::shaderc_shared)
 	endif()
 
-	# Off Android the shader compiler is dlopened, which means the core needs a
+	# Off Android the shader compiler is dlopened, which means the binary needs a
 	# shaderc on the machine it is run on - and on a machine without one the
 	# Vulkan renderer fails to build a pipeline and the frontend gets a black
 	# screen. Where the static archive was found, link it and call it directly:
-	# then the core carries its own. A shared library is deliberately not linked
-	# here, since a hard dependency would stop the core loading at all for
+	# then the binary carries its own. A shared library is deliberately not
+	# linked here, since a hard dependency would stop it loading at all for
 	# someone who is happily using the OpenGL renderer.
-	if(ENABLE_LIBRETRO AND NOT ANDROID AND TARGET Shaderc::shaderc_shared
+	#
+	# Finding the archive is the whole condition; the frontend is not part of it.
+	# The libretro core was simply the first thing to travel to a machine we know
+	# nothing about, and the SDL handheld tarball does exactly the same - it too
+	# would otherwise dlopen a shaderc that its own dependency set no longer
+	# builds. Every build against a shared shaderc is unaffected, because then
+	# this does not match.
+	if(NOT ANDROID AND TARGET Shaderc::shaderc_shared
 			AND SHADERC_LIBRARY MATCHES "shaderc_combined")
 		target_link_libraries(PCSX2_FLAGS INTERFACE Shaderc::shaderc_shared)
 		target_compile_definitions(PCSX2_FLAGS INTERFACE ARMSX2_LINK_SHADERC)
@@ -874,7 +1014,11 @@ elseif(LINUX)
 	list(APPEND pcsx2USBHeaders
 		USB/usb-eyetoy/cam-linux.h
 	)
-elseif(APPLE)
+elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+	# cam-macos.mm asks AVCaptureDeviceDiscoverySession for
+	# AVCaptureDeviceTypeExternalUnknown, which is marked unavailable on tvOS.
+	# There it takes the same no-op backend as every other platform without a
+	# camera; iOS keeps the one it always had.
 	list(APPEND pcsx2USBSources
 		USB/usb-eyetoy/cam-macos.mm
 	)
@@ -1001,19 +1145,32 @@ set(pcsx2HostHeaders
 
 set(pcsx2ImGuiSources
 	ImGui/FullscreenUI.cpp
+	ImGui/FullscreenUI_Drivers.cpp
+	ImGui/FullscreenUI_OnlinePatches.cpp
+	ImGui/FullscreenUI_Packs.cpp
+	ImGui/FullscreenUI_Saves.cpp
+	ImGui/FullscreenUI_Arcade.cpp
 	ImGui/FullscreenUI_Settings.cpp
+	ImGui/FullscreenUI_TexturePacks.cpp
+	ImGui/FullscreenUIShot.cpp
 	ImGui/ImGuiFullscreen.cpp
+	ImGui/ImGuiFullscreen_Keyboard.cpp
 	ImGui/ImGuiManager.cpp
 	ImGui/ImGuiOverlays.cpp
+	ImGui/OnScreenKeyboardModel.cpp
 )
 
 set(pcsx2ImGuiHeaders
 	ImGui/FullscreenUI.h
 	ImGui/FullscreenUI_Internal.h
+	ImGui/FullscreenUI_PageDwell.h
+	ImGui/FullscreenUIShot.h
 	ImGui/ImGuiAnimated.h
 	ImGui/ImGuiFullscreen.h
+	ImGui/ImGuiFullscreen_Keyboard.h
 	ImGui/ImGuiManager.h
 	ImGui/ImGuiOverlays.h
+	ImGui/OnScreenKeyboardModel.h
 )
 
 set(pcsx2InputSources
@@ -1027,6 +1184,66 @@ set(pcsx2InputHeaders
 	Input/InputSource.h
 	Input/SDLInputSource.h
 )
+
+# Catalog: the online services (texture packs, covers, driver packs, patches, memory-card
+# backups, arcade setup) written once for the Qt and Big Picture UIs. New Catalog files go in
+# these two lists; the HTTP transport at the end picks the one backend for this platform.
+set(pcsx2CatalogSources
+	Catalog/CoverAutoDownload.cpp
+	Catalog/CoverDownloadJob.cpp
+	Catalog/CoverSources.cpp
+	Catalog/DriverPacks.cpp
+	Catalog/FileUtil.cpp
+	Catalog/HttpFetcher.cpp
+	Catalog/Json.cpp
+	Catalog/LocalLinkSettings.cpp
+	Catalog/PatchRepo.cpp
+	Catalog/PnachText.cpp
+	Catalog/ResponseCache.cpp
+	Catalog/TarGz.cpp
+	Catalog/TarZstdExtractor.cpp
+	Catalog/TextureArchivePath.cpp
+	Catalog/TexturePackCatalog.cpp
+	Catalog/TexturePackEngine.cpp
+	Catalog/TexturePackInstaller.cpp
+	Catalog/TexturePackState.cpp
+	Catalog/ZipTextureExtractor.cpp
+)
+set(pcsx2CatalogHeaders
+	Catalog/BlockingAnswer.h
+	Catalog/CancelToken.h
+	Catalog/CoverAutoDownload.h
+	Catalog/CoverDownloadJob.h
+	Catalog/CoverSources.h
+	Catalog/DriverPacks.h
+	Catalog/Fetch.h
+	Catalog/FileOps.h
+	Catalog/FileUtil.h
+	Catalog/HttpFetcher.h
+	Catalog/Json.h
+	Catalog/LocalLinkSettings.h
+	Catalog/PatchRepo.h
+	Catalog/PnachText.h
+	Catalog/ResponseCache.h
+	Catalog/TarGz.h
+	Catalog/TarZstdExtractor.h
+	Catalog/TextureArchivePath.h
+	Catalog/TexturePackCatalog.h
+	Catalog/TexturePackEngine.h
+	Catalog/TexturePackInstaller.h
+	Catalog/TexturePackState.h
+	Catalog/ZipTextureExtractor.h
+)
+# Json.h exposes rapidjson types, so everything that includes it needs the include path.
+target_link_libraries(PCSX2_FLAGS INTERFACE rapidjson)
+if(WIN32)
+	list(APPEND pcsx2CatalogSources Catalog/HttpTransportWinHTTP.cpp)
+elseif(ANDROID OR IOS)
+	list(APPEND pcsx2CatalogSources Catalog/HttpTransportNone.cpp)
+else()
+	list(APPEND pcsx2CatalogSources Catalog/HttpTransportCurl.cpp)
+	target_link_libraries(PCSX2 PRIVATE CURL::libcurl)
+endif()
 
 if(APPLE)
 	list(APPEND pcsx2GSSources
@@ -1044,7 +1261,7 @@ if(APPLE)
 	)
 endif()
 
-if(WIN32)
+if(WIN32 AND ARCH_X86)
 	# RAIntegration is only supported on Windows.
 	target_compile_definitions(PCSX2_FLAGS INTERFACE ENABLE_RAINTEGRATION)
 	target_link_libraries(PCSX2_FLAGS INTERFACE rainterface)
@@ -1174,21 +1391,10 @@ set(pcsx2x86Sources
 # x86 headers
 set(pcsx2x86Headers
 	x86/BaseblockEx.h
-	x86/iCOP0.h
 	x86/iCore.h
-	x86/iFPU.h
-	x86/iMMI.h
 	x86/iR3000A.h
-	x86/iR5900Arit.h
-	x86/iR5900AritImm.h
-	x86/iR5900Branch.h
 	x86/iR5900.h
 	x86/iR5900Analysis.h
-	x86/iR5900Jump.h
-	x86/iR5900LoadStore.h
-	x86/iR5900Move.h
-	x86/iR5900MultDiv.h
-	x86/iR5900Shift.h
 	x86/microVU_Alloc.inl
 	x86/microVU_Analyze.inl
 	x86/microVU_Branch.inl
@@ -1215,6 +1421,7 @@ set(pcsx2x86Headers
 # ARM64
 set(pcsx2arm64Sources
 	arm64/AsmHelpers.cpp
+	arm64/FPU-divunit-arm64.cpp
 	arm64/iCore-arm64.cpp
 	arm64/iR3000A-arm64.cpp
 	arm64/iR3000Atables-arm64.cpp
@@ -1240,11 +1447,22 @@ set(pcsx2arm64Sources
 	arm64/Vif_UnpackNEON.cpp
 	arm64/RecStubs.cpp
 	arm64/microVU-arm64.cpp
+	arm64/vuaot/VuAotBackground.cpp
+	arm64/vuaot/VuAotDecode.cpp
+	arm64/vuaot/VuAotGraph.cpp
+	arm64/vuaot/VuAotIR.cpp
+	arm64/vuaot/VuAotLower.cpp
+	arm64/vuaot/VuAotMvuTrace.cpp
+	arm64/vuaot/VuAotPersist.cpp
+	arm64/vuaot/VuAotPipe.cpp
+	arm64/vuaot/VuAotTier.cpp
+	arm64/vuaot/VuAotRegion.cpp
 	x86/iR5900Analysis.cpp  # arch-neutral EE instruction-liveness analysis, shared with the x86 build
 	)
 
 set(pcsx2arm64Headers
 	arm64/AsmHelpers.h
+	arm64/FPU-divunit-arm64.h
 	arm64/iCore-arm64.h
 	arm64/iR3000A-arm64.h
 	arm64/iR5900-arm64.h
@@ -1254,15 +1472,32 @@ set(pcsx2arm64Headers
 	arm64/microVU_Persist-arm64.inl
 	arm64/microVU_ProgCache-arm64.h
 	arm64/microVU_ProgCache-arm64.inl
+	arm64/vuaot/microVU_VuAot-arm64.inl
 	arm64/microVU_Misc-arm64.h
 	arm64/VuFmacFlags-arm64.h
+	arm64/vuaot/VuAotBackground.h
+	arm64/vuaot/VuAotDecode.h
+	arm64/vuaot/VuAotPersist.h
+	arm64/vuaot/VuAotGraph.h
+	arm64/vuaot/VuAotIR.h
+	arm64/vuaot/VuAotLive.h
+	arm64/vuaot/VuAotLower.h
+	arm64/vuaot/VuAotMvuTrace.h
+	arm64/vuaot/VuAotPipe.h
+	arm64/vuaot/VuAotTier.h
+	arm64/vuaot/VuAotRegion.h
 )
 
 # Mobile (arm64) platform sources, relocated from the former android/iOS core
 # forks (refresh-experimental / iOS-refresh). Source wiring only: real NDK /
 # Xcode builds are required to validate include paths and link deps.
 # See REFACTOR_STATUS.md.
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+# tvOS is the same platform as far as this build is concerned: no libpcap, no
+# OpenGL, Metal for the GS, and the same Apple embedded rules about what a
+# process may map and load. The buildbot's templates already pass -DIOS=ON for
+# both, so the `NOT IOS` guards elsewhere cover tvOS; this is the other half of
+# that, and without it a tvOS link is short the PCAPAdapter stubs.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "tvOS")
 	set(ARMSX2_IOS TRUE)
 endif()
 
@@ -1329,6 +1564,16 @@ if(ARMSX2_IOS)
 		# iOS has no libpcap, so pcap_io.cpp is excluded above; reuse the (platform-
 		# agnostic) Android stub to supply the PCAPAdapter definitions DEV9 references.
 		Android/AndroidPcapStubs.cpp)
+	# MacOSStubs.cpp excludes itself on the embedded platforms (it is
+	# !TARGET_OS_IPHONE throughout), so what those need instead is here: the
+	# optical drive CDVDdiscReader names, the sound CocoaTools would have
+	# played, and the downloader there is no libcurl for. Only for a core: the
+	# iOS app answers for all of it in its own IOS/HostImpls.mm, and two
+	# definitions of each is a duplicate symbol at link.
+	if(ENABLE_LIBRETRO)
+		list(APPEND pcsx2Sources
+			Apple/AppleEmbeddedStubs.cpp)
+	endif()
 endif()
 
 # These ones benefit a lot from LTO
@@ -1470,6 +1715,70 @@ if(ARMSX2_EMBED_RESOURCES)
 	target_compile_definitions(PCSX2_FLAGS INTERFACE ARMSX2_EMBEDDED_RESOURCES)
 endif()
 
+# The GS caches' build identity: a hash of the GS code and the shader sources (see
+# cmake/GSCacheBuildId.cmake). Source files only, by extension, and never a dotfile or a symlink, so
+# editor backups and lock files cannot change it. An edit to a listed file reruns the hash through
+# DEPENDS. A file added or removed changes its directory's modification time, and the directories are
+# configure dependencies, so CMake reruns and the list follows; this keeps a dry run clean, which a
+# CONFIGURE_DEPENDS glob does not. The list goes through a file for the same reason as the embedded
+# resources' list.
+set(ARMSX2_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+set(ARMSX2_GS_CACHE_ID_EXTENSIONS cpp c h hpp inl mm glsl hlsl fx metal)
+set(ARMSX2_GS_CACHE_ID_INPUTS "")
+set(ARMSX2_GS_CACHE_ID_DIRS "")
+foreach(root IN ITEMS "${ARMSX2_REPO_ROOT}/pcsx2/GS" "${ARMSX2_REPO_ROOT}/bin/resources/shaders")
+	file(GLOB_RECURSE entries LIST_DIRECTORIES true "${root}/*")
+	list(APPEND ARMSX2_GS_CACHE_ID_DIRS "${root}")
+	foreach(f IN LISTS entries)
+		get_filename_component(name "${f}" NAME)
+		if(IS_SYMLINK "${f}" OR name MATCHES "^\\.")
+			continue()
+		endif()
+		if(IS_DIRECTORY "${f}")
+			list(APPEND ARMSX2_GS_CACHE_ID_DIRS "${f}")
+			continue()
+		endif()
+		get_filename_component(ext "${f}" LAST_EXT)
+		string(REGEX REPLACE "^\\." "" ext "${ext}")
+		if(ext IN_LIST ARMSX2_GS_CACHE_ID_EXTENSIONS)
+			list(APPEND ARMSX2_GS_CACHE_ID_INPUTS "${f}")
+		endif()
+	endforeach()
+endforeach()
+list(APPEND ARMSX2_GS_CACHE_ID_INPUTS "${ARMSX2_REPO_ROOT}/pcsx2/ShaderCacheVersion.h")
+list(SORT ARMSX2_GS_CACHE_ID_INPUTS)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ARMSX2_GS_CACHE_ID_DIRS})
+set(ARMSX2_GS_CACHE_ID_REL "")
+foreach(f IN LISTS ARMSX2_GS_CACHE_ID_INPUTS)
+	file(RELATIVE_PATH rel "${ARMSX2_REPO_ROOT}" "${f}")
+	string(APPEND ARMSX2_GS_CACHE_ID_REL "${rel}\n")
+endforeach()
+set(ARMSX2_GS_CACHE_ID_DIR "${CMAKE_CURRENT_BINARY_DIR}/gs_cache_id")
+# Rewritten only when the list changes, so a reconfigure does not rehash for nothing.
+set(ARMSX2_GS_CACHE_ID_OLD "")
+if(EXISTS "${ARMSX2_GS_CACHE_ID_DIR}/inputs.list")
+	file(READ "${ARMSX2_GS_CACHE_ID_DIR}/inputs.list" ARMSX2_GS_CACHE_ID_OLD)
+endif()
+if(NOT ARMSX2_GS_CACHE_ID_OLD STREQUAL ARMSX2_GS_CACHE_ID_REL)
+	file(WRITE "${ARMSX2_GS_CACHE_ID_DIR}/inputs.list" "${ARMSX2_GS_CACHE_ID_REL}")
+endif()
+add_custom_command(
+	OUTPUT "${ARMSX2_GS_CACHE_ID_DIR}/gs_cache_build_id.h"
+	COMMAND ${CMAKE_COMMAND}
+		-DOUT=${ARMSX2_GS_CACHE_ID_DIR}/gs_cache_build_id.h
+		-DROOT=${ARMSX2_REPO_ROOT}
+		-DLIST=${ARMSX2_GS_CACHE_ID_DIR}/inputs.list
+		-P "${ARMSX2_REPO_ROOT}/cmake/GSCacheBuildId.cmake"
+	DEPENDS ${ARMSX2_GS_CACHE_ID_INPUTS}
+		"${ARMSX2_GS_CACHE_ID_DIR}/inputs.list"
+		"${ARMSX2_REPO_ROOT}/cmake/GSCacheBuildId.cmake"
+	COMMENT "Hashing the GS sources for the shader cache identity"
+	VERBATIM)
+target_sources(PCSX2 PRIVATE "${ARMSX2_GS_CACHE_ID_DIR}/gs_cache_build_id.h")
+set_source_files_properties(GS/GSCacheFile.cpp PROPERTIES
+	OBJECT_DEPENDS "${ARMSX2_GS_CACHE_ID_DIR}/gs_cache_build_id.h"
+	INCLUDE_DIRECTORIES "${ARMSX2_GS_CACHE_ID_DIR}")
+
 # common Sources
 target_sources(PCSX2 PRIVATE
 	${pcsx2CDVDSources}
@@ -1487,6 +1796,8 @@ target_sources(PCSX2 PRIVATE
 	${pcsx2ImGuiHeaders}
 	${pcsx2InputSources}
 	${pcsx2InputHeaders}
+	${pcsx2CatalogSources}
+	${pcsx2CatalogHeaders}
 	${pcsx2ps2Sources}
 	${pcsx2ps2Headers}
 )
@@ -1512,9 +1823,10 @@ endif()
 target_sources(PCSX2 PRIVATE ${pcsx2USBSources} ${pcsx2USBHeaders})
 
 if(APPLE OR BSD)
-	# Disc sources use IOKit, which doesn't exist on iOS.
-	if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-		# No disc support on iOS.
+	# Disc sources use IOKit, which exists on neither iOS nor tvOS.
+	if(ARMSX2_IOS)
+		# No disc support there; Apple/AppleEmbeddedStubs.cpp answers for what
+		# CDVDdiscReader names.
 	elseif(APPLE)
 		target_sources(PCSX2 PRIVATE
 			${pcsx2OSXSources})
@@ -1557,6 +1869,7 @@ target_link_libraries(PCSX2_FLAGS INTERFACE
 if(WIN32)
 	target_link_libraries(PCSX2_FLAGS INTERFACE
 		WIL::WIL
+		WinPixEventRuntime::WinPixEventRuntime
 		D3D12MemAlloc
 		setupapi.lib
 		ws2_32.lib
@@ -1568,6 +1881,7 @@ if(WIN32)
 		hid.lib
 		PowrProf.lib
 		d3dcompiler.lib
+		dxcompiler.lib
 		d3d11.lib
 		d3d12.lib
 		dxgi.lib
@@ -1622,6 +1936,13 @@ set_source_files_properties(PrecompiledHeader.cpp PROPERTIES HEADER_FILE_ONLY TR
 if(NOT MSVC)
 	set_source_files_properties(VUops.cpp FPU.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 endif()
+
+# The RAISR upscaler's scalar and NEON paths must round identically, so the only fused
+# multiply-adds are the ones it writes out (MulAdd / vfmaq). GSTextureUpscaler.cpp says so with a
+# pragma on clang; this covers GCC.
+if(NOT MSVC)
+	set_source_files_properties(GS/Renderers/HW/GSTextureUpscaler.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 if(COMMAND target_precompile_headers)
 	message("Using precompiled headers.")
 	target_precompile_headers(PCSX2_FLAGS INTERFACE PrecompiledHeader.h)
@@ -1652,7 +1973,7 @@ function(pcsx2_copy_runtime_resources target)
 		if("${file}" MATCHES "^\\.") # Don't copy macOS garbage (mainly Finder's .DS_Store files) into application
 			continue()
 		endif()
-		if (NOT WIN32 AND "${path}" MATCHES "/dx11/") # Don't include unneccessary stuff
+		if (NOT WIN32 AND "${path}" MATCHES "/dx11/") # Don't include unnecessary stuff
 			continue()
 		endif()
 		if (NOT BUNDLE_EMOJI_FONT AND "${path}" MATCHES "fonts/Twemoji")
@@ -1698,8 +2019,8 @@ fixup_file_properties(PCSX2)
 force_include_last(PCSX2_FLAGS "/(usr|local)/include/?$")
 
 if (APPLE)
-	if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-		# AppKit and IOKit are macOS-only; iOS links the rest at the app target.
+	if(NOT ARMSX2_IOS)
+		# AppKit and IOKit are macOS-only.
 		find_library(APPKIT_LIBRARY AppKit)
 		find_library(IOKIT_LIBRARY IOKit)
 		find_library(METAL_LIBRARY Metal)
@@ -1714,11 +2035,33 @@ if (APPLE)
 			${AVFOUNDATION_LIBRARY}
 			${COREMEDIA_LIBRARY}
 		)
+	elseif(ENABLE_LIBRETRO)
+		# The iOS app links these at its own target, so PCSX2 never had to -
+		# but a libretro core is the final link itself, and the Metal renderer
+		# it carries names MTLCreateSystemDefaultDevice and CAMetalLayer. The
+		# two macOS-only frameworks above stay out.
+		find_library(METAL_LIBRARY Metal)
+		find_library(QUARTZCORE_LIBRARY QuartzCore)
+		find_library(AVFOUNDATION_LIBRARY AVFoundation)
+		find_library(COREMEDIA_LIBRARY CoreMedia)
+		target_link_libraries(PCSX2_FLAGS INTERFACE
+			${METAL_LIBRARY}
+			${QUARTZCORE_LIBRARY}
+			${AVFOUNDATION_LIBRARY}
+			${COREMEDIA_LIBRARY}
+		)
 	endif()
-	# Weak-link MetalFX so older OS versions still load. Skip on the iOS simulator:
-	# MetalFX.framework isn't in the iphonesimulator SDK (see PCSX2_HAS_METALFX in
-	# GSDeviceMTL.h), so linking it there fails with "framework not found".
-	if(ARMSX2_REAL_DEVICE OR NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+	# Weak-link MetalFX so older OS versions still load. Skip it where the SDK
+	# does not carry the framework at all - the iOS simulator and tvOS (see
+	# PCSX2_HAS_METALFX in GSDeviceMTL.h) - because linking it there fails with
+	# "framework not found".
+	#
+	# ARMSX2_REAL_DEVICE is the iOS app's own switch and nothing sets it for the
+	# libretro core, which is only ever built against a device SDK - and without
+	# the framework the link is short MTLFXSpatialScalerDescriptor, because the
+	# header is there and PCSX2_HAS_METALFX is 1.
+	if(NOT CMAKE_SYSTEM_NAME STREQUAL "tvOS"
+	   AND (ARMSX2_REAL_DEVICE OR ENABLE_LIBRETRO OR NOT CMAKE_SYSTEM_NAME STREQUAL "iOS"))
 		target_link_options(PCSX2_FLAGS INTERFACE "SHELL:-weak_framework MetalFX")
 	endif()
 endif()
@@ -1759,7 +2102,7 @@ function(setup_main_executable target)
 				break()
 			endif()
 		endforeach()
-		set(DEPS_TO_COPY freetype.dll harfbuzz.dll jpeg62.dll libpng16.dll libsharpyuv.dll libwebp.dll libwebpdemux.dll libwebpmux.dll lz4.dll SDL3.dll shaderc_shared.dll z.dll zstd.dll plutovg.dll plutosvg.dll ryml.dll)
+		set(DEPS_TO_COPY freetype.dll harfbuzz.dll jpeg62.dll libpng16.dll libsharpyuv.dll libwebp.dll libwebpdemux.dll libwebpmux.dll lz4.dll SDL3.dll shaderc_shared.dll z.dll zstd.dll plutovg.dll plutosvg.dll ryml.dll dxcompiler.dll)
 		set(DEPS_TO_COPY
 			$<IF:$<CONFIG:Debug>,kddockwidgets-qt6d.dll,kddockwidgets-qt6.dll>
 			${DEPS_TO_COPY}

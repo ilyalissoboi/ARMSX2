@@ -25,8 +25,8 @@ public:
 	};
 
 private:
-	u32 buttons = 0xffffffffu;
-	u8 whammy = Pad::ANALOG_NEUTRAL_POSITION;
+	SharedWord::Relaxed<u32> buttons{0xffffffffu};
+	SharedWord::Relaxed<u8> whammy{Pad::ANALOG_NEUTRAL_POSITION};
 	bool commandStage = false;
 	float whammyAxisScale = 1.0f; // Guitars only have 1 axis on the whammy bar.
 	float whammyDeadzone = 0.0f;
@@ -69,6 +69,7 @@ public:
 	void SetRawAnalogs(const std::tuple<u8, u8> left, const std::tuple<u8, u8> right) override;
 	void SetRawPressureButton(u32 index, const std::tuple<bool, u8> value) override;
 	void SetAxisScale(float deadzone, float scale) override;
+	void SetDiagonalScaleCorrection(bool enabled) override;
 	float GetVibrationScale(u32 motor) const override;
 	void SetVibrationScale(u32 motor, float scale) override;
 	float GetPressureModifier() const override;

@@ -4,6 +4,7 @@
 #include "BuildVersion.h"
 #include "Config.h"
 #include "Counters.h"
+#include "EECycleRateSampler.h"
 #include "GS/GS.h"
 #include "GS/GSShaderCompileIndicator.h"
 #include "GS/GSVector.h"
@@ -21,6 +22,7 @@
 #include "ImGui/ImGuiManager.h"
 #include "ImGui/ImGuiOverlays.h"
 #include "Input/InputManager.h"
+#include "IopThread/IopThreadVm.h"
 #include "MTGS.h"
 #include "Patch.h"
 #include "PerformanceMetrics.h"
@@ -29,6 +31,8 @@
 #include "SIO/Pad/PadBase.h"
 #include "USB/USB.h"
 #include "VMManager.h"
+#include "DEV9/ACJV.h"
+#include "common/ARCADE.h"
 
 #include "common/BitUtils.h"
 #include "common/Error.h"
@@ -63,6 +67,8 @@ Common::Timer s_last_update_timer_cpu_info = Common::Timer(0.0);
 
 ImU32 s_speed_line_color;
 SmallString s_speed_line;
+// Device temperatures (Android), on a line of their own under the speed line.
+SmallString s_thermal_line;
 SmallString s_gs_stats_line;
 SmallString s_gs_memory_stats_line;
 SmallString s_gs_frame_times_line;
@@ -74,6 +80,9 @@ SmallString s_cpu_usage_ee_line;
 SmallString s_cpu_usage_gs_line;
 SmallString s_cpu_usage_gs_back_line;
 SmallString s_cpu_usage_vu_line;
+SmallString s_cpu_usage_iop_line;
+// Devel builds, Threaded mode: the IOP thread's waits and queues per frame (IOP thread design, step 11).
+SmallString s_iop_thread_line;
 std::vector<SmallString> s_software_thread_lines;
 SmallString s_gpu_usage_line;
 SmallString s_gpu_debug_info_line;
@@ -118,6 +127,7 @@ extern "C" const char* ARMSX2_iOSGetDeviceStatsOverlayLine();
 namespace GSLsfg
 {
 	std::string GetStatusText();
+	bool StatusIsProblem();
 }
 #endif
 
@@ -130,6 +140,16 @@ static std::string LsfgStatusText()
 	return GSLsfg::GetStatusText();
 #else
 	return {};
+#endif
+}
+
+/// Frame generation is on and something is wrong with it; see GSLsfg::StatusIsProblem.
+static bool LsfgStatusIsProblem()
+{
+#ifdef ENABLE_VULKAN
+	return GSLsfg::StatusIsProblem();
+#else
+	return false;
 #endif
 }
 
@@ -238,33 +258,8 @@ namespace ImGuiManager
 	static void DrawInputRecordingOverlay(float& position_y, float scale, float margin, float spacing);
 	static void DrawTextureReplacementsOverlay(float& position_y, float scale, float margin, float spacing);
 	static void DrawIndicatorsOverlay(float& position_y, float scale, float margin, float spacing);
+	static void DrawArcadeGunCrosshairs(float scale);
 } // namespace ImGuiManager
-
-static std::tuple<float, float> GetMinMax(std::span<const float> values)
-{
-	GSVector4 vmin(GSVector4::load<false>(values.data()));
-	GSVector4 vmax(vmin);
-
-	const u32 count = static_cast<u32>(values.size());
-	const u32 aligned_count = Common::AlignDownPow2(count, 4);
-	u32 i = 4;
-	for (; i < aligned_count; i += 4)
-	{
-		const GSVector4 v(GSVector4::load<false>(&values[i]));
-		vmin = vmin.min(v);
-		vmax = vmax.max(v);
-	}
-
-	float min = std::min(vmin.x, std::min(vmin.y, std::min(vmin.z, vmin.w)));
-	float max = std::max(vmax.x, std::max(vmax.y, std::max(vmax.z, vmax.w)));
-	for (; i < count; i++)
-	{
-		min = std::min(min, values[i]);
-		max = std::max(max, values[i]);
-	}
-
-	return std::tie(min, max);
-}
 
 __ri void ImGuiManager::FormatProcessorStat(SmallStringBase& text, double usage, double time)
 {
@@ -300,8 +295,14 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 	// reasons: it is driven by the LSFG setting and not by any OsdShow* flag, and the shrink-to-fit
 	// below keys off this word changing — sharing a bit would leave the block sized for the wrong
 	// set of lines the moment the LSFG line appeared or went away.
+	//
+	// The line comes with the rest of the performance overlay, so with the overlay off a healthy
+	// frame generation shows nothing (it stayed on screen whatever the overlay said, and with it,
+	// ImGui always drew, which kept frame generation off the game's own image). A problem still
+	// shows on its own: "on but silent" can't be told from "on and broken".
 	const std::string lsfg_status = LsfgStatusText();
-	enabled_lines |= static_cast<u32>(!lsfg_status.empty()) << 12;
+	const bool lsfg_line = !lsfg_status.empty() && (enabled_lines != 0 || LsfgStatusIsProblem());
+	enabled_lines |= static_cast<u32>(lsfg_line) << 12;
 	if (enabled_lines == 0)
 		return;
 
@@ -485,6 +486,7 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 			const float speed = PerformanceMetrics::GetSpeed();
 
 			s_speed_line.clear();
+			s_thermal_line.clear();
 
 #if defined(__ANDROID__)
 			if (const u32 skip = GSGetManualFrameSkip(); skip > 0)
@@ -501,12 +503,14 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				const float cpu_t = Armsx2Thermals::cpu.load(std::memory_order_relaxed);
 				const float gpu_t = Armsx2Thermals::gpu.load(std::memory_order_relaxed);
 				const float bat_t = Armsx2Thermals::battery.load(std::memory_order_relaxed);
+				// Their own line (drawn after the speed line): appended to the speed line they ran
+				// straight into the FPS readout, "BAT 38°FPS: 60.00" (Ladi Altera, Cotcho).
 				if (cpu_t > ARMSX2_THERMAL_NONE)
-					s_speed_line.append_format("{}CPU {:.0f}\xc2\xb0", s_speed_line.empty() ? "" : " | ", cpu_t);
+					s_thermal_line.append_format("{}CPU {:.0f}\xc2\xb0", s_thermal_line.empty() ? "" : " | ", cpu_t);
 				if (gpu_t > ARMSX2_THERMAL_NONE)
-					s_speed_line.append_format("{}GPU {:.0f}\xc2\xb0", s_speed_line.empty() ? "" : " | ", gpu_t);
+					s_thermal_line.append_format("{}GPU {:.0f}\xc2\xb0", s_thermal_line.empty() ? "" : " | ", gpu_t);
 				if (bat_t > ARMSX2_THERMAL_NONE)
-					s_speed_line.append_format("{}BAT {:.0f}\xc2\xb0", s_speed_line.empty() ? "" : " | ", bat_t);
+					s_thermal_line.append_format("{}BAT {:.0f}\xc2\xb0", s_thermal_line.empty() ? "" : " | ", bat_t);
 			}
 #endif
 
@@ -515,16 +519,16 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				switch (PerformanceMetrics::GetInternalFPSMethod())
 				{
 					case PerformanceMetrics::InternalFPSMethod::GSPrivilegedRegister:
-						s_speed_line.append_format("FPS: {:.2f} [P]", PerformanceMetrics::GetInternalFPS());
+						s_speed_line.append_format("{}FPS: {:.2f} [P]", s_speed_line.empty() ? "" : " | ", PerformanceMetrics::GetInternalFPS());
 						break;
 
 					case PerformanceMetrics::InternalFPSMethod::DISPFBBlit:
-						s_speed_line.append_format("FPS: {:.2f} [B]", PerformanceMetrics::GetInternalFPS());
+						s_speed_line.append_format("{}FPS: {:.2f} [B]", s_speed_line.empty() ? "" : " | ", PerformanceMetrics::GetInternalFPS());
 						break;
 
 					case PerformanceMetrics::InternalFPSMethod::None:
 					default:
-						s_speed_line.append("FPS: N/A");
+						s_speed_line.append_format("{}FPS: N/A", s_speed_line.empty() ? "" : " | ");
 						break;
 				}
 
@@ -541,7 +545,7 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 			}
 
 			if (GSConfig.OsdShowVPS)
-				s_speed_line.append_format("{}VPS: {:.2f}", s_speed_line.empty() ? "" : " | ", PerformanceMetrics::GetFPS());
+				s_speed_line.append_format("{}VPS: {:.2f} (Avg. {:.2f})", s_speed_line.empty() ? "" : " | ", PerformanceMetrics::GetFPS(), PerformanceMetrics::GetAvgVPS());
 
 			if (GSConfig.OsdShowSpeed)
 			{
@@ -573,7 +577,7 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				s_speed_line.append_format("{}ARMSX2 " ARMSX2_IOS_OSD_VERSION " | Core: {}",
 					s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 #elif defined(__ANDROID__)
-				s_speed_line.append_format("{}ARMSX2 2.7", s_speed_line.empty() ? "" : " | ");
+				s_speed_line.append_format("{}ARMSX2 2.8", s_speed_line.empty() ? "" : " | ");
 #else
 				s_speed_line.append_format("{}PCSX2 {}", s_speed_line.empty() ? "" : " | ", BuildVersion::GitRev);
 #endif
@@ -595,6 +599,9 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 			// user comparing "the game runs at 30" with "the screen gets 60" wants them adjacent.
 			if (!s_lsfg_line.empty())
 				DRAW_LINE(osd_font, font_size, s_lsfg_line.c_str(), OsdTextColor());
+
+			if (!s_thermal_line.empty())
+				DRAW_LINE(osd_font, font_size, s_thermal_line.c_str(), OsdTextColor());
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 			if (ARMSX2_iOSShouldShowDeviceStatsOverlay())
@@ -686,10 +693,30 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				DRAW_LINE(osd_font, font_size, s_cpu_jit_line.c_str(), OsdTextColor());
 #endif
 
-				if (EmuConfig.Speedhacks.EECycleRate != 0 || EmuConfig.Speedhacks.EECycleSkip != 0)
+				// The governor's published word is the only governor state this thread reads.
+				// When it is not running the word says so and the configured settings answer,
+				// which is what this line has always shown.
+				const EECycleRateSampler::OverlayState ee_rate =
+					EECycleRateSampler::UnpackOverlayWord(EECycleRateSampler::GetOverlayWord());
+				const bool ee_rate_dynamic = ee_rate.enabled || ee_rate.shadow;
+
+				if (ee_rate_dynamic && ee_rate.effective != ee_rate.configured)
+				{
+					s_cpu_usage_ee_line.format("EE[{}->{}/{}]: ", ee_rate.configured, ee_rate.effective,
+						EmuConfig.Speedhacks.EECycleSkip);
+				}
+				else if (ee_rate_dynamic)
+				{
+					s_cpu_usage_ee_line.format("EE[{}~/{}]: ", ee_rate.configured, EmuConfig.Speedhacks.EECycleSkip);
+				}
+				else if (EmuConfig.Speedhacks.EECycleRate != 0 || EmuConfig.Speedhacks.EECycleSkip != 0)
+				{
 					s_cpu_usage_ee_line.format("EE[{}/{}]: ", EmuConfig.Speedhacks.EECycleRate, EmuConfig.Speedhacks.EECycleSkip);
+				}
 				else
+				{
 					s_cpu_usage_ee_line.assign("EE: ");
+				}
 				FormatProcessorStat(s_cpu_usage_ee_line, PerformanceMetrics::GetCPUThreadUsage(), PerformanceMetrics::GetCPUThreadAverageTime());
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_ee_line.c_str(), OsdTextColor());
 
@@ -697,7 +724,7 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 				FormatProcessorStat(s_cpu_usage_gs_line, PerformanceMetrics::GetGSThreadUsage(), PerformanceMetrics::GetGSThreadAverageTime());
 				DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_line.c_str(), OsdTextColor());
 
-				// Only exists under GSBackThreadMode >= Lockstep. The line above is the MTGS
+				// Only exists with GS multi-threading on. The line above is the MTGS
 				// thread alone, so without this one the split's second half is invisible.
 				if (PerformanceMetrics::HasGSBackThread())
 				{
@@ -713,6 +740,24 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					FormatProcessorStat(s_cpu_usage_vu_line, PerformanceMetrics::GetVUThreadUsage(), PerformanceMetrics::GetVUThreadAverageTime());
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_vu_line.c_str(), OsdTextColor());
 				}
+
+				// Only exists while the IOP runs on its own thread beside the EE. The EE line above no longer
+				// includes the IOP's work then, so without this one that work is invisible.
+				if (PerformanceMetrics::HasIOPThread())
+				{
+					s_cpu_usage_iop_line.assign("IOP: ");
+					FormatProcessorStat(s_cpu_usage_iop_line, PerformanceMetrics::GetIOPThreadUsage(), PerformanceMetrics::GetIOPThreadAverageTime());
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_iop_line.c_str(), OsdTextColor());
+				}
+
+#if defined(PCSX2_DEVBUILD) || defined(PCSX2_DEBUG)
+				{
+					const std::string iop_stats = IopThread::OsdStatsLine();
+					s_iop_thread_line.assign(iop_stats.c_str());
+					if (!iop_stats.empty())
+						DRAW_LINE(osd_font, font_size, s_iop_thread_line.c_str(), OsdTextColor());
+				}
+#endif
 
 				const u32 gs_sw_threads = PerformanceMetrics::GetGSSWThreadCount();
 				for (u32 thread = 0; thread < gs_sw_threads; thread++)
@@ -776,6 +821,9 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 			if (!s_lsfg_line.empty())
 				DRAW_LINE(osd_font, font_size, s_lsfg_line.c_str(), OsdTextColor());
 
+			if (!s_thermal_line.empty())
+				DRAW_LINE(osd_font, font_size, s_thermal_line.c_str(), OsdTextColor());
+
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 			if (ARMSX2_iOSShouldShowDeviceStatsOverlay() && !s_ios_device_stats_line.empty())
 				DRAW_LINE(osd_font, font_size, s_ios_device_stats_line.c_str(), ARMSX2IOSDeviceStatsColor());
@@ -811,6 +859,14 @@ __ri void ImGuiManager::DrawPerformanceOverlay(float& position_y, float scale, f
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_gs_back_line.c_str(), OsdTextColor());
 				if (THREAD_VU1)
 					DRAW_LINE(osd_font, font_size, s_cpu_usage_vu_line.c_str(), OsdTextColor());
+				// The frames between two refreshes of the figures draw the text of the last refresh. The IOP line is
+				// formatted where the others are, so without this it showed on the refresh frames only.
+				if (PerformanceMetrics::HasIOPThread())
+					DRAW_LINE(osd_font, font_size, s_cpu_usage_iop_line.c_str(), OsdTextColor());
+#if defined(PCSX2_DEVBUILD) || defined(PCSX2_DEBUG)
+				if (!s_iop_thread_line.empty())
+					DRAW_LINE(osd_font, font_size, s_iop_thread_line.c_str(), OsdTextColor());
+#endif
 
 				const u32 thread_count = std::min(
 					PerformanceMetrics::GetGSSWThreadCount(),
@@ -1164,7 +1220,11 @@ __ri void ImGuiManager::DrawSettingsOverlay(float scale, float margin, float bot
 			Patch::GetActivePatchesCount(),
 			Patch::GetActiveCheatsCount());
 
-	if (EmuConfig.Speedhacks.EECycleRate != 0)
+	const EECycleRateSampler::OverlayState ee_rate =
+		EECycleRateSampler::UnpackOverlayWord(EECycleRateSampler::GetOverlayWord());
+	if (ee_rate.enabled || ee_rate.shadow)
+		APPEND("CR={}->{} ", ee_rate.configured, ee_rate.effective);
+	else if (EmuConfig.Speedhacks.EECycleRate != 0)
 		APPEND("CR={} ", EmuConfig.Speedhacks.EECycleRate);
 	if (EmuConfig.Speedhacks.EECycleSkip != 0)
 		APPEND("CS={} ", EmuConfig.Speedhacks.EECycleSkip);
@@ -1176,6 +1236,8 @@ __ri void ImGuiManager::DrawSettingsOverlay(float scale, float margin, float bot
 		APPEND("MTVU ");
 	if (EmuConfig.GS.VsyncEnable)
 		APPEND("VSYNC ");
+	if (EmuConfig.GS.AdvancedFrameDisplay)
+		APPEND("AFD ");
 
 	APPEND("EER={} EEC={} VUR={} VUC={} VQS={} ", static_cast<unsigned>(EmuConfig.Cpu.FPUFPCR.GetRoundMode()),
 		EmuConfig.Cpu.Recompiler.GetEEClampMode(), static_cast<unsigned>(EmuConfig.Cpu.VU0FPCR.GetRoundMode()),
@@ -1269,7 +1331,7 @@ __ri void ImGuiManager::DrawSettingsOverlay(float scale, float margin, float bot
 			APPEND("ETR ");
 		if (GSConfig.UserHacks_DrawBuffering)
 			APPEND("DRWB ");
-		if (GSConfig.UserHacks_RewriteLargeST)
+		if (GSConfig.UserHacks_RewriteLargeSTCoords)
 			APPEND("RWST ");
 		if (GSConfig.HWSpinGPUForReadbacks)
 			APPEND("RBSG ");
@@ -1705,6 +1767,9 @@ void SaveStateSelectorUI::Close()
 
 void SaveStateSelectorUI::RefreshList(const std::string& serial, u32 crc)
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
+
 	for (ListEntry& entry : s_slots)
 	{
 		if (entry.preview_texture)
@@ -1724,6 +1789,7 @@ void SaveStateSelectorUI::Clear()
 		if (li.preview_texture)
 		{
 			MTGS::RunOnGSThread([tex = li.preview_texture.release()]() {
+				GSDrainBackQueue();
 				g_gs_device->Recycle(tex);
 			});
 		}
@@ -1736,6 +1802,8 @@ void SaveStateSelectorUI::Clear()
 
 void SaveStateSelectorUI::DestroyTextures()
 {
+	// Creates or releases device textures, whose pool the GS back thread also uses.
+	GSDrainBackQueue();
 	Close();
 
 	for (ListEntry& entry : s_slots)
@@ -2139,8 +2207,37 @@ void ImGuiManager::RenderOverlays()
 	DrawSettingsOverlay(scale, margin, bottom_margin, spacing);
 	DrawShaderCompileIndicator(scale, margin, bottom_margin, spacing);
 	DrawInputsOverlay(scale, margin, bottom_margin, spacing);
+	DrawArcadeGunCrosshairs(scale);
 	if (SaveStateSelectorUI::s_open)
 		SaveStateSelectorUI::Draw();
+}
+
+// An arcade light gun aimed with a stick has nothing on screen to show where it points (a finger on a
+// touchscreen, or a real gun, needs nothing): a crosshair per player, while that player's stick aims.
+void ImGuiManager::DrawArcadeGunCrosshairs(float scale)
+{
+	if (!Arcade::IsActive() || ACJV::GetMode() != JVS_MODE::LIGHTGUN)
+		return;
+
+	static constexpr ImU32 colors[2] = {IM_COL32(255, 72, 72, 230), IM_COL32(72, 160, 255, 230)};
+	ImDrawList* const dl = ImGui::GetBackgroundDrawList();
+	const float radius = 11.0f * scale;
+	const float thickness = std::max(2.0f * scale, 1.0f);
+	for (u32 player = 0; player < 2; player++)
+	{
+		float dx, dy;
+		if (!ACJV::GetGunStickAim(player, &dx, &dy))
+			continue;
+		float x, y;
+		GSTranslateDisplayToWindowCoordinates(dx, dy, &x, &y);
+		const ImVec2 c(x, y);
+		dl->AddCircle(c, radius, IM_COL32(0, 0, 0, 160), 0, thickness + 2.0f * scale);
+		dl->AddCircle(c, radius, colors[player], 0, thickness);
+		dl->AddLine(ImVec2(c.x - radius * 1.6f, c.y), ImVec2(c.x - radius * 0.5f, c.y), colors[player], thickness);
+		dl->AddLine(ImVec2(c.x + radius * 0.5f, c.y), ImVec2(c.x + radius * 1.6f, c.y), colors[player], thickness);
+		dl->AddLine(ImVec2(c.x, c.y - radius * 1.6f), ImVec2(c.x, c.y - radius * 0.5f), colors[player], thickness);
+		dl->AddLine(ImVec2(c.x, c.y + radius * 0.5f), ImVec2(c.x, c.y + radius * 1.6f), colors[player], thickness);
+	}
 }
 
 std::string SaveStateSelectorUI::GetSaveStateTimestampSummary(const std::time_t& modification_time)

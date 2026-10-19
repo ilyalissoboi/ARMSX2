@@ -76,7 +76,8 @@ enum GIF_REG_COMPLEX
 	GIF_REG_STQXYZ2 = 0x03,
 	GIF_REG_UVXYZ2 = 0x04,
 	GIF_REG_RGBAQXYZ2 = 0x05,
-	GIF_REG_COMPLEX_COUNT = 0x06,
+	GIF_REG_UVRGBAQXYZF2 = 0x06,
+	GIF_REG_COMPLEX_COUNT = 0x07,
 };
 
 enum GIF_A_D_REG
@@ -862,6 +863,13 @@ REG64_(GIFReg, TEX1)
 REG_END2
 	bool IsMinLinear() const { return (MMIN == 1) || (MMIN & 4); }
 	bool IsMagLinear() const { return MMAG; }
+
+	/// K in levels. The field is DECLARED SIGNED, so it arrives sign-extended and
+	/// needs nothing but the 1:7:4 scale. Code that sign-extends it a second time
+	/// (`(K ^ 0x800) - 0x800`) turns -32 into -4128 and reads -2 levels as -258,
+	/// which is how a draw with a live mip chain can be read as having an inert
+	/// one.
+	float KLevels() const { return static_cast<float>(K) / 16.0f; }
 REG_END2
 
 REG64_(GIFReg, TEX2)
@@ -1113,11 +1121,11 @@ REG_SET_END
 // Where a fused packed layout's descriptors sit inside one record, in qwords.
 // The two contiguous {ST, RGBAQ, XYZ} layouts never read it -- their stride and
 // offsets are compile-time 3 / 0 / 1 / 2 -- so SetTag only fills it in for the
-// NOP-padded and the two-register layouts.
+// NOP-padded, the UV-addressed and the two-register layouts.
 struct GIFPackedLayout
 {
 	u32 stride;
-	u32 off_a;    // ST for a triple; the pair's non-position descriptor otherwise
+	u32 off_a;    // ST or UV for a triple; the pair's non-position descriptor otherwise
 	u32 off_rgba; // triple only
 	u32 off_xyz;
 };
@@ -1158,6 +1166,9 @@ struct alignas(32) GIFPath
 		TYPE_STQXYZ2,
 		TYPE_UVXYZ2,
 		TYPE_RGBAQXYZ2,
+		// {UV, RGBAQ, XYZF2}, contiguous or NOP-padded: ST and the latched Q are
+		// carried, the UV and the colour come from the record.
+		TYPE_UVRGBAQXYZF2,
 	};
 
 	static_assert(TYPE_STQRGBAXYZF2 - TYPE_STQRGBAXYZF2 == GIF_REG_STQRGBAXYZF2);
@@ -1166,6 +1177,7 @@ struct alignas(32) GIFPath
 	static_assert(TYPE_STQXYZ2 - TYPE_STQRGBAXYZF2 == GIF_REG_STQXYZ2);
 	static_assert(TYPE_UVXYZ2 - TYPE_STQRGBAXYZF2 == GIF_REG_UVXYZ2);
 	static_assert(TYPE_RGBAQXYZ2 - TYPE_STQRGBAXYZF2 == GIF_REG_RGBAQXYZ2);
+	static_assert(TYPE_UVRGBAQXYZF2 - TYPE_STQRGBAXYZF2 == GIF_REG_UVRGBAQXYZF2);
 
 	__forceinline void SetTag(const void* mem)
 	{
@@ -1226,7 +1238,12 @@ struct alignas(32) GIFPath
 						// GoW (has other crazy formats, like ...030503050103)
 						if (regs.U32[0] == 0x00050102)
 							type = TYPE_STQRGBAXYZ2;
-						// TODO: common types with UV instead
+						// The same triple addressed by UV instead of ST.
+						if (regs.U32[0] == 0x00040103)
+						{
+							type = TYPE_UVRGBAQXYZF2;
+							layout = {3, 0, 1, 2};
+						}
 						break;
 					case 4:
 						// The pair repeated twice -- spiderman3's entire sprite

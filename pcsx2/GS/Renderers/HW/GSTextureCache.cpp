@@ -32,8 +32,216 @@ std::unique_ptr<GSTextureCache> g_texture_cache;
 
 static u8* s_unswizzle_buffer;
 
+namespace
+{
+	/// The texture level a hash pass expanded into s_unswizzle_buffer, so that PreloadTexture can upload it
+	/// without expanding it a second time. Every other writer of the buffer clears it, and it only matches while
+	/// local memory has not been written since the expansion.
+	struct UnswizzledLevel
+	{
+		bool valid = false;
+		bool palette = false; ///< Expanded to palette indices (rtxP) rather than colours (rtx).
+		u32 tbp0 = 0, tbw = 0, psm = 0;
+		u32 pitch = 0;
+		u64 texa = 0;
+		u64 write_seq = 0;
+		const GSLocalMemory* mem = nullptr;
+		GSVector4i block_rect = GSVector4i::zero();
+	};
+} // namespace
+
+static UnswizzledLevel s_unswizzled_level;
+
 /// List of candidates for purging when the hash cache gets too large.
 static std::vector<std::pair<GSTextureCache::HashCacheMap::iterator, s32>> s_hash_cache_purge_list;
+
+static GSTextureCache::HashCacheLimits s_hash_cache_limits;
+static GSTextureCache::HashCacheStats s_hash_cache_stats;
+
+void GSTextureCache::SetHashCacheLimits(const HashCacheLimits& limits)
+{
+	s_hash_cache_limits = limits;
+}
+
+GSTextureCache::HashCacheLimits GSTextureCache::GetHashCacheLimits()
+{
+	return s_hash_cache_limits;
+}
+
+GSTextureCache::HashCacheStats GSTextureCache::GetHashCacheStats()
+{
+	return s_hash_cache_stats;
+}
+
+// Verify mode of the hash memo (GSTextureCache::SetHashMemoVerify).
+static GSTextureCache::HashMemoVerifyReport s_hash_memo_verify_report;
+static constexpr u64 HASH_MEMO_VERIFY_PRINT_LIMIT = 20; // lines printed per kind of finding
+
+/// What the last sweep of verify mode saw of each page of local memory.
+struct GSTextureCache::HashMemoSweep
+{
+	u64 hash[GS_MAX_PAGES];
+	u64 stamp[GS_MAX_PAGES];
+	bool primed = false;
+};
+
+void GSTextureCache::SetHashMemoVerify(bool enable)
+{
+	s_hash_memo_verify = enable;
+	s_hash_memo_verify_report = {};
+}
+
+GSTextureCache::HashMemoVerifyReport GSTextureCache::GetHashMemoVerifyReport()
+{
+	return s_hash_memo_verify_report;
+}
+
+void GSTextureCache::VerifyWriteStamps(const GSLocalMemory& mem)
+{
+	if (!m_hash_memo_sweep)
+		m_hash_memo_sweep = std::make_unique<HashMemoSweep>();
+	HashMemoSweep& sweep = *m_hash_memo_sweep;
+
+	s_hash_memo_verify_report.sweeps++;
+	for (u32 page = 0; page < GS_MAX_PAGES; page++)
+	{
+		const u64 hash = GSXXH3_64bits(mem.m_vm8 + page * GS_PAGE_SIZE, GS_PAGE_SIZE);
+		const u64 stamp = mem.PageStamp(page);
+
+		// A mark always moves the stamp, so bytes that changed under the same stamp were stored unmarked.
+		if (sweep.primed && hash != sweep.hash[page] && stamp == sweep.stamp[page])
+		{
+			if (++s_hash_memo_verify_report.missed_writers <= HASH_MEMO_VERIFY_PRINT_LIMIT)
+				Console.Error("TC: hash memo MISSED WRITER: page %u changed with no mark (frame %u, stamp %" PRIu64 ")", page, static_cast<u32>(g_perfmon.GetFrame()), stamp);
+		}
+
+		sweep.hash[page] = hash;
+		sweep.stamp[page] = stamp;
+	}
+	sweep.primed = true;
+}
+
+// --- The per-block hash cache (GSTextureCache::SetBlockHashCacheEnabled) ------------------------------------
+
+struct GSTextureCache::BlockHashCache
+{
+	/// GSLocalMemory::Id() of the memory the hashes describe. 0, which no memory has, before the first use.
+	u32 mem_id = 0;
+	/// The hash of each block of local memory. Valid where the hash-dirty bit of the memory is clear.
+	std::unique_ptr<u64[]> hash{new u64[GS_MAX_BLOCKS]()};
+};
+
+static GSTextureCache::BlockHashStats s_block_hash_stats;
+static GSTextureCache::BlockHashVerifyReport s_block_hash_verify_report;
+static constexpr u64 BLOCK_HASH_VERIFY_PRINT_LIMIT = 20; // lines printed per kind of finding
+
+/// Levels keyed through the cache so far; a counter that HashCacheKey::Create reads before and after a key to
+/// tell whether the key used the cache at all.
+static u64 s_block_hash_levels_cached = 0;
+
+/// The block hashes of the level being keyed, in the order they are fed to the hash. A level is at most 1024
+/// texels each way, and the smallest block, of the 32-bit formats, is 8 x 8 texels; a window that starts away
+/// from a block edge reaches one block further each way. A level with more blocks than that is keyed without
+/// the cache (see HashTextureLevel), which no real level is.
+static constexpr u32 BLOCK_HASH_GATHER_MAX = (1024 / 8 + 1) * (1024 / 8 + 1);
+static u64 s_block_hash_gather[BLOCK_HASH_GATHER_MAX];
+
+/// What verify mode has seen of the keys of both forms: the key without the cache to the key with it, and back.
+/// Two lookups have the same window if and only if both maps keep one answer for the key.
+static std::unordered_map<GSTextureCache::HashCacheKey, u64, GSTextureCache::HashCacheKeyHash> s_block_hash_verify_forward;
+static std::unordered_map<GSTextureCache::HashCacheKey, u64, GSTextureCache::HashCacheKeyHash> s_block_hash_verify_reverse;
+
+void GSTextureCache::SetBlockHashVerify(bool enable)
+{
+	s_block_hash_verify = enable;
+	s_block_hash_verify_report = {};
+	s_block_hash_verify_forward.clear();
+	s_block_hash_verify_reverse.clear();
+}
+
+GSTextureCache::BlockHashVerifyReport GSTextureCache::GetBlockHashVerifyReport()
+{
+	return s_block_hash_verify_report;
+}
+
+GSTextureCache::BlockHashStats GSTextureCache::GetBlockHashStats()
+{
+	return s_block_hash_stats;
+}
+
+/// The hash of one block's 256 bytes.
+__fi static u64 HashOneBlock(const u8* block)
+{
+	return GSXXH3_64bits(block, GS_BLOCK_SIZE);
+}
+
+/// The cache, bound to `mem`: made at first use, and every hash invalid again if it described another memory.
+/// A memory made after the one the cache described has an id of its own, so this also catches a renderer that
+/// was replaced under a texture cache that was kept.
+GSTextureCache::BlockHashCache& GSTextureCache::SyncBlockHashCache(GSLocalMemory& mem)
+{
+	if (!m_block_hash_cache)
+		m_block_hash_cache = std::make_unique<BlockHashCache>();
+
+	BlockHashCache& cache = *m_block_hash_cache;
+	if (cache.mem_id != mem.Id())
+	{
+		mem.MarkAllHashDirty();
+		cache.mem_id = mem.Id();
+	}
+	return cache;
+}
+
+u64 GSTextureCache::BlockHash(GSLocalMemory& mem, u32 block)
+{
+	BlockHashCache& cache = SyncBlockHashCache(mem);
+	block %= GS_MAX_BLOCKS;
+	if (mem.TestAndClearHashDirty(block))
+		cache.hash[block] = HashOneBlock(mem.BlockPtr(block));
+	return cache.hash[block];
+}
+
+/// Verify mode, one lookup: the key the cache gave the window (`cached`, whose TEX0Hash is the cached form) and
+/// the hash it has without the cache. Checks that the two forms agree on which windows are one.
+static void VerifyBlockHashKey(const GSTextureCache::HashCacheKey& cached, u64 uncached_hash)
+{
+	GSTextureCache::BlockHashVerifyReport& report = s_block_hash_verify_report;
+	report.lookups++;
+
+	GSTextureCache::HashCacheKey uncached = cached;
+	uncached.TEX0Hash = uncached_hash;
+
+	// Two windows with one key without the cache must have one with it, or a hit is lost.
+	const auto forward = s_block_hash_verify_forward.emplace(uncached, cached.TEX0Hash);
+	if (!forward.second && forward.first->second != cached.TEX0Hash)
+	{
+		if (++report.extra_misses <= BLOCK_HASH_VERIFY_PRINT_LIMIT)
+			Console.Error("TC: block hash cache EXTRA MISS: tbp0 0x%x psm %u: one key without the cache, two with it", static_cast<u32>(cached.TEX0.TBP0), static_cast<u32>(cached.TEX0.PSM));
+	}
+
+	// Two windows with one key with the cache must have one without it, or a wrong texture is used.
+	const auto reverse = s_block_hash_verify_reverse.emplace(cached, uncached_hash);
+	if (!reverse.second && reverse.first->second != uncached_hash)
+	{
+		if (++report.false_hits <= BLOCK_HASH_VERIFY_PRINT_LIMIT)
+			Console.Error("TC: block hash cache FALSE HIT: tbp0 0x%x psm %u: one key with the cache, two without it", static_cast<u32>(cached.TEX0.TBP0), static_cast<u32>(cached.TEX0.PSM));
+	}
+}
+
+/// Counts a memo hit and compares its hash with the one computed afresh. False if they differ.
+static bool VerifyHashMemoHit(const GIFRegTEX0& TEX0, u64 memo, u64 fresh)
+{
+	s_hash_memo_verify_report.hits++;
+	if (memo == fresh)
+		return true;
+
+	if (++s_hash_memo_verify_report.mismatches <= HASH_MEMO_VERIFY_PRINT_LIMIT)
+	{
+		Console.Error("TC: hash memo MISMATCH: tbp0 0x%x psm %u tw %u th %u memo %016" PRIx64 " fresh %016" PRIx64,
+			static_cast<u32>(TEX0.TBP0), static_cast<u32>(TEX0.PSM), static_cast<u32>(TEX0.TW), static_cast<u32>(TEX0.TH), memo, fresh);
+	}
+	return false;
+}
 
 #ifdef PCSX2_DEVBUILD
 // We can only set one texture name per command buffer, which would break our fancy texture cache RT/DS/texture naming.
@@ -112,7 +320,11 @@ void GSTextureCache::RemoveAll(bool sources, bool targets, bool hash_cache)
 	if (hash_cache)
 	{
 		for (auto it : m_hash_cache)
+		{
 			g_gs_device->Recycle(it.second.texture);
+			if (it.second.native)
+				g_gs_device->Recycle(it.second.native);
+		}
 
 		m_hash_cache.clear();
 		m_hash_cache_memory_usage = 0;
@@ -2346,10 +2558,31 @@ GSTextureCache::Target* GSTextureCache::FindTargetOverlap(Target* target, int ty
 	return nullptr;
 }
 
+int GSTextureCache::ScaleNativeToDevice(int native, float scale)
+{
+	return static_cast<int>(std::ceil(static_cast<float>(native) * scale));
+}
+
+int GSTextureCache::ScaleNativeSpanToDevice(int start, int length, float scale)
+{
+	return ScaleNativeToDevice(start + length, scale) - ScaleNativeToDevice(start, scale);
+}
+
+GSTextureCache::DeviceMove GSTextureCache::ScaleMoveToDevice(int sx, int sy, int dx, int dy, int w, int h, float scale)
+{
+	const int scaled_sx = ScaleNativeToDevice(sx, scale);
+	const int scaled_sy = ScaleNativeToDevice(sy, scale);
+	const int scaled_dx = ScaleNativeToDevice(dx, scale);
+	const int scaled_dy = ScaleNativeToDevice(dy, scale);
+	const int scaled_w = std::min(ScaleNativeSpanToDevice(sx, w, scale), ScaleNativeSpanToDevice(dx, w, scale));
+	const int scaled_h = std::min(ScaleNativeSpanToDevice(sy, h, scale), ScaleNativeSpanToDevice(dy, h, scale));
+	return {GSVector4i(scaled_sx, scaled_sy, scaled_sx + scaled_w, scaled_sy + scaled_h),
+		GSVector4i(scaled_dx, scaled_dy, scaled_dx + scaled_w, scaled_dy + scaled_h)};
+}
+
 GSVector2i GSTextureCache::ScaleRenderTargetSize(const GSVector2i& sz, float scale)
 {
-	return GSVector2i(static_cast<int>(std::ceil(static_cast<float>(sz.x) * scale)),
-		static_cast<int>(std::ceil(static_cast<float>(sz.y) * scale)));
+	return GSVector2i(ScaleNativeToDevice(sz.x, scale), ScaleNativeToDevice(sz.y, scale));
 }
 
 void GSTextureCache::CombineAlignedInsideTargets(Target* target, GSTextureCache::Source* src)
@@ -3023,7 +3256,11 @@ GSTextureCache::Target* GSTextureCache::ProcessTargetAfterLookup(RescaleHelper& 
 		if (!tex)
 			return nullptr;
 
-		if (rescaler.m_scale == 1.0f && type == RenderTarget)
+		// Can't box filter a fractional scale: the shader steps the source by an integer number of
+		// texels per output pixel, so a truncated factor reads the wrong texel and, below 1x,
+		// truncates to a zero-wide box. Stretch those, the same way the draw's downscale-source
+		// copy does.
+		if (rescaler.m_scale == 1.0f && type == RenderTarget && std::floor(dst->GetScale()) == dst->GetScale())
 		{
 			// When using native HPO, the top-left column/row of pixels are often not drawn. Clamp these away to avoid sampling black,
 			// causing bleeding into the edges of the downsampled texture.
@@ -3303,10 +3540,17 @@ GSTextureCache::Target* GSTextureCache::ProcessTargetAfterLookup(RescaleHelper& 
 			}
 
 			// And invalidate the target, we're drawing over it so we don't care what's there.
-			// We can't do this when upscaling, because of the vertex offset, the top/left rows often aren't drawn.
+			// We can't do this when upscaling: the vertex offset can leave device rows/columns of
+			// the target undrawn even though the draw covers every native pixel, so an invalidate
+			// leaves the merge sampling whatever the texture pool last left in that allocation.
+			// Native (mode 4) is the mode that misses the most: its offset is half a NATIVE pixel,
+			// a whole device pixel at 2x, so device row 0 and column 0 are never covered. Clear for
+			// every mode except NativeWTexOffset (mode 5), whose offset is half a DEVICE pixel, so
+			// row 0 and column 0 are always drawn and the clear would cost those titles for nothing.
+			// If a mode-5 hole is ever measured, this is the line that changes.
 			GL_INS("TC: Invalidating%s target %s[%x] because it's completely overwritten.", to_string(type),
-				(rescaler.m_scale > 1.0f && GSConfig.UserHacks_HalfPixelOffset >= GSHalfPixelOffset::Native) ? "[clearing] " : "", dst->m_TEX0.TBP0);
-			if (rescaler.m_scale > 1.0f && GSConfig.UserHacks_HalfPixelOffset < GSHalfPixelOffset::Native)
+				(rescaler.m_scale > 1.0f && GSConfig.UserHacks_HalfPixelOffset != GSHalfPixelOffset::NativeWTexOffset) ? "[clearing] " : "", dst->m_TEX0.TBP0);
+			if (rescaler.m_scale > 1.0f && GSConfig.UserHacks_HalfPixelOffset != GSHalfPixelOffset::NativeWTexOffset)
 			{
 				if (dst->m_type == RenderTarget)
 					g_gs_device->ClearRenderTarget(dst->m_texture, 0);
@@ -3650,11 +3894,16 @@ bool GSTextureCache::PreloadTarget(GIFRegTEX0 TEX0, const GSVector2i& size, cons
 								old_dst->m_valid = old_dst->m_valid.rintersect(GSVector4i(old_dst->m_valid.x, old_dst->m_valid.y, old_dst->m_valid.z, old_dst->m_valid.w - change_height));
 								old_dst->m_TEX0.TBP0 += block_diff;
 
-								const GSVector2i new_scaled_size = GSVector2i(old_dst->m_unscaled_size * old_dst->m_scale);
+								// Size the replacement by the same rule that sized the texture we are copying out of.
+								// GSVector2i's multiply takes an int per lane, so the float scale used to narrow to an
+								// int here: at 1.5x the new texture came out 1x wide and then took a 1.5x-wide copy.
+								const GSVector2i new_scaled_size = ScaleRenderTargetSize(old_dst->m_unscaled_size, old_dst->m_scale);
 								if (GSTexture* tex = g_gs_device->CreateCompatible(dst->m_texture, new_scaled_size, true))
 								{
-									const int height_offset = change_height * old_dst->m_scale;
-									g_gs_device->CopyRect(old_dst->m_texture, tex, GSVector4i(0, height_offset, old_dst->GetUnscaledWidth() * old_dst->m_scale, old_dst->GetUnscaledHeight() * old_dst->m_scale), 0, 0);
+									// The rows from native row change_height down survive, and that row starts at
+									// device row ceil(change_height * scale).
+									const int height_offset = ScaleNativeToDevice(change_height, old_dst->m_scale);
+									g_gs_device->CopyRect(old_dst->m_texture, tex, GSVector4i(0, height_offset, new_scaled_size.x, new_scaled_size.y), 0, 0);
 
 									g_gs_device->Recycle(old_dst->m_texture);
 									old_dst->m_texture = tex;
@@ -3734,6 +3983,13 @@ bool GSTextureCache::PreloadTarget(GIFRegTEX0 TEX0, const GSVector2i& size, cons
 					if (preserve_target && old_dst->m_scale == dst->m_scale && dst->m_type == old_dst->m_type && !new_valid.rcontains(old_dst->m_drawn_since_read))
 					{
 						// Clamp the copy inside the source and destination.
+						// Left truncating on purpose, unlike the other native-to-device conversions in this
+						// file: copy_rect is scaled here but then used in BOTH spaces below - as a device rect
+						// for the CopyRect, and as an unscaled rect against m_dirty, m_valid and
+						// AddDirtyRectTarget, which are all native. The two only agree at 1x. Rounding it one
+						// way or the other does not settle which space it is in, so changing it here would
+						// move the native uses for no stated reason. The unit mismatch is the finding; fix
+						// that first, then this line follows from whichever space survives.
 						const GSVector4i copy_rect = GSVector4i(GSVector4((new_valid + GSVector4i(0, new_valid.w).xyxy()).rintersect(old_dst->m_drawn_since_read).rintersect(GSVector4i(0, 0, dst->m_unscaled_size.x, new_valid.w + dst->m_unscaled_size.y))) * dst->m_scale);
 						// Copy over the double buffer data, in case we need it.
 						// Clear the dirty first
@@ -3806,14 +4062,18 @@ bool GSTextureCache::PreloadTarget(GIFRegTEX0 TEX0, const GSVector2i& size, cons
 					}
 
 					const int dst_offset_width = (page_diff % new_buffer_width) * GSLocalMemory::m_psm[old_dst->m_TEX0.PSM].pgs.x;
-					const int dst_offset_scaled_width = dst_offset_width * dst->m_scale;
-					const int dst_offset_scaled_height = dst_offset_height * dst->m_scale;
+					const int dst_offset_scaled_width = ScaleNativeToDevice(dst_offset_width, dst->m_scale);
+					const int dst_offset_scaled_height = ScaleNativeToDevice(dst_offset_height, dst->m_scale);
 					const GSVector4i dst_rect_scale = GSVector4i(old_dst->m_valid.x, dst_offset_height, old_dst->m_valid.z, texture_height);
 
 					if (((!hw_clear && (preserve_target || preload)) || dst_rect_scale.rintersect(draw_rect).rempty()) && dst->GetScale() == old_dst->GetScale())
 					{
 						int copy_width = ((old_dst->m_texture->GetWidth()) > (dst->m_texture->GetWidth()) ? (dst->m_texture->GetWidth()) : old_dst->m_texture->GetWidth()) - dst_offset_scaled_width;
-						int copy_height = (texture_height - dst_offset_height) * old_dst->m_scale;
+						// The old target's rows from native 0 land at native dst_offset_height in the new one.
+						// Copy what both of those native spans own on the device grid, as a move does.
+						const int copy_rows = texture_height - dst_offset_height;
+						int copy_height = std::min(ScaleNativeSpanToDevice(0, copy_rows, old_dst->m_scale),
+							ScaleNativeSpanToDevice(dst_offset_height, copy_rows, dst->m_scale));
 
 						GL_INS("TC: RT double buffer copy from FBP 0x%x, %dx%d => %d,%d", old_dst->m_TEX0.TBP0, copy_width, copy_height, 0, dst_offset_scaled_height);
 
@@ -3840,10 +4100,15 @@ bool GSTextureCache::PreloadTarget(GIFRegTEX0 TEX0, const GSVector2i& size, cons
 						}
 						else
 						{
-							if ((copy_width + dst_offset_scaled_width) > (dst->m_unscaled_size.x * dst->m_scale) || (copy_height + dst_offset_scaled_height) > (dst->m_unscaled_size.y * dst->m_scale))
+							// The bound being protected is the destination texture, which was allocated at
+							// ceil(unscaled * scale) per axis. Recomputing it with a truncating multiply put the
+							// clamp a pixel inside the real texture at a fractional scale.
+							const int dst_scaled_width = ScaleNativeToDevice(dst->m_unscaled_size.x, dst->m_scale);
+							const int dst_scaled_height = ScaleNativeToDevice(dst->m_unscaled_size.y, dst->m_scale);
+							if ((copy_width + dst_offset_scaled_width) > dst_scaled_width || (copy_height + dst_offset_scaled_height) > dst_scaled_height)
 							{
-								copy_width = std::min(copy_width, static_cast<int>((dst->m_unscaled_size.x * dst->m_scale) - dst_offset_scaled_width));
-								copy_height = std::min(copy_height, static_cast<int>((dst->m_unscaled_size.y * dst->m_scale) - dst_offset_scaled_height));
+								copy_width = std::min(copy_width, dst_scaled_width - dst_offset_scaled_width);
+								copy_height = std::min(copy_height, dst_scaled_height - dst_offset_scaled_height);
 							}
 
 							g_gs_device->CopyRect(old_dst->m_texture, dst->m_texture, GSVector4i(0, 0, copy_width, copy_height), dst_offset_scaled_width, dst_offset_scaled_height);
@@ -3943,7 +4208,9 @@ bool GSTextureCache::PreloadTarget(GIFRegTEX0 TEX0, const GSVector2i& size, cons
 								delete_target = false;
 								if (GSTexture* tex = g_gs_device->CreateCompatible(old_dst->m_texture, true))
 								{
-									g_gs_device->CopyRect(old_dst->m_texture, tex, GSVector4i(0, height_adjust * old_dst->m_scale, old_dst->m_texture->GetWidth(), old_dst->m_texture->GetHeight()), 0, 0);
+									// Same shape as the preload copy above: the rows from native row height_adjust
+									// down survive, and that row starts at device row ceil(height_adjust * scale).
+									g_gs_device->CopyRect(old_dst->m_texture, tex, GSVector4i(0, ScaleNativeToDevice(height_adjust, old_dst->m_scale), old_dst->m_texture->GetWidth(), old_dst->m_texture->GetHeight()), 0, 0);
 									if (src && src->m_target && src->m_from_target == old_dst)
 									{
 										src->m_from_target = old_dst;
@@ -4261,7 +4528,9 @@ void GSTextureCache::Target::ScaleRTAlpha()
 		if (m_alpha_max > 0)
 		{
 			const GSVector2i rtsize(m_texture->GetSize());
-			const GSVector4i valid_rect = GSVector4i(GSVector4(m_valid) * GSVector4(m_scale));
+			// Ceil, like every other native-to-device rect in the cache: truncating the far edge left
+			// the last device column and row of the valid area un-corrected at a fractional scale.
+			const GSVector4i valid_rect = GSVector4i((GSVector4(m_valid) * GSVector4(m_scale)).ceil());
 			GL_PUSH("TC: ScaleRTAlpha(valid=(%dx%d %d,%d=>%d,%d))", m_valid.width(), m_valid.height(), m_valid.x, m_valid.y, m_valid.z, m_valid.w);
 
 			if (GSTexture* temp_rt = g_gs_device->CreateCompatible(m_texture, rtsize, !GSVector4i::loadh(rtsize).eq(valid_rect)))
@@ -4286,7 +4555,8 @@ void GSTextureCache::Target::UnscaleRTAlpha()
 		if (m_alpha_max > 0)
 		{
 			const GSVector2i rtsize(m_texture->GetSize());
-			const GSVector4i valid_rect = GSVector4i(GSVector4(m_valid) * GSVector4(m_scale));
+			// Ceil, for the same reason as ScaleRTAlpha above.
+			const GSVector4i valid_rect = GSVector4i((GSVector4(m_valid) * GSVector4(m_scale)).ceil());
 			GL_PUSH("TC: UnscaleRTAlpha(valid=(%dx%d %d,%d=>%d,%d))", valid_rect.width(), valid_rect.height(), valid_rect.x, valid_rect.y, valid_rect.z, valid_rect.w);
 
 			if (GSTexture* temp_rt = g_gs_device->CreateCompatible(m_texture, rtsize, !GSVector4i::loadh(rtsize).eq(valid_rect)))
@@ -5604,14 +5874,19 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 		req_resize = true;
 	}
 
-	// Scale coordinates.
+	// Scale coordinates. Each offset names the first device pixel its native pixel owns, and the
+	// extent is what both native rects own on the device grid (see ScaleMoveToDevice). An extent of
+	// ceil(w * scale) is the span of a rect starting at native 0; at a fractional scale a rect
+	// starting elsewhere can own one pixel fewer, and the extra pixel pushed a one-row scroll of a
+	// full target one row past the texture and onto the CPU path.
 	const float scale = src->m_scale;
-	const int scaled_sx = static_cast<int>(sx * scale);
-	const int scaled_sy = static_cast<int>(sy * scale);
-	const int scaled_dx = static_cast<int>(dx * scale);
-	const int scaled_dy = static_cast<int>(dy * scale);
-	const int scaled_w = static_cast<int>(w * scale);
-	const int scaled_h = static_cast<int>(h * scale);
+	const DeviceMove device_move = ScaleMoveToDevice(sx, sy, dx, dy, w, h, scale);
+	const int scaled_sx = device_move.src.x;
+	const int scaled_sy = device_move.src.y;
+	const int scaled_dx = device_move.dst.x;
+	const int scaled_dy = device_move.dst.y;
+	const int scaled_w = device_move.src.width();
+	const int scaled_h = device_move.src.height();
 
 	// The source isn't in our texture, otherwise it could falsely expand the texture causing a misdetection later, which then renders black.
 	if ((scaled_sx + scaled_w) > src->m_texture->GetWidth() || (scaled_sy + scaled_h) > src->m_texture->GetHeight())
@@ -5619,7 +5894,7 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 
 	if (req_resize)
 	{
-		const GSVector2i target_size = GetTargetSize(DBP, DBW, DPSM, Common::AlignUpPow2(dx + w, 64), dx + h);
+		const GSVector2i target_size = GetTargetSize(DBP, DBW, DPSM, Common::AlignUpPow2(dx + w, 64), dy + h);
 		dst->ResizeTexture(std::max(dst->m_unscaled_size.x, target_size.x), std::max(dst->m_unscaled_size.y, target_size.y));
 	}
 	// We don't want to copy "old" data that the game has overwritten with writes,
@@ -5633,23 +5908,31 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 	// Invalidate any opposite targets.
 	g_texture_cache->InvalidateVideoMemType(GSTextureCache::DepthStencil - dst->m_type, dst->m_TEX0.TBP0);
 
-	// Expand the target when we used a more conservative size.
+	// Expand the target when we used a more conservative size. Width grows too, as long as the
+	// move stays inside the destination's buffer width: a small target the game later moves a
+	// wider block into would otherwise send the move to the CPU, behind a synchronous readback.
+	const int required_dw = scaled_dx + scaled_w;
 	const int required_dh = scaled_dy + scaled_h;
-	if ((scaled_dx + scaled_w) <= dst->m_texture->GetWidth() && required_dh > dst->m_texture->GetHeight())
+	const bool grow_w = required_dw > dst->m_texture->GetWidth() && (dx + w) <= static_cast<int>(DBW * 64);
+	if ((required_dw <= dst->m_texture->GetWidth() || grow_w) &&
+		(grow_w || required_dh > dst->m_texture->GetHeight()))
 	{
-		int new_height = dy + h;
+		int new_height = std::max(dy + h, dst->m_unscaled_size.y);
 		if (new_height > GSRendererHW::MAX_FRAMEBUFFER_HEIGHT)
 			return false;
 
 		// Align height to page size, that way we don't do too many small resizes (Dark Cloud).
 		new_height = Common::AlignUpPow2(new_height, static_cast<unsigned>(GSLocalMemory::m_psm[DPSM].bs.y));
+		const int new_width = grow_w ?
+			std::max(dst->m_unscaled_size.x, Common::AlignUpPow2(dx + w, static_cast<unsigned>(GSLocalMemory::m_psm[DPSM].pgs.x))) :
+			dst->m_unscaled_size.x;
 
 		// We don't recycle the old texture here, because the height cache will track the new size,
 		// so the old size won't get created again.
-		GL_INS("TC: Resize %dx%d target to %dx%d for move", dst->m_unscaled_size.x, dst->m_unscaled_size.y, dst->m_unscaled_size.x, new_height);
-		GetTargetSize(DBP, DBW, DPSM, 0, new_height);
+		GL_INS("TC: Resize %dx%d target to %dx%d for move", dst->m_unscaled_size.x, dst->m_unscaled_size.y, new_width, new_height);
+		GetTargetSize(DBP, DBW, DPSM, grow_w ? new_width : 0, new_height);
 
-		if (!dst->ResizeTexture(dst->m_unscaled_size.x, new_height, false))
+		if (!dst->ResizeTexture(new_width, new_height, false))
 		{
 			// Resize failed, probably ran out of VRAM, better luck next time. Fall back to CPU.
 			// We injected the new height into the cache, so hopefully won't happen again.
@@ -5726,7 +6009,8 @@ bool GSTextureCache::Move(u32 SBP, u32 SBW, u32 SPSM, int sx, int sy, u32 DBP, u
 		}
 		else if (src->m_type != dst->m_type)
 		{
-			g_gs_device->StretchRectAuto(src->m_texture, src_rect, dst->m_texture, scaled_src_rect,
+			const GSVector4 dst_rect = GSVector4(scaled_dx, scaled_dy, (scaled_dx + scaled_w), (scaled_dy + scaled_h));
+			g_gs_device->StretchRectAuto(src->m_texture, src_rect, dst->m_texture, dst_rect,
 				Nearest, dpsm_s.trbpp == 16 ? 16 : 32, dpsm_s.trbpp);
 		}
 		else if (src->m_texture->IsDepthLike())
@@ -5861,6 +6145,8 @@ bool GSTextureCache::ShuffleMove(u32 BP, u32 BW, u32 PSM, int sx, int sy, int dx
 	if (read_ba || !write_rg)
 		tgt->UnscaleRTAlpha();
 
+	tgt->Update();
+
 	GSHWDrawConfig& config = GSRendererHW::GetInstance()->BeginHLEHardwareDraw(tgt->m_texture, nullptr, tgt->m_scale, tgt->m_texture, tgt->m_scale, bbox);
 	config.colormask.wrgba = (write_rg ? (1 | 2) : (4 | 8));
 	config.ps.process_ba = read_ba ? 1 : 0;
@@ -5943,6 +6229,15 @@ bool GSTextureCache::PageMove(u32 SBP, u32 DBP, u32 BW, u32 PSM, int sx, int sy,
 		GL_INS("TC: Effective SBP of %x or DBP of %x is not page aligned.", SBP - stgt->m_TEX0.TBP0, DBP - dtgt->m_TEX0.TBP0);
 		return false;
 	}
+
+	// We don't want to copy "old" data that the game has overwritten with writes,
+	// so flush any overlapping dirty area.
+	// We pass that this is an invalidation to the translate function just to get a rough rect, we don't care if it's slightly for an overlap check.
+	stgt->UpdateIfDirtyIntersects(TranslateAlignedRectByPage(stgt, SBP, PSM, BW, GSVector4i(sx, sy, sx + w, sy + h), true));
+
+	// The main point of HW moves is so GPU data can get used as sources. If we don't flush all writes,
+	// we're not going to be able to use it as a source.
+	dtgt->Update();
 
 	// Need to offset based on the target's actual BP.
 	const u32 real_src_offset = ((SBP - stgt->m_TEX0.TBP0) / GS_BLOCKS_PER_PAGE) + src_page_offset;
@@ -6331,10 +6626,14 @@ GSTextureCache::Source* GSTextureCache::CreateSource(const GIFRegTEX0& TEX0, con
 	if (dst && (x_offset != 0 || y_offset != 0) && (TEX0.PSM != PSMT8 || channel_shuffle))
 	{
 		const float scale = dst->m_scale;
-		const int x = static_cast<int>(scale * x_offset);
-		const int y = static_cast<int>(scale * y_offset);
-		const int w = static_cast<int>(std::ceil(scale * tw));
-		const int h = static_cast<int>(std::ceil(scale * th));
+		// The offset names the first device pixel its native pixel owns, and the extent is what the
+		// native rect owns from there. Truncating the offset read the copy one device column and row
+		// early, out of the previous native pixel; ceiling the extent on its own read one past the
+		// rect's far edge.
+		const int x = ScaleNativeToDevice(x_offset, scale);
+		const int y = ScaleNativeToDevice(y_offset, scale);
+		const int w = ScaleNativeSpanToDevice(x_offset, tw, scale);
+		const int h = ScaleNativeSpanToDevice(y_offset, th, scale);
 
 		const GSVector4i read_rect = GSVector4i(x_offset, y_offset, x_offset + tw, y_offset + th);
 		// Do this first as we could be adding in alpha from an upgraded 24bit target. if the rect intersects a dirty area.
@@ -6708,10 +7007,13 @@ GSTextureCache::Source* GSTextureCache::CreateSource(const GIFRegTEX0& TEX0, con
 
 						const GSVector4 dRect = GSVector4(GSVector4i::loadh(dst->m_unscaled_size));
 
-						if (GSConfig.UserHacks_NativeScaling != GSNativeScaling::Off)
+						// Same rule as the other two downsample sites: the box filter only has a whole
+						// number of source texels per output pixel at an integer scale, so a fractional
+						// one goes through the stretch below instead.
+						if (GSConfig.UserHacks_NativeScaling != GSNativeScaling::Off && std::floor(dst->GetScale()) == dst->GetScale())
 						{
 							const u32 downsample_factor = static_cast<u32>(dst->GetScale());
-							
+
 							g_gs_device->FilteredDownsampleTexture(dst->m_texture, tmpTex, downsample_factor, GSVector2i(0, 0), dRect);
 						}
 						else
@@ -6925,8 +7227,10 @@ GSTextureCache::Source* GSTextureCache::CreateMergedSource(GIFRegTEX0 TEX0, GIFR
 	const GSLocalMemory::psm_t& psm_s = GSLocalMemory::m_psm[TEX0.PSM];
 	const int tex_width = (std::max<int>(64 * TEX0.TBW, region.GetMaxX()) + (psm_s.bs.x - 1)) & ~(psm_s.bs.x - 1);
 	const int tex_height = ((region.HasY() ? region.GetHeight() : (1 << TEX0.TH)) + (psm_s.bs.y - 1)) & ~(psm_s.bs.y - 1);
-	const int scaled_width = static_cast<int>(static_cast<float>(tex_width) * scale);
-	const int scaled_height = static_cast<int>(static_cast<float>(tex_height) * scale);
+	// Ceil: the page copies queued below land at rect * scale in this texture, so a truncated
+	// allocation would be smaller than what gets written into it.
+	const int scaled_width = ScaleNativeToDevice(tex_width, scale);
+	const int scaled_height = ScaleNativeToDevice(tex_height, scale);
 
 	// Compute new end block based on size.
 	const u32 end_block = GSLocalMemory::m_psm[TEX0.PSM].info.bn(tex_width - 1, tex_height - 1, TEX0.TBP0, TEX0.TBW);
@@ -6993,6 +7297,7 @@ GSTextureCache::Source* GSTextureCache::CreateMergedSource(GIFRegTEX0 TEX0, GIFR
 		{
 			// Slow for DX11... page_width * 4 should still be 32 byte aligned for AVX.
 			const int pitch = page_width * sizeof(u32);
+			s_unswizzled_level.valid = false;
 			psm.rtx(g_gs_renderer->m_mem, lm_off, rect, s_unswizzle_buffer, pitch, TEXA);
 			lmtex->Update(rect, s_unswizzle_buffer, pitch);
 		}
@@ -7221,17 +7526,30 @@ extern bool FMVstarted;
 
 GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, bool& paltex, const u32* clut, const GSVector2i* lod, SourceRegion region)
 {
+	const int tw = region.HasX() ? region.GetWidth() : (1 << TEX0.TW);
+	const int th = region.HasY() ? region.GetHeight() : (1 << TEX0.TH);
+
 	// don't bother hashing if we're not dumping or replacing.
 	const bool dump = GSConfig.DumpReplaceableTextures && (!FMVstarted || GSConfig.DumpTexturesWithFMVActive) &&
 	                  (clut ? GSConfig.DumpPaletteTextures : GSConfig.DumpDirectTextures);
 	const bool replace = GSConfig.LoadTextureReplacements && GSTextureReplacements::HasAnyReplacementTextures();
+
+	// Upscaled textures come back the way pack textures do, so they are keyed the same way, palette
+	// included. Not while an FMV plays (every frame is a new texture), and not when the palette
+	// lives on the GPU: the CPU copy that would be hashed is not the one the draw will use.
+	const bool upscale = GSTextureReplacements::IsUpscaleActive() && !FMVstarted &&
+	                     !(clut && g_gs_renderer->m_mem.m_clut.GetGPUTexture()) &&
+	                     GSTextureReplacements::CanUpscaleTexture(tw, th);
 	bool can_cache = (TEX0.PSM >= PSMT8H && TEX0.PSM <= PSMT4HH) ? CanPreloadTextureSize(TEX0.TW, TEX0.TH) : CanCacheTextureSize(TEX0.TW, TEX0.TH);
-	if (!dump && !replace && !can_cache)
+	if (!dump && !replace && !upscale && !can_cache)
 		return nullptr;
 
 	// need the hash either for replacing, dumping or caching.
 	// if dumping/replacing is on, we compute the clut hash regardless, since replacements aren't indexed
-	HashCacheKey key{HashCacheKey::Create(TEX0, TEXA, (dump || replace || !paltex) ? clut : nullptr, lod, region)};
+	// Textures that are dumped, replaced or upscaled are named by the hash of their texels, so those lookups
+	// hash texels. Every other paletted window is keyed by the bytes of its blocks, which needs no unswizzle.
+	HashCacheKey key{HashCacheKey::Create(TEX0, TEXA, (dump || replace || upscale || !paltex) ? clut : nullptr, lod, region,
+		!dump && !replace && !upscale)};
 
 	// handle dumping first, this is mostly isolated.
 	if (dump)
@@ -7256,7 +7574,7 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 	auto it = m_hash_cache.find(key);
 
 	// if this fails, and paltex is on, try indexed texture
-	const bool needs_second_lookup = paltex && (dump || replace);
+	const bool needs_second_lookup = paltex && (dump || replace || upscale);
 	if (needs_second_lookup && it == m_hash_cache.end())
 		it = m_hash_cache.find(key.WithRemovedCLUTHash());
 
@@ -7277,9 +7595,9 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 	GL_CACHE("TC: HC Miss: %" PRIx64 " %" PRIx64 " R-%ux%u", key.TEX0Hash, key.CLUTHash, key.region_width, key.region_height);
 
 	// check for a replacement texture with the full clut key
+	bool replacement_texture_pending = false;
 	if (replace)
 	{
-		bool replacement_texture_pending = false;
 		std::pair<u8, u8> alpha_minmax;
 		GSTexture* replacement_tex = GSTextureReplacements::LookupReplacementTexture(key, lod != nullptr,
 			&replacement_texture_pending, &alpha_minmax);
@@ -7310,6 +7628,51 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 		}
 	}
 
+	// No pack texture for this one, and none on its way, so it can be upscaled. A finished result is
+	// used as it stands; otherwise one is queued, the native texture is used meanwhile, and the
+	// result is swapped in when it lands, as for a pack texture loaded asynchronously.
+	if (upscale && !replacement_texture_pending)
+	{
+		GSTextureReplacements::UpscaleRequest request = {};
+		request.key = key;
+		request.TEXA = TEXA;
+		request.region = region;
+		request.mipmap = (lod != nullptr);
+		request.cpu_mips = (lod != nullptr && !GSConfig.HWMipmap);
+
+		// The levels the native path would upload: the base, plus the guest mips when the lod range
+		// is set and hardware mipmapping is on.
+		request.guest_levels = 1;
+		request.level_tex0[0] = TEX0;
+		if (lod && GSConfig.HWMipmap)
+		{
+			const int levels = std::min(lod->y - lod->x + 1, GSDevice::GetMipmapLevelsForSize(tw, th));
+			request.guest_levels = static_cast<u32>(std::clamp(levels, 1, static_cast<int>(std::size(request.level_tex0))));
+			for (u32 i = 1; i < request.guest_levels; i++)
+				request.level_tex0[i] = g_gs_renderer->GetTex0Layer(lod->x + i);
+		}
+
+		bool upscale_pending = false;
+		std::pair<u8, u8> upscale_alpha_minmax;
+		GSTexture* upscaled_tex = GSTextureReplacements::LookupUpscaledTexture(request, g_gs_renderer->m_mem,
+			&upscale_pending, &upscale_alpha_minmax);
+		if (upscaled_tex)
+		{
+			// Same as a found pack texture: it is not indexed, so paltex goes.
+			paltex = false;
+			const HashCacheEntry entry{upscaled_tex, 1u, 0u, upscale_alpha_minmax, true, true, true};
+			m_hash_cache_replacement_memory_usage += entry.texture->GetMemUsage();
+			return &m_hash_cache.emplace(key, entry).first->second;
+		}
+		else if (upscale_pending)
+		{
+			// The upscaled texture is not indexed either, so what gets drawn meanwhile must not be,
+			// and it has to be in the hash cache for the result to swap with.
+			paltex = false;
+			can_cache = true;
+		}
+	}
+
 	// Using paltex without full preloading is a disaster case here. basically, unless *all* textures are
 	// replaced, any texture can get populated without the hash cache, which means it'll get partial invalidated,
 	// and unless it's 100% removed, this partial texture will always take precedence over future hash cache
@@ -7328,8 +7691,6 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 		return nullptr;
 
 	// expand/upload texture
-	const int tw = region.HasX() ? region.GetWidth() : (1 << TEX0.TW);
-	const int th = region.HasY() ? region.GetHeight() : (1 << TEX0.TH);
 	const int tlevels = lod ? (GSConfig.HWMipmap ? std::min(lod->y - lod->x + 1, GSDevice::GetMipmapLevelsForSize(tw, th)) : -1) : 1;
 	GSTexture* tex = g_gs_device->CreateTexture(tw, th, tlevels, paltex ? GSTexture::Format::UNorm8 : GSTexture::Format::Color);
 	if (!tex)
@@ -7375,6 +7736,32 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 	return &m_hash_cache.emplace(key, entry).first->second;
 }
 
+GSTexture* GSTextureCache::GetNativeTexture(const Source* s)
+{
+	HashCacheEntry* const e = s->m_from_hash_cache;
+	if (!e || !e->generated)
+		return nullptr;
+
+	if (!e->native)
+	{
+		const SourceRegion& region = s->m_region;
+		const int tw = region.HasX() ? region.GetWidth() : (1 << s->m_TEX0.TW);
+		const int th = region.HasY() ? region.GetHeight() : (1 << s->m_TEX0.TH);
+
+		GSTexture* tex = g_gs_device->CreateTexture(tw, th, 1, GSTexture::Format::Color);
+		if (!tex)
+			return nullptr;
+
+		// The CPU palette expansion LookupHashCache's own upload does. A texture that gets a
+		// generated upscale never uses paltex, so its source has no palette texture to match.
+		PreloadTexture(s->m_TEX0, s->m_TEXA, region, g_gs_renderer->m_mem, false, tex, 0, nullptr);
+		e->native = tex;
+		m_hash_cache_memory_usage += tex->GetMemUsage();
+	}
+
+	return e->native;
+}
+
 GSTextureCache::HashCacheMap::iterator GSTextureCache::RemoveFromHashCache(HashCacheMap::iterator it)
 {
 	HashCacheEntry& e = it->second;
@@ -7384,19 +7771,42 @@ GSTextureCache::HashCacheMap::iterator GSTextureCache::RemoveFromHashCache(HashC
 	else
 		m_hash_cache_memory_usage -= mem_usage;
 	g_gs_device->Recycle(e.texture);
+	if (e.native)
+	{
+		m_hash_cache_memory_usage -= e.native->GetMemUsage();
+		g_gs_device->Recycle(e.native);
+	}
 	return m_hash_cache.erase(it);
 }
 
 void GSTextureCache::AgeHashCache()
 {
-	// Where did this number come from?
-	// A game called Corvette draws its background FMVs with a ton of 17x17 tiles, which ends up
-	// being about 600 texture uploads per frame. We'll use 800 as an upper bound for a bit of
-	// a buffer, hopefully nothing's going to end up with more textures than that.
-	constexpr u32 MAX_HASH_CACHE_SIZE = 800;
 	constexpr u32 MAX_HASH_CACHE_AGE = 30;
 
-	bool might_need_cache_purge = (m_hash_cache.size() > MAX_HASH_CACHE_SIZE);
+	{
+		const u64 hash_bytes = GetTotalHashCacheMemoryUsage();
+		HashCacheStats& st = s_hash_cache_stats;
+		st.peak_entries = std::max<u64>(st.peak_entries, m_hash_cache.size());
+		st.peak_bytes = std::max(st.peak_bytes, hash_bytes);
+		st.peak_total_bytes = std::max(st.peak_total_bytes,
+			m_target_memory_usage + m_source_memory_usage + hash_bytes + (g_gs_device ? g_gs_device->GetPoolMemoryUsage() : 0));
+		st.frames++;
+		st.sum_bytes += hash_bytes;
+	}
+
+	// 800 entries used to be the whole limit. A game called Corvette draws its background FMVs with a ton of
+	// 17x17 tiles, which ends up being about 600 texture uploads per frame, so 800 was picked as an upper bound
+	// with a bit of a buffer. It is now the floor: nothing is dropped for memory while the cache is no larger.
+	// Above it the cache may grow to max_entries while the textures stay under max_bytes, so a title that comes
+	// back to the same thousand windows within 30 frames finds them instead of decoding and uploading them again.
+	const HashCacheLimits limits = s_hash_cache_limits;
+	const auto over_limit = [&]() {
+		const size_t entries = m_hash_cache.size();
+		return (limits.max_entries != 0 && entries > limits.max_entries) ||
+		       (limits.max_bytes != 0 && entries > limits.floor_entries && GetTotalHashCacheMemoryUsage() > limits.max_bytes);
+	};
+
+	bool might_need_cache_purge = over_limit();
 	if (might_need_cache_purge)
 		s_hash_cache_purge_list.clear();
 
@@ -7418,7 +7828,7 @@ void GSTextureCache::AgeHashCache()
 		// We might free up enough just with "normal" removals above.
 		if (might_need_cache_purge)
 		{
-			might_need_cache_purge = (m_hash_cache.size() > MAX_HASH_CACHE_SIZE);
+			might_need_cache_purge = over_limit();
 			if (might_need_cache_purge)
 				s_hash_cache_purge_list.emplace_back(it, static_cast<s32>(e.age));
 		}
@@ -7432,9 +7842,7 @@ void GSTextureCache::AgeHashCache()
 		std::sort(s_hash_cache_purge_list.begin(), s_hash_cache_purge_list.end(),
 			[](const auto& lhs, const auto& rhs) { return lhs.second > rhs.second; });
 
-		const u32 entries_to_purge = std::min(static_cast<u32>(m_hash_cache.size() - MAX_HASH_CACHE_SIZE),
-			static_cast<u32>(s_hash_cache_purge_list.size()));
-		for (u32 i = 0; i < entries_to_purge; i++)
+		for (size_t i = 0; i < s_hash_cache_purge_list.size() && over_limit(); i++)
 			RemoveFromHashCache(s_hash_cache_purge_list[i].first);
 	}
 }
@@ -7691,9 +8099,7 @@ void GSTextureCache::Read(Target* t, const GSVector4i& r, bool force_synchronous
 	if (asynchronous && !asynchronous_dltex)
 		return;
 
-	// Per-frame readback patterns (occlusion tests etc.) redraw the same target before
-	// each read; let the backend schedule submissions around the next producing draw.
-	g_gs_device->HintReadbackSource(t->m_texture);
+	g_gs_device->FlushBeforeReadback();
 
 	if (direct_read)
 	{
@@ -8123,6 +8529,7 @@ void GSTextureCache::Source::Flush(u32 count, int layer, const GSOffset& off)
 		if (rint.width() == 0 || rint.height() == 0)
 			continue;
 
+		s_unswizzled_level.valid = false;
 		rtx(mem, off, r, s_unswizzle_buffer, pitch, m_TEXA);
 
 		// need to offset if we're a region texture
@@ -8280,9 +8687,6 @@ void GSTextureCache::Target::Update(bool cannot_scale)
 		return;
 	}
 
-	GSTexture::GSMap m;
-	const bool mapped = t->Map(m);
-
 	GIFRegTEXA TEXA = {};
 	TEXA.AEM = 0;
 	TEXA.TA0 = 0;
@@ -8322,36 +8726,20 @@ void GSTextureCache::Target::Update(bool cannot_scale)
 
 		const GSVector4i read_r = m_dirty.GetDirtyRect(i, m_TEX0, total_rect, true);
 		const GSVector4i t_r(read_r - t_offset);
-		if (mapped)
+
+		// Unswizzle into the scratch buffer: unswizzling straight into mapped upload memory is slow where that memory is write-combined.
+		const int pitch = VectorAlign(read_r.width() * sizeof(u32));
+		s_unswizzled_level.valid = false;
+		g_gs_renderer->m_mem.ReadTexture(off, read_r, s_unswizzle_buffer, pitch, TEXA);
+
+		if (((m_TEX0.PSM & 0xf) != PSMCT24 || m_valid_alpha_high || m_valid_alpha_low) && m_dirty[i].rgba.c.a && bpp >= 16)
 		{
-			if (((m_TEX0.PSM & 0xf) != PSMCT24 || m_valid_alpha_high || m_valid_alpha_low) && m_dirty[i].rgba.c.a && bpp >= 16)
-			{
-				// TODO: Only read once in 32bit and copy to the mapped texture. Bit out of scope of this PR and not a huge impact.
-				const int pitch = VectorAlign(read_r.width() * sizeof(u32));
-				g_gs_renderer->m_mem.ReadTexture(off, read_r, s_unswizzle_buffer, pitch, TEXA);
-
-				std::pair<u8, u8> new_alpha_minmax = GSGetRGBA8AlphaMinMax(s_unswizzle_buffer, read_r.width(), read_r.height(), pitch);
-				alpha_minmax.first = std::min(alpha_minmax.first, new_alpha_minmax.first);
-				alpha_minmax.second = std::max(alpha_minmax.second, new_alpha_minmax.second);
-			}
-
-			g_gs_renderer->m_mem.ReadTexture(
-				off, read_r, m.bits + t_r.y * static_cast<u32>(m.pitch) + (t_r.x * sizeof(u32)), m.pitch, TEXA);
+			std::pair<u8, u8> new_alpha_minmax = GSGetRGBA8AlphaMinMax(s_unswizzle_buffer, read_r.width(), read_r.height(), pitch);
+			alpha_minmax.first = std::min(alpha_minmax.first, new_alpha_minmax.first);
+			alpha_minmax.second = std::max(alpha_minmax.second, new_alpha_minmax.second);
 		}
-		else
-		{
-			const int pitch = VectorAlign(read_r.width() * sizeof(u32));
-			g_gs_renderer->m_mem.ReadTexture(off, read_r, s_unswizzle_buffer, pitch, TEXA);
 
-			if (((m_TEX0.PSM & 0xf) != PSMCT24 || m_valid_alpha_high || m_valid_alpha_low) &&m_dirty[i].rgba.c.a && bpp >= 16)
-			{
-				std::pair<u8, u8> new_alpha_minmax = GSGetRGBA8AlphaMinMax(s_unswizzle_buffer, read_r.width(), read_r.height(), pitch);
-				alpha_minmax.first = std::min(alpha_minmax.first, new_alpha_minmax.first);
-				alpha_minmax.second = std::max(alpha_minmax.second, new_alpha_minmax.second);
-			}
-
-			t->Update(t_r, s_unswizzle_buffer, pitch);
-		}
+		t->Update(t_r, s_unswizzle_buffer, pitch);
 
 		GSDevice::MultiStretchRect& drect = drects[ndrects++];
 		drect.src = t;
@@ -8372,9 +8760,6 @@ void GSTextureCache::Target::Update(bool cannot_scale)
 			drect.wmask = 0xF;
 		}
 	}
-
-	if (mapped)
-		t->Unmap();
 
 	if (ndrects > 0)
 	{
@@ -9013,7 +9398,7 @@ void GSTextureCache::InvalidateTemporaryZ()
 	m_temporary_z = nullptr;
 }
 
-void GSTextureCache::InjectHashCacheTexture(const HashCacheKey& key, GSTexture* tex, const std::pair<u8, u8>& alpha_minmax)
+void GSTextureCache::InjectHashCacheTexture(const HashCacheKey& key, GSTexture* tex, const std::pair<u8, u8>& alpha_minmax, bool generated)
 {
 	// When we insert we update memory usage. Old texture gets removed below.
 	m_hash_cache_replacement_memory_usage += tex->GetMemUsage();
@@ -9022,8 +9407,9 @@ void GSTextureCache::InjectHashCacheTexture(const HashCacheKey& key, GSTexture* 
 	if (it == m_hash_cache.end())
 	{
 		// We must've got evicted before we finished loading. No matter, add it in there anyway;
-		// if it's not used again, it'll get tossed out later.
-		const HashCacheEntry entry{tex, 1u, 0u, alpha_minmax, true, true};
+		// if it's not used again, it'll get tossed out later. No source holds it, so it starts
+		// unreferenced: AgeHashCache never ages an entry with a reference.
+		const HashCacheEntry entry{tex, 0u, 0u, alpha_minmax, true, true, generated};
 		m_hash_cache.emplace(key, entry);
 		return;
 	}
@@ -9040,6 +9426,7 @@ void GSTextureCache::InjectHashCacheTexture(const HashCacheKey& key, GSTexture* 
 		m_hash_cache_replacement_memory_usage -= it->second.texture->GetMemUsage();
 
 	it->second.is_replacement = true;
+	it->second.generated = generated;
 	m_src.SwapTexture(it->second.texture, tex);
 	g_gs_device->Recycle(it->second.texture);
 	it->second.texture = tex;
@@ -9372,16 +9759,17 @@ GSTextureCache::SourceRegion GSTextureCache::SourceRegion::Create(GIFRegTEX0 TEX
 	return region;
 }
 
-using BlockHashState = XXH3_state_t;
+using BlockHashState = GSXXH3BlockState;
 
 __fi static void BlockHashReset(BlockHashState& st)
 {
-	XXH3_64bits_reset(&st);
+	GSXXH3_block_reset(st);
 }
 
 __fi static void BlockHashAccumulate(BlockHashState& st, const u8* bp)
 {
-	GSXXH3_64bits_update(&st, bp, GS_BLOCK_SIZE);
+	static_assert(GS_BLOCK_SIZE == 256, "GSXXH3_64bits_block hashes exactly 256 bytes");
+	GSXXH3_64bits_block(&st, bp);
 }
 
 __fi static void BlockHashAccumulate(BlockHashState& st, const u8* bp, u32 size)
@@ -9394,19 +9782,158 @@ __fi static GSTextureCache::HashType FinishBlockHash(BlockHashState& st)
 	return GSXXH3_64bits_digest(&st);
 }
 
-static void HashTextureLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, GSTextureCache::SourceRegion region, BlockHashState& hash_st, u8* temp)
+namespace
+{
+	/// The texels of a texture level that its hash covers.
+	struct HashLevelGeometry
+	{
+		int tw, th;
+		GSVector4i rect; ///< The texels, relative to the base pointer.
+		GSVector4i block_rect; ///< The same texels widened to whole blocks.
+	};
+} // namespace
+
+static HashLevelGeometry GetHashLevelGeometry(const GIFRegTEX0& TEX0, GSTextureCache::SourceRegion region)
 {
 	const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
-	const GSVector2i& bs = psm.bs;
 	const int tw = region.HasX() ? region.GetWidth() : (1 << TEX0.TW);
 	const int th = region.HasY() ? region.GetHeight() : (1 << TEX0.TH);
 
 	// From GSLocalMemory foreachBlock(), used for reading textures.
 	// We want to hash the exact same blocks here.
 	const GSVector4i rect(region.GetRect(tw, th));
-	const GSVector4i block_rect(rect.ralign<Align_Outside>(bs));
+	return {tw, th, rect, rect.ralign<Align_Outside>(psm.bs)};
+}
+
+// True if the level used to be expanded to texels to be hashed: smaller than a block, a format that shares
+// its words with other data, or a window that starts away from the origin.
+static bool HashLevelIsExpanded(const GSLocalMemory::psm_t& psm, const HashLevelGeometry& geometry, const GSTextureCache::SourceRegion& region)
+{
+	return geometry.tw < psm.bs.x || geometry.th < psm.bs.y || psm.fmsk != 0xFFFFFFFFu || region.GetMaxX() > 0 || region.GetMinY() > 0;
+}
+
+// True if a level that used to be expanded is hashed from the raw bytes of its blocks instead (see
+// HashTextureLevel): a paletted window of at least a block each way, where the lookup allows it. A level
+// that was never expanded already hashed its blocks, and keeps doing exactly that.
+static bool HashLevelIsRaw(const GSLocalMemory::psm_t& psm, const HashLevelGeometry& geometry, const GSTextureCache::SourceRegion& region, bool raw_blocks)
+{
+	return raw_blocks && psm.pal > 0 && geometry.tw >= psm.bs.x && geometry.th >= psm.bs.y && HashLevelIsExpanded(psm, geometry, region);
+}
+
+// Hashes the texture level into hash_st, and returns where its window starts inside its first block as
+// x | y << 8, or 0 if the level is not hashed from raw blocks.
+static u32 HashTextureLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, GSTextureCache::SourceRegion region, BlockHashState& hash_st, u8* temp, bool raw_blocks, GSTextureCache::BlockHashCache* block_hashes = nullptr)
+{
+	const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
+	const HashLevelGeometry geometry = GetHashLevelGeometry(TEX0, region);
+	const int tw = geometry.tw;
+	const int th = geometry.th;
+	const GSVector4i& rect = geometry.rect;
+	const GSVector4i& block_rect = geometry.block_rect;
 	GSLocalMemory& mem = g_gs_renderer->m_mem;
 	const GSOffset off = mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM);
+
+	// A paletted window of at least one block each way is hashed from the bytes of its blocks, in the order
+	// the unswizzle reads them, with no unswizzle. Its texels are a function of those bytes, the format, the
+	// size of the window, and where it starts inside its first block, so equal raw hashes (and equal offsets,
+	// returned below) mean equal texels. The blocks go in whole, so a byte of an edge block outside the window
+	// changes the hash: that can only turn a texel-hash hit into a miss, never the reverse.
+	const bool raw = HashLevelIsRaw(psm, geometry, region, raw_blocks);
+
+	// With the block hash cache, a raw level is keyed by one hash of the hashes of its blocks, in the same
+	// order, instead of by the bytes: each block's hash is kept until a mark of the block's bytes, so a block
+	// that was not written since the last lookup is not read. Two windows have the same key here if and only
+	// if they have the same raw key, because a block hash is a function of the block's bytes alone, and the
+	// blocks a window reads, and where it starts inside the first, are what the rest of the key and the offset
+	// below say.
+	const int right = block_rect.right >> off.blockShiftX();
+	const int bottom = block_rect.bottom >> off.blockShiftY();
+	if (raw && block_hashes &&
+		static_cast<u64>((block_rect.width() >> off.blockShiftX())) * static_cast<u64>((block_rect.height() >> off.blockShiftY())) <= BLOCK_HASH_GATHER_MAX)
+	{
+		const u32 fmsk = psm.fmsk;
+		GSOffset::BNHelper bn = off.bnMulti(block_rect.left, block_rect.top);
+		u64* const hashes = block_hashes->hash.get();
+		u64* out = s_block_hash_gather;
+		u64 rehashed = 0;
+
+		if (fmsk == 0xFFFFFFFFu)
+		{
+			for (; bn.blkY() < bottom; bn.nextBlockY())
+			{
+				for (; bn.blkX() < right; bn.nextBlockX())
+				{
+					const u32 block = bn.value();
+					if (mem.TestAndClearHashDirty(block))
+					{
+						hashes[block] = HashOneBlock(mem.BlockPtr(block));
+						rehashed++;
+					}
+					*out++ = hashes[block];
+				}
+			}
+		}
+		else
+		{
+			// The H formats share their words with other data, which changes without the format's own bits
+			// changing, so a block hash would be dirtied by writes that are not the format's. Hash only the
+			// format's bits, afresh each time: these formats are rare, and nothing is gained by caching.
+			alignas(16) u32 masked[GS_BLOCK_SIZE / sizeof(u32)];
+			for (; bn.blkY() < bottom; bn.nextBlockY())
+			{
+				for (; bn.blkX() < right; bn.nextBlockX())
+				{
+					const u32* block = reinterpret_cast<const u32*>(mem.BlockPtr(bn.value()));
+					for (u32 i = 0; i < GS_BLOCK_SIZE / sizeof(u32); i++)
+						masked[i] = block[i] & fmsk;
+					*out++ = HashOneBlock(reinterpret_cast<const u8*>(masked));
+					rehashed++;
+				}
+			}
+		}
+
+		const u64 count = static_cast<u64>(out - s_block_hash_gather);
+		BlockHashAccumulate(hash_st, reinterpret_cast<const u8*>(s_block_hash_gather), static_cast<u32>(count * sizeof(u64)));
+
+		s_block_hash_levels_cached++;
+		s_block_hash_stats.levels++;
+		s_block_hash_stats.blocks += count;
+		s_block_hash_stats.rehashed += rehashed;
+
+		if (GSTextureCache::IsBlockHashVerify()) [[unlikely]]
+		{
+			// Each block of the full-mask formats, hashed afresh, against the hash the key was made from. A
+			// difference is a store into local memory that nothing marked. The cached hash is put right
+			// after, so a missed store is counted once and not once per lookup.
+			GSTextureCache::BlockHashVerifyReport& report = s_block_hash_verify_report;
+			report.levels++;
+			if (fmsk == 0xFFFFFFFFu)
+			{
+				GSOffset::BNHelper check = off.bnMulti(block_rect.left, block_rect.top);
+				const u64* used = s_block_hash_gather;
+				for (; check.blkY() < bottom; check.nextBlockY())
+				{
+					for (; check.blkX() < right; check.nextBlockX(), used++)
+					{
+						const u32 block = check.value();
+						const u64 fresh = HashOneBlock(mem.BlockPtr(block));
+						report.blocks++;
+						if (fresh != *used)
+						{
+							if (++report.stale_blocks <= BLOCK_HASH_VERIFY_PRINT_LIMIT)
+							{
+								Console.Error("TC: block hash cache STALE: block %u of tbp0 0x%x psm %u has bytes that changed with no mark (frame %u)",
+									block, static_cast<u32>(TEX0.TBP0), static_cast<u32>(TEX0.PSM), static_cast<u32>(g_perfmon.GetFrame()));
+							}
+							hashes[block] = fresh;
+						}
+					}
+				}
+			}
+		}
+
+		return static_cast<u32>(rect.left - block_rect.left) | (static_cast<u32>(rect.top - block_rect.top) << 8);
+	}
 
 	// For textures which are smaller than the block size, we expand and then hash.
 	// This is because otherwise we get the padding bytes, which can be random junk.
@@ -9415,7 +9942,7 @@ static void HashTextureLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, GST
 	// the texture data with other textures/framebuffers/etc (which is common).
 	// Even though you might think this would be slower than just hashing for the hash
 	// cache, it actually ends up faster (unswizzling is faster than hashing).
-	if (tw < bs.x || th < bs.y || psm.fmsk != 0xFFFFFFFFu || region.GetMaxX() > 0 || region.GetMinY() > 0)
+	if (!raw && HashLevelIsExpanded(psm, geometry, region))
 	{
 		// Expand texture indices. Align to 32 bytes for AVX2.
 		const bool palette = (psm.pal > 0);
@@ -9425,6 +9952,11 @@ static void HashTextureLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, GST
 
 		// Use temp buffer for expanding, since we may not need to update.
 		rtx(mem, off, block_rect, temp, pitch, TEXA);
+		if (temp == s_unswizzle_buffer)
+		{
+			s_unswizzled_level = {true, palette, TEX0.TBP0, TEX0.TBW, TEX0.PSM, pitch, TEXA.U64, mem.WriteSeq(), &mem,
+				block_rect};
+		}
 
 		// Hash the expanded texture.
 		u8* ptr = temp + (pitch * static_cast<u32>(rect.top - block_rect.top)) +
@@ -9438,29 +9970,48 @@ static void HashTextureLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, GST
 			for (int y = 0; y < th; y++, ptr += pitch)
 				BlockHashAccumulate(hash_st, ptr, row_size);
 		}
+		return 0;
 	}
-	else
-	{
-		GSOffset::BNHelper bn = off.bnMulti(block_rect.left, block_rect.top);
-		const int right = block_rect.right >> off.blockShiftX();
-		const int bottom = block_rect.bottom >> off.blockShiftY();
-		const int xAdd = (1 << off.blockShiftX()) * (psm.bpp / 8);
 
+	GSOffset::BNHelper bn = off.bnMulti(block_rect.left, block_rect.top);
+
+	if (psm.fmsk == 0xFFFFFFFFu)
+	{
 		for (; bn.blkY() < bottom; bn.nextBlockY())
 		{
-			for (int x = 0; bn.blkX() < right; bn.nextBlockX(), x += xAdd)
+			for (; bn.blkX() < right; bn.nextBlockX())
 			{
 				BlockHashAccumulate(hash_st, mem.BlockPtr(bn.value()));
 			}
 		}
 	}
+	else
+	{
+		// The H formats keep their indices in some bits of 32-bit words and share the rest with other data,
+		// often a frame buffer's colour. Hash only the format's bits. The update copies what it is given, so
+		// the masked block does not have to outlive the call.
+		const u32 fmsk = psm.fmsk;
+		alignas(16) u32 masked[GS_BLOCK_SIZE / sizeof(u32)];
+		for (; bn.blkY() < bottom; bn.nextBlockY())
+		{
+			for (; bn.blkX() < right; bn.nextBlockX())
+			{
+				const u32* block = reinterpret_cast<const u32*>(mem.BlockPtr(bn.value()));
+				for (u32 i = 0; i < GS_BLOCK_SIZE / sizeof(u32); i++)
+					masked[i] = block[i] & fmsk;
+				BlockHashAccumulate(hash_st, reinterpret_cast<const u8*>(masked), GS_BLOCK_SIZE);
+			}
+		}
+	}
+
+	return raw ? static_cast<u32>(rect.left - block_rect.left) | (static_cast<u32>(rect.top - block_rect.top) << 8) : 0;
 }
 
 GSTextureCache::HashType GSTextureCache::HashTexture(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, SourceRegion region)
 {
 	BlockHashState hash_st;
 	BlockHashReset(hash_st);
-	HashTextureLevel(TEX0, TEXA, region, hash_st, s_unswizzle_buffer);
+	HashTextureLevel(TEX0, TEXA, region, hash_st, s_unswizzle_buffer, false);
 	return FinishBlockHash(hash_st);
 }
 
@@ -9502,8 +10053,20 @@ void GSTextureCache::PreloadTexture(const GIFRegTEX0& TEX0, const GIFRegTEXA& TE
 	{
 		pitch = VectorAlign(pitch);
 
+		// A hash of this level on a cache miss has usually just expanded it into the buffer the same way.
 		u8* buff = s_unswizzle_buffer;
-		rtx(mem, off, block_rect, buff, pitch, TEXA);
+		const UnswizzledLevel& ul = s_unswizzled_level;
+		if (ul.valid && ul.mem == &mem && ul.write_seq == mem.WriteSeq() && ul.palette == paltex &&
+			ul.tbp0 == TEX0.TBP0 && ul.tbw == TEX0.TBW && ul.psm == TEX0.PSM && ul.texa == TEXA.U64 &&
+			ul.block_rect.eq(block_rect))
+		{
+			pitch = ul.pitch;
+		}
+		else
+		{
+			s_unswizzled_level.valid = false;
+			rtx(mem, off, block_rect, buff, pitch, TEXA);
+		}
 
 		const u8* ptr = buff + (pitch * static_cast<u32>(rect.top - block_rect.top)) +
 		                (static_cast<u32>(rect.left - block_rect.left) << (paltex ? 0 : 2));
@@ -9525,36 +10088,173 @@ GSTextureCache::HashCacheKey::HashCacheKey()
 	TEXA.U64 = 0;
 }
 
-GSTextureCache::HashCacheKey GSTextureCache::HashCacheKey::Create(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const u32* clut, const GSVector2i* lod, SourceRegion region)
+// True if a hash of the level has not been read from pages written since step `seq` of local memory.
+static bool HashLevelUnwritten(const GSLocalMemory& mem, const GIFRegTEX0& TEX0, const GSVector4i& block_rect, u64 seq)
+{
+	bool unwritten = true;
+	mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM).pageLooperForRect(block_rect).loopPagesWithBreak([&](u32 page) {
+		unwritten = mem.PageStamp(page) <= seq;
+		return unwritten;
+	});
+	return unwritten;
+}
+
+// The bits of TEX0 that HashTextureLevel reads: TBP0, TBW, PSM, TW and TH.
+static constexpr u64 HASH_MEMO_TEX0_BITS = 0x00000003FFFFFFFFULL;
+// The bits of TEXA that the texture reads can depend on: TA0, AEM and TA1.
+static constexpr u64 HASH_MEMO_TEXA_BITS = 0x000000FF000080FFULL;
+
+// Set in HashCacheKey::TEX0 of a key whose window used to be hashed as texels and now is of raw blocks
+// (HashTextureLevel), in a bit of TBP0, which the key does not otherwise carry. A raw hash is not a texel
+// hash, so a key of one kind must never equal one of the other, even by a hash collision. A window that was
+// always hashed from its blocks has the same hash, and the same key, in both modes.
+static constexpr u64 HASH_KEY_RAW_BLOCKS = 1;
+
+GSTextureCache::HashCacheKey GSTextureCache::HashCacheKey::Create(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA, const u32* clut, const GSVector2i* lod, SourceRegion region, bool raw_blocks)
 {
 	const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
+	const HashLevelGeometry base_geometry = GetHashLevelGeometry(TEX0, region);
 
 	HashCacheKey ret;
 	ret.TEX0.U64 = TEX0.U64 & 0x00000003FFF00000ULL; // PSM, TW, TH
+	static_assert((0x00000003FFF00000ULL & HASH_KEY_RAW_BLOCKS) == 0, "the tag must be a bit the key does not carry");
+	if (HashLevelIsRaw(psm, base_geometry, region, raw_blocks))
+		ret.TEX0.U64 |= HASH_KEY_RAW_BLOCKS;
 	ret.TEXA.U64 = (psm.pal == 0 && psm.fmt > 0) ? (TEXA.U64 & 0x000000FF000080FFULL) : 0;
 	ret.CLUTHash = clut ? GSTextureCache::PaletteKeyHash{}({clut, psm.pal}) : 0;
 	ret.region_width = static_cast<u16>(region.GetWidth());
 	ret.region_height = static_cast<u16>(region.GetHeight());
 
-	BlockHashState hash_st;
-	BlockHashReset(hash_st);
+	// The levels to hash: the base, then the mipmaps of the chain when they are enabled.
+	const int basemip = lod ? lod->x : 0;
+	const u32 levels = lod ? static_cast<u32>(std::max(lod->y - lod->x, 0)) + 1 : 1;
 
-	// base level is always hashed
-	HashTextureLevel(TEX0, TEXA, region, hash_st, s_unswizzle_buffer);
+	GIFRegTEX0 level_tex0[HASH_MEMO_MAX_LEVELS];
+	level_tex0[0] = TEX0;
+	for (u32 i = 1; i < std::min(levels, HASH_MEMO_MAX_LEVELS); i++)
+		level_tex0[i] = g_gs_renderer->GetTex0Layer(basemip + i);
 
-	if (lod)
-	{
+	// The raw levels of a lookup are keyed through the block hash cache when it is on. A paletted format is
+	// the only one with a raw level, so no other lookup makes the cache.
+	GSTextureCache* const tc = g_texture_cache.get();
+	GSTextureCache::BlockHashCache* const block_hashes =
+		(raw_blocks && psm.pal > 0 && s_block_hash_cache_enabled && tc) ? &tc->SyncBlockHashCache(g_gs_renderer->m_mem) : nullptr;
+
+	const auto hash_levels = [&](GSTextureCache::BlockHashCache* cache) {
+		BlockHashState hash_st;
+		BlockHashReset(hash_st);
+
+		// base level is always hashed
+		u64 window_offsets = HashTextureLevel(TEX0, TEXA, region, hash_st, s_unswizzle_buffer, raw_blocks, cache);
+
 		// hash and combine full mipmaps when enabled
-		const int basemip = lod->x;
-		const int nmips = lod->y - lod->x + 1;
-		for (int i = 1; i < nmips; i++)
+		for (u32 i = 1; i < levels; i++)
 		{
-			const GIFRegTEX0 MIP_TEX0{g_gs_renderer->GetTex0Layer(basemip + i)};
-			HashTextureLevel(MIP_TEX0, TEXA, region.AdjustForMipmap(i), hash_st, s_unswizzle_buffer);
+			const GIFRegTEX0 MIP_TEX0 = (i < HASH_MEMO_MAX_LEVELS) ? level_tex0[i] : g_gs_renderer->GetTex0Layer(basemip + i);
+			const u32 offset = HashTextureLevel(MIP_TEX0, TEXA, region.AdjustForMipmap(i), hash_st, s_unswizzle_buffer, raw_blocks, cache);
+			window_offsets = window_offsets * 0x100000001B3ULL + offset;
 		}
+
+		// Where each raw level's window starts inside its first block, which the blocks do not say. It goes in
+		// after the last block, because a block fed after any other input takes the slow path. It is zero, and
+		// adds nothing, for a window that starts on a block edge and for levels hashed as texels.
+		if (window_offsets)
+			BlockHashAccumulate(hash_st, reinterpret_cast<const u8*>(&window_offsets), sizeof(window_offsets));
+
+		return FinishBlockHash(hash_st);
+	};
+
+	// A texture whose memory has not been written since it was last hashed hashes to the same value, so
+	// that value is reused. The hash is a function of the bytes of the pages the levels cover, and of
+	// everything HashTextureLevel reads besides them: the TEX0 bits above, the TEXA bits, and the region
+	// (the clut is not part of TEX0Hash). Only the whole key matching counts.
+	//
+	// Only a texture of some size is memoised. A frame hashes a hundred or more textures, most of them a
+	// few KiB and most of those written again before the next frame, and a memo of 32 entries that took
+	// them all would lose the one large texture that hits to the small ones that do not.
+	const int base_blocks = (base_geometry.block_rect.width() / psm.bs.x) * (base_geometry.block_rect.height() / psm.bs.y);
+
+	// Verify mode of the block hash cache: every lookup, memo or not, is keyed both ways and the two are compared.
+	if (s_block_hash_verify && block_hashes) [[unlikely]]
+	{
+		const u64 cached_levels = s_block_hash_levels_cached;
+		ret.TEX0Hash = hash_levels(block_hashes);
+		if (s_block_hash_levels_cached != cached_levels)
+			VerifyBlockHashKey(ret, hash_levels(nullptr));
+		return ret;
 	}
 
-	ret.TEX0Hash = FinishBlockHash(hash_st);
+	if (!tc || levels > HASH_MEMO_MAX_LEVELS || base_blocks < HASH_MEMO_MIN_BLOCKS)
+	{
+		ret.TEX0Hash = hash_levels(block_hashes);
+		return ret;
+	}
+
+	const auto level_geometry = [&](u32 i) { return i ? GetHashLevelGeometry(level_tex0[i], region.AdjustForMipmap(i)) : base_geometry; };
+
+	HashMemo& memo = tc->m_hash_memo;
+	GSLocalMemory& mem = g_gs_renderer->m_mem;
+	const u64 texa = TEXA.U64 & HASH_MEMO_TEXA_BITS;
+	const u64 base_tex0 = TEX0.U64 & HASH_MEMO_TEX0_BITS;
+	HashMemoEntry& entry = memo.entries[((base_tex0 * 0x9E3779B97F4A7C15ULL) ^ (region.bits * 0xC2B2AE3D27D4EB4FULL) ^ (levels * 0x165667B19E3779F9ULL)) >> (64 - 5)];
+	static_assert(HASH_MEMO_ENTRIES == 32, "the index above takes 5 bits");
+	memo.stats.lookups++;
+
+	bool key_matches = entry.levels == levels && entry.texa == texa && entry.region == region.bits && entry.raw_blocks == raw_blocks &&
+	                   entry.block_hash_cache == (block_hashes != nullptr);
+	for (u32 i = 0; key_matches && i < levels; i++)
+		key_matches = entry.tex0[i] == (level_tex0[i].U64 & HASH_MEMO_TEX0_BITS);
+
+	if (key_matches)
+	{
+		// The pages each level reads, from the same rectangle HashTextureLevel reads. A level whose rectangle
+		// has no page set was never stored, so a matching entry has one for every level.
+		bool unwritten = true;
+		for (u32 i = 0; unwritten && i < levels; i++)
+		{
+			unwritten = HashLevelUnwritten(mem, level_tex0[i], level_geometry(i).block_rect, entry.seq);
+		}
+
+		if (unwritten)
+		{
+			memo.stats.hits++;
+			ret.TEX0Hash = entry.hash;
+
+			if (s_hash_memo_verify) [[unlikely]]
+			{
+				const HashType fresh = hash_levels(block_hashes);
+				if (!VerifyHashMemoHit(TEX0, entry.hash, fresh))
+				{
+					ret.TEX0Hash = fresh;
+					entry.levels = 0;
+				}
+			}
+			return ret;
+		}
+
+		memo.stats.stale++;
+	}
+
+	// The sequence is noted before the pages are read: a store after this has a stamp past it.
+	const u64 seq = mem.WriteSeq();
+	ret.TEX0Hash = hash_levels(block_hashes);
+
+	bool has_page_sets = true;
+	for (u32 i = 0; has_page_sets && i < levels; i++)
+		has_page_sets = GSLocalMemory::HasPageSet(level_geometry(i).block_rect);
+
+	if (has_page_sets)
+	{
+		entry.seq = seq;
+		entry.hash = ret.TEX0Hash;
+		entry.texa = texa;
+		entry.region = region.bits;
+		entry.raw_blocks = raw_blocks;
+		entry.block_hash_cache = (block_hashes != nullptr);
+		entry.levels = levels;
+		for (u32 i = 0; i < levels; i++)
+			entry.tex0[i] = level_tex0[i].U64 & HASH_MEMO_TEX0_BITS;
+	}
 
 	return ret;
 }

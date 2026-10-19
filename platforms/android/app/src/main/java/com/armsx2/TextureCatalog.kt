@@ -9,7 +9,9 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * The online texture-pack catalog, hosted by sashkinbro and shared with us with his approval.
+ * The online texture-pack catalog: ours, at dl.ps2ktxpak.net. It began as a conversion of
+ * sashkinbro's catalog (used with his approval), which is where its pack ids come from; his own
+ * catalog is no longer read.
  *
  * Structure follows [SkinRepo]: fetch a manifest, list what matches, install on demand. The parsing
  * is deliberately written against `org.json` rather than kotlinx-serialization as upstream does —
@@ -22,15 +24,11 @@ import java.net.URL
 object TextureCatalog {
     private const val TAG = "TextureCatalog"
 
-    /** Sources, tried in order. The B2 bucket is ours and serves the converted ASTC KTX packs
-     *  (schema 2, tar+zstd); the sashkinbro mirrors stay as fallback and still serve the original
-     *  schema-1 ZIP packs when B2 is unreachable. The raw host is fastest, the second is a
-     *  different GitHub edge, and jsDelivr survives GitHub being blocked on some networks. */
+    /** Sources, tried in order: our catalog of converted ASTC KTX packs (schema 2, tar+zstd), and
+     *  the B2 bucket it is served from, for when that domain is unreachable. */
     private val CATALOG_URLS = listOf(
+        "https://dl.ps2ktxpak.net/textures.json",
         "https://f005.backblazeb2.com/file/armsx2-textures/textures.json",
-        "https://raw.githubusercontent.com/sashkinbro/EmuCoreX-Textures/main/textures.json",
-        "https://github.com/sashkinbro/EmuCoreX-Textures/raw/main/textures.json",
-        "https://cdn.jsdelivr.net/gh/sashkinbro/EmuCoreX-Textures@main/textures.json",
     )
 
     private const val SCHEMA_VERSION = 1
@@ -38,7 +36,9 @@ object TextureCatalog {
     private const val MAX_SCHEMA_VERSION = 2
     private const val MAX_CATALOG_BYTES = 8L * 1024 * 1024
     private const val CACHE_TTL_MS = 6L * 60 * 60 * 1000
-    private const val CACHE_FILE = "textures-v1.json"
+    private const val CACHE_FILE = "textures-v2.json"
+    /** Older builds' cache, which can hold sashkinbro's catalog: never shown again, so deleted. */
+    private const val OLD_CACHE_FILE = "textures-v1.json"
 
     /** Upper bound on a single archive. Guards against a malformed entry proposing a download that
      *  could never fit; the real free-space check happens in [TexturePackInstaller]. */
@@ -103,6 +103,19 @@ object TextureCatalog {
             !serial.isNullOrBlank() && serials.any { it.equals(serial, ignoreCase = true) }
 
         /**
+         * The serial folder this pack installs into for this player. The core only reads
+         * replacements from the folder named for the running disc's own serial, so a multi-region
+         * pack has to land under the serial of the copy the player has: the game in context if the
+         * pack covers it, else the first of the pack's serials in [ownedSerials] (upper-case), else
+         * the first one listed. Always using the first one listed put a PAL player's pack under the
+         * NTSC serial, where their game never looks.
+         */
+        fun installSerialFor(contextSerial: String?, ownedSerials: Set<String>): String =
+            serials.firstOrNull { it.equals(contextSerial, ignoreCase = true) }
+                ?: serials.firstOrNull { it.uppercase() in ownedSerials }
+                ?: serials.first()
+
+        /**
          * The pieces to fetch, in order. A single-file pack presents as one piece so the installer
          * has exactly one path to maintain rather than a split one.
          */
@@ -116,6 +129,7 @@ object TextureCatalog {
 
     /** Blocking. Returns null only when there is neither a usable network response nor a cache. */
     fun fetch(context: Context, forceRefresh: Boolean = false): Result? {
+        File(cacheDir(context), OLD_CACHE_FILE).delete()
         val cache = File(cacheDir(context), CACHE_FILE)
         if (!forceRefresh && cache.isFile &&
             (System.currentTimeMillis() - cache.lastModified()) < CACHE_TTL_MS

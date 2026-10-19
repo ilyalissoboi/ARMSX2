@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "GameDatabase.h"
+
+#include "AutoTune/AutoTuneApplier.h"
 #ifdef ARMSX2_EMBEDDED_RESOURCES
 #include "EmbeddedResources.h"
 #endif
@@ -10,6 +12,7 @@
 #include "IconsFontAwesome.h"
 #include "vtlb.h"
 
+#include "common/ARCADE.h"
 #include "common/Console.h"
 #include "common/EnumOps.h"
 #include "common/Error.h"
@@ -100,6 +103,14 @@ const char* GameDatabaseSchema::GameEntry::compatAsString() const
 void GameDatabase::populateEntry(GameDatabaseSchema::GameEntry& gameEntry, const std::string_view serial,
 	const ryml::NodeRef& node, bool is_override)
 {
+	// Arcade entries (PCSX2x6).
+	if (node.has_child("bootprog"))
+		node["bootprog"] >> gameEntry.arcade.bootprog;
+	if (node.has_child("media"))
+		node["media"] >> gameEntry.arcade.media;
+	if (node.has_child("input"))
+		node["input"] >> gameEntry.arcade.input;
+
 	if (node.has_child("name"))
 	{
 		node["name"] >> gameEntry.name;
@@ -421,7 +432,7 @@ static const char* s_gs_hw_fix_names[] = {
 	"nativePaletteDraw",
 	"estimateTextureRegion",
 	"drawBuffering",
-	"rewriteLargeST",
+	"rewriteLargeSTCoords",
 	"PCRTCOffsets",
 	"PCRTCOverscan",
 	"coalesceRenderPasses",
@@ -440,6 +451,7 @@ static const char* s_gs_hw_fix_names[] = {
 	"gpuPaletteConversion",
 	"minimumBlendingLevel",
 	"maximumBlendingLevel",
+	"copyRoadMaximumBlendingLevel",
 	"recommendedBlendingLevel",
 	"recommendedAccurateAlphaTest",
 	"recommendedHWAA1",
@@ -463,6 +475,10 @@ static std::optional<GameDatabaseSchema::GSHWFixId> GameDatabaseSchema::parseHWF
 			return static_cast<GameDatabaseSchema::GSHWFixId>(i);
 	}
 
+	// ARMSX2 2.6.9 shipped this fix before upstream renamed it; custom databases may still use it.
+	if (name == "rewriteLargeST")
+		return GameDatabaseSchema::GSHWFixId::RewriteLargeSTCoords;
+
 	return std::nullopt;
 }
 
@@ -476,6 +492,7 @@ bool GameDatabaseSchema::isUserHackHWFix(GSHWFixId id)
 		case GSHWFixId::TrilinearFiltering:
 		case GSHWFixId::MinimumBlendingLevel:
 		case GSHWFixId::MaximumBlendingLevel:
+		case GSHWFixId::CopyRoadMaximumBlendingLevel:
 		case GSHWFixId::RecommendedBlendingLevel:
 		case GSHWFixId::PCRTCOffsets:
 		case GSHWFixId::PCRTCOverscan:
@@ -538,7 +555,7 @@ static std::optional<GSUserHackOverride> UserHackOverrideForHWFix(GameDatabaseSc
 			return GSUserHackOverride::CPUCLUTRender;
 		case GameDatabaseSchema::GSHWFixId::GPUTargetCLUT:
 			return GSUserHackOverride::GPUTargetCLUT;
-		case GameDatabaseSchema::GSHWFixId::RewriteLargeST:
+		case GameDatabaseSchema::GSHWFixId::RewriteLargeSTCoords:
 			return GSUserHackOverride::RewriteLargeST;
 		default:
 			return std::nullopt;
@@ -670,6 +687,13 @@ void GameDatabaseSchema::GameEntry::applyGameFixes(
 		// Legacy note - speedhacks are setup in the GameDB as integer values, but
 		// are effectively booleans like the gamefixes
 		config.Speedhacks.Set(it.first, it.second);
+
+		// The database has just staked a compatibility claim on this game's EE timing.
+		// Record it: the resolved selector cannot say so afterwards, and the dynamic
+		// governor is only allowed to move a rate nobody claimed.
+		if (it.first == SpeedHack::EECycleRate)
+			config.GameDBSetEECycleRate = true;
+
 		if (!quiet)
 		{
 			Console.WriteLn("GameDB: Setting Speedhack '%s' to [mode=%d]",
@@ -765,8 +789,8 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
 		case GSHWFixId::DrawBuffering:
 			return (static_cast<int>(config.UserHacks_DrawBuffering) == value);
 		
-		case GSHWFixId::RewriteLargeST:
-			return (static_cast<int>(config.UserHacks_RewriteLargeST) == value);
+		case GSHWFixId::RewriteLargeSTCoords:
+			return (static_cast<int>(config.UserHacks_RewriteLargeSTCoords) == value);
 
 		case GSHWFixId::PCRTCOffsets:
 			return (static_cast<int>(config.PCRTCOffsets) == value);
@@ -830,6 +854,12 @@ bool GameDatabaseSchema::GameEntry::configMatchesHWFix(const Pcsx2Config::GSOpti
 			return (static_cast<int>(config.AccurateBlendingUnit) >= value);
 
 		case GSHWFixId::MaximumBlendingLevel:
+			return (static_cast<int>(config.AccurateBlendingUnit) <= value);
+
+		case GSHWFixId::CopyRoadMaximumBlendingLevel:
+			// The cap is a ceiling the GS applies later, and only on the roads that charge for a
+			// destination read, so a player already at or below it has nothing left for this fix
+			// to do, on any device.
 			return (static_cast<int>(config.AccurateBlendingUnit) <= value);
 
 		case GSHWFixId::RecommendedBlendingLevel:
@@ -981,8 +1011,8 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 				config.UserHacks_DrawBuffering = (value > 0);
 				break;
 
-			case GSHWFixId::RewriteLargeST:
-				config.UserHacks_RewriteLargeST = (value > 0);
+			case GSHWFixId::RewriteLargeSTCoords:
+				config.UserHacks_RewriteLargeSTCoords = (value > 0);
 				break;
 
 			case GSHWFixId::PCRTCOffsets:
@@ -1104,9 +1134,21 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 			}
 			break;
 
+			case GSHWFixId::CopyRoadMaximumBlendingLevel:
+			{
+				// Recorded, not applied. Whether the cap bites depends on how the device serves a
+				// render-target self-read, and that is not known here -- the GS device may not
+				// exist yet, and it is the GS thread's to read when it does. So the value rides to
+				// GSConfig and GS.cpp asks GSCopyRoadBlendingPolicy.h once the device is up.
+				if (value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum))
+					config.CopyRoadMaximumBlendingLevel = static_cast<s8>(value);
+			}
+			break;
+
 			case GSHWFixId::RecommendedBlendingLevel:
 			{
-				if (quiet)
+				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
+				if (quiet || AutoTune::IsApplyingSettings())
 					break;
 
 				if (!is_sw_renderer && value >= 0 && value <= static_cast<int>(AccBlendLevel::Maximum) && static_cast<int>(EmuConfig.GS.AccurateBlendingUnit) < value)
@@ -1140,7 +1182,8 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 
 			case GSHWFixId::RecommendedAccurateAlphaTest:
 			{
-				if (quiet)
+				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
+				if (quiet || AutoTune::IsApplyingSettings())
 					break;
 
 				if (!is_sw_renderer && value >= 0 && value <= 1 &&
@@ -1164,7 +1207,8 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 
 			case GSHWFixId::RecommendedHWAA1:
 			{
-				if (quiet)
+				// Quiet also while auto-tune applies a trial: a toast per apply stacks up (see AutoTune::IsApplyingSettings).
+				if (quiet || AutoTune::IsApplyingSettings())
 					break;
 
 				if (!is_sw_renderer && value >= 0 && value <= 1 &&
@@ -1226,6 +1270,57 @@ void GameDatabaseSchema::GameEntry::applyGSHardwareFixes(
 	{
 		Host::RemoveKeyedOSDMessage("HWFixesWarning");
 	}
+}
+
+std::vector<GameDatabaseSchema::GameEntry::ClaimableSetting> GameDatabaseSchema::GameEntry::claimableSettings() const
+{
+	std::vector<ClaimableSetting> out;
+
+	// Names match the labels applyGameFixes() logs, so the list and a log line read together.
+	const auto add_knob = [&out](CoreGameDBKnob knob, const char* name, int value) {
+		const PerGameOverrideKeys::CoreKnobKeys keys = PerGameOverrideKeys::ForCoreKnob(knob);
+		if (!keys.section)
+			return;
+
+		ClaimableSetting& setting = out.emplace_back(ClaimableSetting{name, value, true, false, {}});
+		for (u32 i = 0; i < keys.count; i++)
+			setting.keys.emplace_back(keys.section, keys.keys[i]);
+	};
+
+	if (eeRoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::EERoundMode, "eeRoundMode", static_cast<int>(eeRoundMode));
+	if (eeDivRoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::EEDivRoundMode, "eeDivRoundMode", static_cast<int>(eeDivRoundMode));
+	if (vu0RoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::VU0RoundMode, "vu0RoundMode", static_cast<int>(vu0RoundMode));
+	if (vu1RoundMode < FPRoundMode::MaxCount)
+		add_knob(CoreGameDBKnob::VU1RoundMode, "vu1RoundMode", static_cast<int>(vu1RoundMode));
+	if (eeClampMode != ClampMode::Undefined)
+		add_knob(CoreGameDBKnob::EEClampMode, "eeClampMode", enum_cast(eeClampMode));
+	if (vu0ClampMode != ClampMode::Undefined)
+		add_knob(CoreGameDBKnob::VU0ClampMode, "vu0ClampMode", enum_cast(vu0ClampMode));
+	if (vu1ClampMode != ClampMode::Undefined)
+		add_knob(CoreGameDBKnob::VU1ClampMode, "vu1ClampMode", enum_cast(vu1ClampMode));
+
+	for (const auto& [hack, value] : speedHacks)
+	{
+		if (const char* key = PerGameOverrideKeys::ForSpeedHack(hack))
+			out.push_back({Pcsx2Config::SpeedhackOptions::GetSpeedHackName(hack), value, true, false, {{"EmuCore/Speedhacks", key}}});
+	}
+
+	for (const GamefixId id : gameFixes)
+	{
+		if (const char* key = PerGameOverrideKeys::ForGamefix(id))
+			out.push_back({Pcsx2Config::GamefixOptions::GetGameFixName(id), 1, true, false, {{"EmuCore/Gamefixes", key}}});
+	}
+
+	for (const auto& [id, value] : gsHWFixes)
+	{
+		if (const char* key = PerGameOverrideKeys::ForGSHWFix(id))
+			out.push_back({getHWFixName(id), value, false, isUserHackHWFix(id), {{"EmuCore/GS", key}}});
+	}
+
+	return out;
 }
 
 void GameDatabase::loadFile(const std::string& path, const std::string& name, bool is_override)
@@ -1315,6 +1410,21 @@ const GameDatabaseSchema::GameEntry* GameDatabase::findGame(const std::string_vi
 
 	auto iter = s_game_db.find(StringUtil::toLower(serial));
 	return (iter != s_game_db.end()) ? &iter->second : nullptr;
+}
+
+std::vector<std::pair<std::string, const GameDatabaseSchema::GameEntry*>> GameDatabase::findArcadeGames()
+{
+	GameDatabase::ensureLoaded();
+
+	std::vector<std::pair<std::string, const GameDatabaseSchema::GameEntry*>> games;
+	for (const auto& [serial, entry] : s_game_db)
+	{
+		std::string id = StringUtil::toUpper(serial);
+		if (Arcade::IsGameId(id))
+			games.emplace_back(std::move(id), &entry);
+	}
+	std::sort(games.begin(), games.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+	return games;
 }
 
 bool GameDatabase::TrackHash::parseHash(const std::string_view str)

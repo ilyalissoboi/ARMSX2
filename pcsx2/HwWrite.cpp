@@ -13,11 +13,14 @@
 #include "ps2/pgif.h"
 #include "SPU2/spu2.h"
 #include "R3000A.h"
+#include "common/ARCADE.h"
 
 #include "CDVD/Ps1CD.h"
 #include "CDVD/CDVD.h"
 
 #include "IopDma.h" // for iopIntcIrq
+#include "IopThread/IopBridge.h"
+#include "IopThread/SharedWord.h"
 
 using namespace R5900;
 
@@ -155,47 +158,57 @@ void _hwWrite32( u32 mem, u32 value )
 				}
 				return;
 
+				// The SBUS registers. The IOP reads and writes the same words through its 0x1D000000 window, so
+				// every write to them is one atomic operation (SharedWord.h). F200 and F210 are plain stores
+				// (they were: the default action below), F220 sets bits, F230 clears bits.
 				mcase(SBUS_F200):
-					// Performs a standard psHu32 assignment (which is the default action anyway).
-					//psHu32(mem) = value;
-				break;
+				mcase(SBUS_F210):
+					SharedWord::StoreRelease(psHu32(mem), value);
+				return;
 
 				mcase(SBUS_F220):
-					psHu32(mem) |= value;
+					SharedWord::FetchOr(psHu32(mem), value);
 				return;
 
 				mcase(SBUS_F230):
-					psHu32(mem) &= ~value;
+					SharedWord::FetchAnd(psHu32(mem), ~value);
 				return;
 
 				mcase(SBUS_F240):
 					if (value & (1 << 18))
 					{
-						iopIntcIrq(1);
+						IopBridge::RaiseIopIrq(1);
 					}
 					if (value & (1 << 19))
 					{
+						// PS1 mode forces the IOP thread off. This holds the IOP, stops its thread and
+						// has the EE core regenerate its dispatcher for Off (IOP thread design 9.6).
+						IopBridge::Ps1Switch ps1_switch;
 						u64 cycle = psxRegs.cycle;
 						//pgifInit();
 						psxReset();
-						PSXCLK =  33868800;
-						SPU2::Reset(true);
-						setPs1CDVDSpeed(cdvd.Speed);
-						psxHu32(HW_ICFG) = 0x8;
+						// An arcade board has no PS1 mode: keep its clocks and CD speed (PCSX2x6).
+						if (!Arcade::IsActive())
+						{
+							PSXCLK =  33868800;
+							SPU2::Reset(true);
+							setPs1CDVDSpeed(cdvd.Speed);
+							psxHu32(HW_ICFG) = 0x8;
+						}
 						psxHu32(HW_ICTRL) = 1;
 						psxRegs.cycle = cycle;
 					}
 					if(!(value & 0x100))
-						psHu32(mem) &= ~0x100;
+						SharedWord::FetchAnd(psHu32(mem), ~0x100u);
 					else
-						psHu32(mem) |= 0x100;
+						SharedWord::FetchOr(psHu32(mem), 0x100u);
 				return;
 
 				mcase(SBUS_F260):
 #if PSX_EXTRALOGS
 					DevCon.Warning("Write  SBUS_F260  %x ", psHu32(SBUS_F260));
 #endif
-					psHu32(mem) = value;
+					SharedWord::StoreRelease(psHu32(mem), value);
 				return;
 
 				// TODO: psx handling is done in the default case. Keep the code until we decide if we decide which interface to use (sif2/Pgif dma)

@@ -40,9 +40,22 @@ public:
 	// ---- Pre-state setters ----
 	void SetVf(u32 reg_idx, float x, float y, float z, float w);
 	void SetVfBits(u32 reg_idx, u32 x, u32 y, u32 z, u32 w);
+	void SetAccBits(u32 x, u32 y, u32 z, u32 w);
+	// Cycles each Execute() may run before the engine takes its budget break
+	// (default kCycleBudget).
+	void SetCycleBudget(u32 cycles) { cycle_budget_ = cycles; }
 	// Masks to the register's architectural width: 32-bit for the special VIs
 	// (REG_R/I/Q/P/flags/TPC/FBRST/VPU_STAT), low 16 for the rest. For REG_Q/P
 	// prefer SetQ/SetP, which also write the q.UL/p.UL float slot.
+	//
+	// Seeding REG_CLIP_FLAG, REG_MAC_FLAG or REG_STATUS_FLAG does not give a
+	// program an incoming flag, and the two engines disagree about what it
+	// does do: the recompiler reads its flag from the micro_*flags ring and
+	// sees nothing, the interpreter's FCGET/FMAND/FSAND read the VI slot and
+	// see the seed, so Run()'s own diff fires. A flag-writing op folds into
+	// the VURegs clipflag/macflag/statusflag scalar, which is neither of
+	// those. Build the incoming value in-band, from an earlier op in the
+	// same program.
 	void SetVi(u32 reg_idx, u32 value);
 	void SetQ(u32 bits);
 	void SetP(u32 bits);
@@ -128,6 +141,16 @@ public:
 	// asserting the pre-seeded block graph runs without a recompile.
 	void RunJitPreserveBlockCache();
 
+	// After a JIT-only run that a cycle budget cut short (RunJitPreserveBlockCache with a small
+	// SetCycleBudget): re-enters the JIT, as a game re-dispatches a program, with `budget` cycles
+	// each time until the program ends or `max_resumes` re-entries have been made. Updates
+	// JitSnapshot() and Path1PacketBytesJit() to the state at the end.
+	void ContinueJit(u32 budget, int max_resumes);
+	// The micro-memory byte address the next run starts at (default kProgramPc). The program a test
+	// loaded is at kProgramPc; a test that wrote another image elsewhere in micro memory starts it here
+	// with RunJitPreserveBlockCache(). Applies to every run after the call.
+	void SetStartPc(u32 pc) { start_pc_ = pc; }
+
 private:
 	void RunDiffing(const char* require_why);
 
@@ -207,6 +230,8 @@ private:
 	// Real microprograms can run thousands of cycles but the harness's
 	// E-bit terminator caps every test deterministically.
 	static constexpr u32 kCycleBudget = 4096;
+	u32 cycle_budget_ = kCycleBudget;
+	u32 start_pc_ = kProgramPc;
 
 	// Bound on ResumeUntilTerminated's re-entries. A program that has not
 	// terminated by then is reported rather than quietly truncated.

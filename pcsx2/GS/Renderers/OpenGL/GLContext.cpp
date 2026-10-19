@@ -15,6 +15,9 @@
 #ifdef WAYLAND_API
 #include "GS/Renderers/OpenGL/GLContextEGLWayland.h"
 #endif
+#ifndef __ANDROID__
+#include "GS/Renderers/OpenGL/GLContextEGL.h"
+#endif
 #endif
 
 #include "common/Console.h"
@@ -23,14 +26,19 @@
 #include "glad/gl.h"
 
 #if defined(ENABLE_LIBRETRO)
-#include "GS/Renderers/OpenGL/GLContextLibretro.h"
+#include "GS/Renderers/OpenGL/GLLibretro.h"
 #endif
+
+#include <cstdlib>
+#include <cstring>
 
 static bool ShouldPreferESContext()
 {
 	const char* value = std::getenv("PREFER_GLES_CONTEXT");
 	return (value && std::strcmp(value, "1") == 0);
 }
+
+bool GLContext::AllowHeadless = false;
 
 GLContext::GLContext(const WindowInfo& wi)
 	: m_wi(wi)
@@ -78,12 +86,19 @@ std::unique_ptr<GLContext> GLContext::Create(const WindowInfo& wi, Error* error)
 	}
 
 	std::unique_ptr<GLContext> context;
-	// A frontend-owned context wins over anything we could open ourselves, so
-	// it is asked first: in a libretro core there is no window for any of the
-	// platform contexts below to attach to in the first place.
+	// Libretro: the frontend owns the only context that can reach the screen,
+	// and it is current on the frontend's own thread - so this thread, the GS
+	// thread, gets one that shares its objects rather than one of its own. See
+	// GLLibretro. Nothing below could help here anyway: there is no window for
+	// a platform context to attach to.
 #if defined(ENABLE_LIBRETRO)
-	if (GLContextLibretro::IsAvailable())
-		context = GLContextLibretro::Create(wi, error);
+	if (GLLibretro::Active)
+	{
+		context = GLLibretro::CreateSharedContext(
+			wi, std::span<const Version>(versions_to_try, num_versions_to_try), error);
+		if (!context)
+			return nullptr;
+	}
 #endif
 
 #ifdef __ANDROID__
@@ -101,6 +116,11 @@ std::unique_ptr<GLContext> GLContext::Create(const WindowInfo& wi, Error* error)
 #ifdef WAYLAND_API
 	if (!context && wi.type == WindowInfo::Type::Wayland)
 		context = GLContextEGLWayland::Create(wi, std::span<const Version>(versions_to_try, num_versions_to_try), error);
+#endif
+// GLContextEGL.cpp is built only alongside a window system or libretro (pcsx2/CMakeLists.txt).
+#if !defined(__ANDROID__) && (defined(X11_API) || defined(WAYLAND_API) || defined(ENABLE_LIBRETRO))
+	if (!context && wi.type == WindowInfo::Type::Surfaceless && AllowHeadless)
+		context = GLContextEGL::Create(wi, std::span<const Version>(versions_to_try, num_versions_to_try), error);
 #endif
 #endif
 

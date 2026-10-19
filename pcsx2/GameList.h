@@ -29,6 +29,7 @@ namespace GameList
 		PS1Disc,
 		ELF,
 		Invalid,
+		Arcade, // A Namco System 246/256 game (serial = its game ID, CRC 0): an .acgame, or a loose image with the ID in its name. Start it with ArcadeSetup::Service::Prepare().
 		Count
 	};
 
@@ -102,6 +103,7 @@ namespace GameList
 		CompatibilityRating compatibility_rating = CompatibilityRating::Unknown;
 
 		__fi bool IsDisc() const { return (type == EntryType::PS1Disc || type == EntryType::PS2Disc); }
+		__fi bool IsArcade() const { return type == EntryType::Arcade; }
 	};
 
 	const char* EntryTypeToString(EntryType type, bool translate);
@@ -141,6 +143,9 @@ namespace GameList
 
 	/// Returns the total time played for a game. Requires the game to be scanned in the list.
 	std::time_t GetCachedPlayedTimeForSerial(const std::string& serial);
+
+	/// Returns the total time played for a game, read from the played-time file.
+	std::time_t GetPlayedTimeForSerial(const std::string& serial);
 
 	/// Formats a timestamp to something human readable (e.g. Today, Yesterday, 10/11/12).
 	std::string FormatTimestamp(std::time_t timestamp);

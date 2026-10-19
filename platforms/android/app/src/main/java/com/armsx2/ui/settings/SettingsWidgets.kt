@@ -89,11 +89,23 @@ import androidx.core.content.edit
  * white text, transparent borders. Each row is 24dp tall to keep the
  * tab content fitting in the same 75% screen height the Playing-Now
  * tab uses.
+ *
+ * A row that edits a [com.armsx2.config.Settings] field names it with `field`, the key
+ * Settings.toJson uses. That is what tints the row (see [OverrideMarks]): green where the game
+ * database sets it for the game, soft red where it is not at a default. Each also gets a small marker,
+ * a diamond for the database and a circle for the player, so it does not rest on colour alone. A row with no
+ * `field` (an app preference, a preset, a picker over several fields) is never tinted.
  */
 
 private val focusBlue = Color(0xFF3DA5FF)
 
 val LocalSettingsScrollState = staticCompositionLocalOf<ScrollState?> { null }
+
+/** The resolved CollapsibleSection titles a settings-search jump must open — the destination's
+ * section chain from the search index. Set only while search is resolving a jump, empty the rest
+ * of the time. Knowing the chain up front is what lets a collapsed section open for the jump
+ * without ever composing its rows to discover where the target lives. */
+internal val LocalSettingsSearchOpenSections = staticCompositionLocalOf<Set<String>> { emptySet() }
 
 /** The exclusive input layer the surrounding content belongs to — null on a base screen, a
  *  modal's key inside PadModal's host, which is the only thing that ever provides it.
@@ -135,7 +147,8 @@ internal object SettingsControllerNav {
     // sibling subtrees dispose in the order Compose happens to pick: the survivor is left
     // holding a layer that is no longer active, so it looks fine and answers nothing.
     //
-    // Written only by PadModal, via pushLayer/popLayer. Everything else reads.
+    // Written only via pushLayer/popLayer: by PadModal, and by the in-game menu's Friends panel.
+    // Everything else reads.
     private val layers = mutableStateListOf<Layer>()
 
     /** The layer that currently owns input; null when the base screen does. */
@@ -168,6 +181,7 @@ internal object SettingsControllerNav {
         val index = layers.indexOfLast { it.key == key }
         if (index < 0) return
         val gone = layers.removeAt(index)
+        if (lateFocus?.layer == key) lateFocus = null
         // Only the layer that was actually on top hands the selection back; a layer buried
         // under a still-open modal must not disturb what that modal has focused.
         if (index != layers.size) return
@@ -192,7 +206,17 @@ internal object SettingsControllerNav {
     // (e.g. the memcard "New Card" form, which registers after the card list but
     // is drawn above it).
     private val positions = HashMap<String, Pair<Float, Float>>()
+    // Measured width per id, for telling which column a control sits in (see [columnScreens]).
+    private val widths = HashMap<String, Float>()
     private val selectedId = mutableStateOf<String?>(null)
+
+    /** How many screens laid out in side-by-side columns are up (the texture and patch managers),
+     *  held through [ColumnControllerNav]. While any is, and no modal owns input, Up/Down keep to
+     *  the selection's column and Left/Right reach the next column even where nothing sits level
+     *  with the selection; otherwise a two-column screen walked up and down both columns
+     *  interleaved, and Left/Right did nothing. A count, so two such screens overlapping in a
+     *  transition cannot switch it off for each other. */
+    internal var columnScreens = 0
     val selectedIndex = mutableIntStateOf(-1)
     val scrollVelocity = mutableFloatStateOf(0f)
 
@@ -201,8 +225,9 @@ internal object SettingsControllerNav {
      *  scroll to the very top when a category chip regains focus. */
     fun currentSelectedId(): String? = selectedId.value
 
-    fun setPosition(id: String, x: Float, y: Float) {
+    fun setPosition(id: String, x: Float, y: Float, width: Float = 0f) {
         positions[id] = y to x
+        widths[id] = width
     }
 
     private fun orderedIds(): List<String> {
@@ -244,11 +269,35 @@ internal object SettingsControllerNav {
         registry[id] = Item(id, onConfirm, onLeft, onRight, layer)
         if (selectedId.value == id)
             selectedIndex.intValue = orderedIds().indexOf(id)
+        lateFocus?.let { late ->
+            when {
+                // The pad has moved since, or another modal is on top: that selection stands.
+                late.layer != activeLayer || selectedId.value != late.fallback -> lateFocus = null
+                id == late.id && layer == late.layer -> {
+                    lateFocus = null
+                    selectById(id)
+                }
+            }
+        }
+    }
+
+    /** A modal's initial focus that had not registered yet when the modal opened, because the
+     *  content it belongs to comes a moment later (the Icon Museum's panel, once its icons have
+     *  loaded). The modal opens on [fallback] meanwhile, and [id] takes over when it registers,
+     *  as long as the selection is still on [fallback]. */
+    private class LateFocus(val layer: String, val id: String, val fallback: String?)
+    private var lateFocus: LateFocus? = null
+
+    /** For PadModal: [id], the focus [layer] asked for on open, is not there yet. Select it when
+     *  it registers, unless the pad has moved by then. */
+    fun focusWhenRegistered(layer: String, id: String) {
+        lateFocus = LateFocus(layer, id, selectedId.value)
     }
 
     fun unregister(id: String) {
         registry.remove(id)
         positions.remove(id)
+        widths.remove(id)
         if (selectedId.value == id)
             selectedId.value = orderedIds().firstOrNull()
         selectedIndex.intValue = orderedIds().indexOf(selectedId.value)
@@ -260,16 +309,14 @@ internal object SettingsControllerNav {
         scrollVelocity.floatValue = 0f
     }
 
-    /** Highlight + scroll to the row whose id derives from [label] — used by settings search
-     *  to jump to a specific control after switching tabs. The shared row widgets register
-     *  label-based ids (toggle:/segmented:/segmented-grid:/slider:<label>[:hash]); sliders
-     *  append a composition hash, so those are matched by prefix. Returns true once a row
-     *  matched (the target tab must already be composed — retry until it is). */
+    /** Highlight + scroll to the row or section header whose id derives from [label] — used by
+     *  settings search after its jump has opened the destination's sections. Sliders append a
+     *  composition hash, so those are matched by prefix. Returns true only after the destination
+     *  control is visibly composed and registered. */
     fun selectByLabel(label: String): Boolean {
         val ids = orderedIds()
-        val exact = setOf("toggle:$label", "segmented:$label", "segmented-grid:$label", "slider:$label")
-        val id = ids.firstOrNull { it in exact }
-            ?: ids.firstOrNull { it.startsWith("slider:$label:") }
+        val id = ids.firstOrNull { settingsRowMatchesLabel(it, label) }
+            ?: ids.firstOrNull { settingsSectionMatchesLabel(it, label) }
             ?: return false
         selectedId.value = id
         selectedIndex.intValue = ids.indexOf(id)
@@ -342,11 +389,45 @@ internal object SettingsControllerNav {
         // built to prevent that. And it makes the scan deterministic: positions is a
         // HashMap, so the old iteration order was arbitrary, and any tie between two
         // equally-good candidates was settled differently from run to run.
-        val candidates = orderedIds().mapNotNull { id ->
+        val all = orderedIds().mapNotNull { id ->
             if (id == curId) null else positions[id]?.let { id to it }
         }
+        val columns = columnScreens > 0 && activeLayer == null
+        // In a column layout, Up/Down look in the selection's own column first: the controls whose
+        // width overlaps its width. Only when that column has nothing more that way do they look
+        // everywhere, as before, so a column's end is never a dead end.
+        val curWidth = curId?.let { widths[it] } ?: 0f
+        val inColumn = { id: String, p: Pair<Float, Float> ->
+            val w = widths[id] ?: 0f
+            p.second < cx + curWidth && cx < p.second + w
+        }
+        val target = (if (columns && dy != 0) spatialTarget(dx, dy, cy, cx, rowTol, all.filter { (id, p) -> inColumn(id, p) }) else null)
+            ?: spatialTarget(dx, dy, cy, cx, rowTol, all)
+            // Left/Right with nothing level with the selection: in a column layout, the nearest
+            // control that way, the closest in height first.
+            ?: if (columns && dx != 0) {
+                all.filter { (_, p) -> if (dx > 0) p.second - cx > 1f else p.second - cx < -1f }
+                    .minByOrNull { (_, p) -> abs(p.first - cy) + abs(p.second - cx) * 0.25f }?.first
+            } else null
 
-        val target: String? = if (dy != 0) {
+        if (target == null) return false
+        selectedId.value = target
+        selectedIndex.intValue = orderedIds().indexOf(target)
+        com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
+        return true
+    }
+
+    /** The control a move lands on among [candidates] (id to (y, x)), or null: the rules
+     *  [moveSpatial] describes. */
+    private fun spatialTarget(
+        dx: Int,
+        dy: Int,
+        cy: Float,
+        cx: Float,
+        rowTol: Float,
+        candidates: List<Pair<String, Pair<Float, Float>>>,
+    ): String? {
+        return if (dy != 0) {
             // Vertical: step exactly ONE row in the travel direction, then land on the
             // item in that row whose x is closest to the current x. Row-based (not a
             // per-item distance score) so Up and Down are symmetric and can never skip
@@ -389,12 +470,6 @@ internal object SettingsControllerNav {
             }
             bestId
         }
-
-        if (target == null) return false
-        selectedId.value = target
-        selectedIndex.intValue = orderedIds().indexOf(target)
-        com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.NAV)
-        return true
     }
 
     fun adjust(delta: Int): Boolean {
@@ -471,6 +546,25 @@ internal fun ControllerAutoScroll(scroll: ScrollState) {
     }
 }
 
+/** Marks the calling screen as laid out in side-by-side columns for the controller, for as long as
+ *  it is composed (see [SettingsControllerNav.columnScreens]). */
+@Composable
+internal fun ColumnControllerNav() {
+    DisposableEffect(Unit) {
+        SettingsControllerNav.columnScreens++
+        onDispose { SettingsControllerNav.columnScreens-- }
+    }
+}
+
+/** The registry ids used by the shared settings rows. Slider ids may carry an additional
+ * composition suffix, but other prefixes must match the whole label. */
+internal fun settingsRowMatchesLabel(id: String, label: String): Boolean =
+    id == "toggle:$label" || id == "segmented:$label" ||
+        id == "segmented-grid:$label" || id == "slider:$label" ||
+        id.startsWith("slider:$label:")
+
+internal fun settingsSectionMatchesLabel(id: String, label: String): Boolean = id == "section.$label"
+
 internal fun Modifier.controllerFocusable(
     controllerId: String? = null,
     shape: RoundedCornerShape = RoundedCornerShape(16.dp),
@@ -515,7 +609,7 @@ internal fun Modifier.controllerFocusable(
             if (controllerId != null)
                 Modifier.onGloballyPositioned {
                     val p = it.positionInRoot()
-                    SettingsControllerNav.setPosition(controllerId, p.x, p.y)
+                    SettingsControllerNav.setPosition(controllerId, p.x, p.y, it.size.width.toFloat())
                 }
             else Modifier,
         )
@@ -529,8 +623,8 @@ internal fun Modifier.controllerFocusable(
                     onConfirm?.invoke()
                     onConfirm != null
                 }
-                // Left/Right adjust the value in place (stepper −/+, toggle off/on,
-                // dropdown prev/next) when this row has an adjust handler. Consumed
+                // Left/Right adjust the value in place (stepper −/+, dropdown
+                // prev/next) when this row has an adjust handler. Consumed
                 // only when a handler exists, so plain nav rows still let Left/Right
                 // move focus. This is what makes sliders/steppers adjustable with a
                 // controller when the row is driven by Compose focus, rather than by
@@ -602,6 +696,12 @@ fun CollapsibleSection(
     var expanded by androidx.compose.runtime.saveable.rememberSaveable(title) {
         mutableStateOf(initiallyExpanded)
     }
+    if (!expanded && title in LocalSettingsSearchOpenSections.current) {
+        // A settings-search jump targets a row (or this header) behind a collapsed section. Open
+        // it before the jump selects its destination — the chain names every section to open, so
+        // this needs no look at the rows this section would show.
+        SideEffect { expanded = true }
+    }
     val toggle = {
         expanded = !expanded
         com.armsx2.MenuSfx.play(
@@ -632,7 +732,8 @@ fun CollapsibleSection(
         )
     }
     // Collapsed content is not composed at all, so its rows also drop out of the controller-focus
-    // registry — a pad cannot land on a setting the user cannot see.
+    // registry — a pad cannot land on a setting the user cannot see. A search jump opens the
+    // section (above) before it selects anything, so the destination is always a visible row.
     if (expanded) content()
 }
 
@@ -654,11 +755,12 @@ fun ToggleRow(
     label: String,
     value: Boolean,
     description: String? = null,
+    field: String? = null,
     onChange: (Boolean) -> Unit,
 ) {
-    // Menu SFX: a distinct on/off blip on every flip. Touch, the switch, and the controller's
-    // confirm/left/right all route through this, so one wrapper covers every input path; the
-    // left/right guards below keep it silent when nothing actually changes.
+    val tint = rowTint(field)
+    // Menu SFX: a distinct on/off blip on every flip. Touch, the switch, and the controller's A
+    // all route through this, so one wrapper covers every input path.
     val emit: (Boolean) -> Unit = {
         com.armsx2.MenuSfx.play(if (it) com.armsx2.MenuSfx.Event.TOGGLE_ON else com.armsx2.MenuSfx.Event.TOGGLE_OFF)
         onChange(it)
@@ -670,16 +772,13 @@ fun ToggleRow(
             .padding(vertical = 5.dp)
             .controllerFocusable(
                 controllerId = "toggle:$label",
+                // Only A flips it: Left/Right are for moving, and on a switch they flipped it by
+                // accident on the way past.
                 onConfirm = { emit(!value) },
-                onLeft = { if (value) emit(false) },
-                onRight = { if (!value) emit(true) },
             ),
         shape = RoundedCornerShape(22.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            MaterialTheme.colorScheme.outline.copy(alpha = 0.46f),
-        ),
+        color = tint.container,
+        border = androidx.compose.foundation.BorderStroke(1.dp, tint.border),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -690,7 +789,7 @@ fun ToggleRow(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                     if (description != null) InfoHint(label, description)
                 }
                 if (description != null) {
@@ -732,8 +831,10 @@ fun IntSliderRow(
     description: String? = null,
     valueFormatter: (Int) -> String = { it.toString() },
     onReset: (() -> Unit)? = null,
+    field: String? = null,
     onChange: (Int) -> Unit,
 ) {
+    val tint = rowTint(field)
     // Include the call-site composite-key hash so two sliders that happen to share a
     // label (e.g. the OSD-scale and border-scale rows both labelled "UI Size") get
     // DISTINCT registry ids — otherwise one overwrites the other and the controller
@@ -755,11 +856,8 @@ fun IntSliderRow(
                 onRight = { onChangeSfx((value + 1).coerceAtMost(max)) },
             ),
         shape = RoundedCornerShape(22.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            MaterialTheme.colorScheme.outline.copy(alpha = 0.46f),
-        ),
+        color = tint.container,
+        border = androidx.compose.foundation.BorderStroke(1.dp, tint.border),
     ) {
         Column(
             modifier = Modifier
@@ -770,7 +868,7 @@ fun IntSliderRow(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                         if (description != null) InfoHint(label, description)
                     }
                     if (description != null) {
@@ -1032,8 +1130,10 @@ fun SegmentedRow(
     options: List<String>,
     selectedIndex: Int,
     description: String? = null,
+    field: String? = null,
     onChange: (Int) -> Unit,
 ) {
+    val tint = rowTint(field)
     // Menu SFX: a select blip when the chosen option changes — covers the chip tap and the
     // controller's confirm/left/right, which all route through onChange.
     val emit: (Int) -> Unit = { com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SELECT); onChange(it) }
@@ -1042,8 +1142,8 @@ fun SegmentedRow(
             .fillMaxWidth()
             .padding(vertical = 5.dp)
             .clip(RoundedCornerShape(22.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f))
-            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.46f), RoundedCornerShape(22.dp))
+            .background(tint.container)
+            .border(1.dp, tint.border, RoundedCornerShape(22.dp))
             .controllerFocusable(
                 controllerId = "segmented:$label",
                 onConfirm = {
@@ -1067,7 +1167,7 @@ fun SegmentedRow(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                 if (description != null) InfoHint(label, description)
             }
             if (description != null) {
@@ -1125,15 +1225,17 @@ fun SegmentedGridRow(
     selectedIndex: Int,
     columns: Int = 3,
     description: String? = null,
+    field: String? = null,
     onChange: (Int) -> Unit,
 ) {
+    val tint = rowTint(field)
     Box(
         Modifier
             .fillMaxWidth()
             .padding(vertical = 5.dp)
             .clip(RoundedCornerShape(22.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f))
-            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.46f), RoundedCornerShape(22.dp))
+            .background(tint.container)
+            .border(1.dp, tint.border, RoundedCornerShape(22.dp))
             .controllerFocusable(
                 controllerId = "segmented-grid:$label",
                 onConfirm = {
@@ -1154,7 +1256,7 @@ fun SegmentedGridRow(
     ) {
         Column {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f).overrideMarker(tint, 23.sp))
                 if (description != null) InfoHint(label, description)
             }
             if (description != null) {

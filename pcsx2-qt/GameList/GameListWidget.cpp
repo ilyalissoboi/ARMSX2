@@ -255,7 +255,7 @@ void GameListWidget::initialize()
 		if (type != static_cast<u32>(GameList::EntryType::Invalid))
 		{
 			m_ui.filterType->addItem(GameListModel::getIconForType(static_cast<GameList::EntryType>(type)),
-				GameList::EntryTypeToString(static_cast<GameList::EntryType>(type), true));
+				GameList::EntryTypeToString(static_cast<GameList::EntryType>(type), true), type);
 		}
 	}
 
@@ -271,7 +271,9 @@ void GameListWidget::initialize()
 	connect(m_ui.viewGridTitles, &QPushButton::toggled, this, &GameListWidget::setShowCoverTitles);
 	connect(m_ui.viewFullGridTitles, &QPushButton::toggled, this, &GameListWidget::setShowFullCoverTitles);
 	connect(m_ui.filterType, &QComboBox::currentIndexChanged, this, [this](int index) {
-		m_sort_model->setFilterType((index == 0) ? GameList::EntryType::Count : static_cast<GameList::EntryType>(index - 1));
+		// Invalid is left out of the list, so the position is not the enum value; item 0 ("All Types") has no data.
+		const QVariant type = m_ui.filterType->itemData(index);
+		m_sort_model->setFilterType(type.isValid() ? static_cast<GameList::EntryType>(type.toUInt()) : GameList::EntryType::Count);
 	});
 	connect(m_ui.filterRegion, &QComboBox::currentIndexChanged, this, [this](int index) {
 		m_sort_model->setFilterRegion((index == 0) ? GameList::Region::Count : static_cast<GameList::Region>(index - 1));
@@ -328,13 +330,15 @@ void GameListWidget::initialize()
 		applyTableHeaderDefaults();
 	}
 
+	// Set after the header state is loaded, because restoreState() carries the resize modes with it.
+	m_table_view->horizontalHeader()->setSectionResizeMode(GameListModel::Column_Title, QHeaderView::Stretch);
+	m_table_view->horizontalHeader()->setSectionResizeMode(GameListModel::Column_FileTitle, QHeaderView::Stretch);
+
 	// After header state load to account for user-specified sort.
 	m_table_view->setSortingEnabled(true);
 
-	// Safety Fallback: Ensure the header is actually visible and
-	// force it to stretch correctly on the first launch. This is an edgecase in case it already broke for some people or broke on older versions
+	// Safety Fallback: Ensure the header is actually visible. This is an edgecase in case it already broke for some people or broke on older versions
 	m_table_view->horizontalHeader()->show();
-	resizeTableViewColumnsToFit();
 
 	m_ui.stack->insertWidget(0, m_table_view);
 
@@ -379,7 +383,6 @@ void GameListWidget::initialize()
 	setFocusProxy(m_ui.stack->currentWidget());
 
 	updateToolbar();
-	resizeTableViewColumnsToFit();
 	setCustomBackground();
 }
 
@@ -748,7 +751,6 @@ void GameListWidget::showGameList()
 
 	m_ui.stack->setCurrentIndex(0);
 	setFocusProxy(m_ui.stack->currentWidget());
-	resizeTableViewColumnsToFit();
 	updateToolbar();
 	emit layoutChange();
 }
@@ -845,7 +847,6 @@ void GameListWidget::hideEvent(QHideEvent* event)
 void GameListWidget::resizeEvent(QResizeEvent* event)
 {
 	QWidget::resizeEvent(event);
-	resizeTableViewColumnsToFit();
 	m_model->updateCacheSize(width(), height());
 	processBackgroundFrames();
 }
@@ -877,22 +878,6 @@ bool GameListWidget::eventFilter(QObject* watched, QEvent* event)
 	}
 
 	return QWidget::eventFilter(watched, event);
-}
-
-void GameListWidget::resizeTableViewColumnsToFit()
-{
-	QtUtils::ResizeColumnsForTableView(m_table_view, {
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_Type],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_Serial],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_Title],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_FileTitle],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_CRC],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_TimePlayed],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_LastPlayed],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_Size],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_Region],
-														 DEFAULT_COLUMN_WIDTHS[GameListModel::Column_Compatibility],
-													 });
 }
 
 void GameListWidget::loadTableHeaderState()
@@ -1010,9 +995,6 @@ void GameListWidget::resetTableHeaderToDefault()
 
 	Host::SetBaseStringSettingValue("GameListTableView", "HeaderState", header->saveState().toBase64());
 	Host::CommitBaseSettingChanges();
-
-	// This makes the columns expand to fill the window right now.
-	resizeTableViewColumnsToFit();
 }
 
 void GameListWidget::saveSortSettings(const int column, const Qt::SortOrder sort_order)

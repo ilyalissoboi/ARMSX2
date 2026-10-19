@@ -38,13 +38,13 @@ public:
 private:
 	struct Analogs
 	{
-		u8 i = 0x00;
-		u8 ii = 0x00;
-		u8 l = 0x00;
-		u8 twist = 0x80;
+		SharedWord::Relaxed<u8> i{0x00};
+		SharedWord::Relaxed<u8> ii{0x00};
+		SharedWord::Relaxed<u8> l{0x00};
+		SharedWord::Relaxed<u8> twist{0x80};
 	};
 
-	u32 buttons = 0xffffffffu;
+	SharedWord::Relaxed<u32> buttons{0xffffffffu};
 	Analogs analogs;
 
 	bool commandStage = false;
@@ -111,6 +111,7 @@ public:
 	void SetRawAnalogs(const std::tuple<u8, u8> left, const std::tuple<u8, u8> right) override;
 	void SetRawPressureButton(u32 index, const std::tuple<bool, u8> value) override;
 	void SetAxisScale(float deadzone, float scale) override;
+	void SetDiagonalScaleCorrection(bool enabled) override;
 	float GetVibrationScale(u32 motor) const override;
 	void SetVibrationScale(u32 motor, float scale) override;
 	float GetPressureModifier() const override;
