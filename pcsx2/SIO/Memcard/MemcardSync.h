@@ -96,7 +96,12 @@ namespace MemcardSync
 	/// a change of the cards in the slots.
 	void OnCardsReopening();
 
-	/// FileMcd_Save and FileMcd_EraseBlock, with the combined slot number (0-7).
+	/// Whether sync tracks the card in the combined slot `slot` (0-7) right now. FileMcd_Save and
+	/// FileMcd_EraseBlock flush a tracked file card's writes before OnCardWritten().
+	bool IsSyncing(uint slot);
+
+	/// FileMcd_Save and FileMcd_EraseBlock, after a successful (and flushed) write, with the combined
+	/// slot number (0-7).
 	void OnCardWritten(uint slot);
 
 	/// FileMcd_Flush and FileMcd_EmuClose: the cards are on disk now.

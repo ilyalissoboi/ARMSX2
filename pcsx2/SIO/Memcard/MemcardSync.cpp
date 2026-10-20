@@ -31,6 +31,7 @@ namespace MemcardSync
 	void SyncNow() {}
 	void SetAppBackgrounded(bool) {}
 	void OnCardsReopening() {}
+	bool IsSyncing(uint) { return false; }
 	void OnCardWritten(uint) {}
 	void OnCardsFlushed() {}
 	void OnVMShutdown() {}
@@ -489,8 +490,13 @@ namespace MemcardSync
 		es_event_set_notifier(s_client, &OnEventsWaiting, nullptr);
 		s_worker = std::thread(&WorkerLoop);
 
-		// A game already running keeps its cards: follow them without touching them.
-		if (VMManager::HasValidVM())
+		// A game already running, or still booting, keeps its cards: follow them without touching
+		// them. Booting counts too: sync starts on its own thread, and when it is ready only after the
+		// boot's FileMcd_Reopen (OnCardsReopening found no client then), nothing else would attach the
+		// cards for that whole session. A stopping VM does not: its shutdown may already have called
+		// OnVMShutdown(), and nothing would end a session begun now.
+		const VMState state = VMManager::GetState();
+		if (state != VMState::Shutdown && state != VMState::Stopping)
 			FollowRunningVM();
 		es_sync_now(s_client);
 		Console.WriteLn("(MemcardSync) Syncing memory cards with %s", config.remote_uri.c_str());
@@ -576,6 +582,17 @@ namespace MemcardSync
 		{
 			Console.Warning("(MemcardSync) Storage not reached before boot; starting with the cards as they are.");
 		}
+	}
+
+	bool IsSyncing(uint slot)
+	{
+		if (slot >= SYNCED_SLOTS)
+			return false;
+		std::shared_lock client(s_client_lock);
+		if (!s_client)
+			return false;
+		std::lock_guard lock(s_state_lock);
+		return s_mounted.ids[slot] != 0;
 	}
 
 	void OnCardWritten(uint slot)
