@@ -196,6 +196,8 @@ public:
 	void Open();
 	void Close();
 	void Flush();
+	/// Hands the slot's buffered writes to the system, so another reader (memory card sync) sees them.
+	void Flush(uint slot);
 
 	s32 IsPresent(uint slot);
 	void GetSizeInfo(uint slot, McdSizeInfo& outways);
@@ -384,6 +386,12 @@ void FileMemoryCard::Flush()
 		// costs one auto-eject on the next savestate load, which is the safe direction.
 		std::fflush(m_file[slot]);
 	}
+}
+
+void FileMemoryCard::Flush(uint slot)
+{
+	if (m_file[slot])
+		std::fflush(m_file[slot]);
 }
 
 void FileMemoryCard::Close()
@@ -774,6 +782,7 @@ void FileMcd_Swap()
 	// Reopen them
 	FileMcd_EmuClose();
 	FileMcd_SetType();
+	MemcardSync::OnCardsReopening(); // the slots now hold each other's card
 	FileMcd_EmuOpen();
 	AutoEject::SetAll();
 	Host::AddIconOSDMessage("MemoryCardSwap", ICON_PF_MEMORY_CARD, fmt::format(TRANSLATE_FS("MemoryCardSwap", "Memory Cards have been swapped.\nSlot 1: {}\nSlot 2: {}"), EmuConfig.Mcd[0].Filename, EmuConfig.Mcd[1].Filename), Host::OSD_INFO_DURATION);
@@ -837,34 +846,55 @@ s32 FileMcd_Read(uint port, uint slot, u8* dest, u32 adr, int size)
 	}
 }
 
+// After a successful write to a card memory card sync tracks: the write is flushed out of stdio's
+// buffer (file cards; a folder card writes itself back two frames after its last write, well inside
+// sync's 2 s quiet window), then sync is told, so the snapshot it takes once writes go quiet reads
+// the card as the game left it.
+static void FileMcd_AfterWrite(uint combinedSlot, s32 result)
+{
+	if (result != 1 || !MemcardSync::IsSyncing(combinedSlot))
+		return;
+	if (EmuConfig.Mcd[combinedSlot].Type == MemoryCardType::File)
+		Mcd::impl.Flush(combinedSlot);
+	MemcardSync::OnCardWritten(combinedSlot);
+}
+
 s32 FileMcd_Save(uint port, uint slot, const u8* src, u32 adr, int size)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
-	MemcardSync::OnCardWritten(combinedSlot);
+	s32 result;
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:
-			return Mcd::impl.Save(combinedSlot, src, adr, size);
+			result = Mcd::impl.Save(combinedSlot, src, adr, size);
+			break;
 		case MemoryCardType::Folder:
-			return Mcd::implFolder.Save(combinedSlot, src, adr, size);
+			result = Mcd::implFolder.Save(combinedSlot, src, adr, size);
+			break;
 		default:
 			return 0;
 	}
+	FileMcd_AfterWrite(combinedSlot, result);
+	return result;
 }
 
 s32 FileMcd_EraseBlock(uint port, uint slot, u32 adr)
 {
 	const uint combinedSlot = FileMcd_ConvertToSlot(port, slot);
-	MemcardSync::OnCardWritten(combinedSlot);
+	s32 result;
 	switch (EmuConfig.Mcd[combinedSlot].Type)
 	{
 		case MemoryCardType::File:
-			return Mcd::impl.EraseBlock(combinedSlot, adr);
+			result = Mcd::impl.EraseBlock(combinedSlot, adr);
+			break;
 		case MemoryCardType::Folder:
-			return Mcd::implFolder.EraseBlock(combinedSlot, adr);
+			result = Mcd::implFolder.EraseBlock(combinedSlot, adr);
+			break;
 		default:
 			return 0;
 	}
+	FileMcd_AfterWrite(combinedSlot, result);
+	return result;
 }
 
 u64 FileMcd_GetCRC(uint port, uint slot)
