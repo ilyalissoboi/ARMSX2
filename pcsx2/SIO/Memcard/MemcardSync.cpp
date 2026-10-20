@@ -3,6 +3,17 @@
 
 #include "SIO/Memcard/MemcardSync.h"
 
+// With or without emusync: the JNI side wipes its copy of the passphrase either way.
+void MemcardSync::WipeSecret(std::string& secret)
+{
+	// Through a volatile pointer, so the stores can't be dropped as dead before the release.
+	volatile char* p = secret.data();
+	for (size_t i = 0; i < secret.size(); i++)
+		p[i] = 0;
+	secret.clear();
+	secret.shrink_to_fit();
+}
+
 #ifndef ARMSX2_HAS_EMUSYNC
 
 namespace MemcardSync
@@ -409,7 +420,7 @@ namespace MemcardSync
 			std::lock_guard lock(s_state_lock);
 			s_config = config;
 			// Only needed below, once: not kept for the life of the client like the keys.
-			s_config.passphrase.clear();
+			WipeSecret(s_config.passphrase);
 		}
 
 		es_config cfg = ES_CONFIG_INIT;

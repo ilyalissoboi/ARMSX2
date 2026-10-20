@@ -62,7 +62,12 @@ namespace MemcardSync
 		std::string passphrase;
 	};
 
-	/// Starts syncing, replacing a client that is already running. Blocks while the local database
+	/// Overwrites a secret's characters, then empties the string and frees its buffer. Plain
+	/// clear() only changes the size, leaving the characters readable in memory.
+	void WipeSecret(std::string& secret);
+
+	/// Starts syncing, replacing a client that is already running. Does not keep
+	/// config.passphrase; the caller should WipeSecret() its own copy afterwards. Blocks while the local database
 	/// opens and for up to 10 s while the storage is checked. Returns false with `error` set when
 	/// sync cannot start (wrong address, keys rejected, unreadable data folder). Storage that cannot
 	/// be reached right now is not an error: sync starts working once it can be reached.

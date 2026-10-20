@@ -7121,7 +7121,10 @@ Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncStart(JNIEnv *env, jclass clazz,
     if (passphrase)
         config.passphrase = GetJavaString(env, passphrase);
     std::string error;
-    if (MemcardSync::Start(config, &error))
+    const bool started = MemcardSync::Start(config, &error);
+    // Start() keeps no copy of the passphrase; don't leave this one in freed memory either.
+    MemcardSync::WipeSecret(config.passphrase);
+    if (started)
         return nullptr;
     return env->NewStringUTF(error.c_str());
 }
