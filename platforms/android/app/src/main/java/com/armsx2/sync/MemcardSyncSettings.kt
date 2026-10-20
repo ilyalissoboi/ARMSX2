@@ -101,6 +101,13 @@ object MemcardSyncSettings {
      */
     fun setPassphrase(context: Context, value: String) = seal(context, KEY_PASSPHRASE, value)
 
+    /**
+     * The stored passphrase, for the settings screen's Show: the user needs it again to set up
+     * their other devices, and losing it loses the saves. Null when none is stored or it can't be
+     * decrypted here. (The secret access key has no such getter: it can be issued again.)
+     */
+    fun passphrase(context: Context): String? = unseal(context, KEY_PASSPHRASE)
+
     /** emusync's private folder for [remoteUri]: not backed up, see the class comment. */
     fun dataDir(context: Context, remoteUri: String): File {
         val digest = MessageDigest.getInstance("SHA-256").digest(remoteUri.toByteArray(Charsets.UTF_8))

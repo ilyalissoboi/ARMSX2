@@ -157,6 +157,9 @@ fun MemcardSyncSection() {
                 keyboardType = KeyboardType.Password,
                 secret = true,
                 trim = false,
+                reveal = if (values.hasPassphrase) {
+                    { MemcardSyncSettings.passphrase(context) }
+                } else null,
                 onClear = if (values.hasPassphrase) {
                     {
                         MemcardSyncSettings.setPassphrase(context, "")
@@ -236,8 +239,10 @@ private fun RowLabel(label: String, description: String?) {
  *
  * On a controller, A on the row puts the cursor in the field and raises the keyboard; moving the
  * selection off the row ends editing. [secret] hides the text, with a Show / Hide switch, and
- * Android then offers paste but not copy, as for any password field. [onClear], when set, adds a
- * Remove button for a stored value the empty field can't express (a secret field never shows it).
+ * Android then offers paste but not copy, as for any password field. A secret field starts empty
+ * and its Show only unmasks what is being typed, unless [reveal] is set: then Show also loads the
+ * stored value into the field, and Hide takes it out again. [onClear], when set, adds a Remove
+ * button for a stored value the empty field can't express.
  */
 @Composable
 private fun SyncTextRow(
@@ -250,6 +255,7 @@ private fun SyncTextRow(
     capitalization: KeyboardCapitalization = KeyboardCapitalization.None,
     secret: Boolean = false,
     trim: Boolean = true,
+    reveal: (() -> String?)? = null,
     onClear: (() -> Unit)? = null,
     onCommit: (String) -> Unit,
 ) {
@@ -275,6 +281,7 @@ private fun SyncTextRow(
         if (secret) {
             text = ""
             saved = ""
+            revealed = false
         }
     }
     // Leaving the screen mid-edit (Back, another tab) still saves what was typed.
@@ -312,11 +319,26 @@ private fun SyncTextRow(
             singleLine = true,
             placeholder = placeholder?.let { { Text(it) } },
             visualTransformation = if (secret && !revealed) PasswordVisualTransformation() else VisualTransformation.None,
+            // Show is only offered when there is something to show: typed text, or a stored value
+            // [reveal] can load. On an empty field without one it would do nothing.
             trailingIcon = if (secret || onClear != null) {
                 {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (secret) {
-                            TextButton(onClick = { revealed = !revealed }) {
+                        if (secret && (text.isNotEmpty() || reveal != null)) {
+                            TextButton(onClick = {
+                                if (!revealed && text.isEmpty()) {
+                                    // Loaded as the saved value, so it is not saved again unchanged.
+                                    reveal?.invoke()?.let {
+                                        text = it
+                                        saved = it
+                                    }
+                                } else if (revealed && reveal != null && !editing && text == saved) {
+                                    // Hide puts the stored value away again rather than masking it.
+                                    text = ""
+                                    saved = ""
+                                }
+                                revealed = !revealed
+                            }) {
                                 Text(str(if (revealed) "memcardSync.hide" else "memcardSync.show"))
                             }
                         }
