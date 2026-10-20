@@ -44,6 +44,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.armsx2.i18n.str
 import com.armsx2.sync.MemcardSyncSettings
 import kotlinx.coroutines.delay
@@ -75,11 +78,16 @@ fun MemcardSyncSection() {
         var running by remember { mutableStateOf(MemcardSyncSettings.isRunning()) }
 
         // The core updates its status from its own thread; a light poll while this is on screen.
-        LaunchedEffect(Unit) {
-            while (true) {
-                status = MemcardSyncSettings.status()
-                running = MemcardSyncSettings.isRunning()
-                delay(2000)
+        // Only while the app is started: a stopped activity keeps its composition, and the loop
+        // with it, so the poll ran on in the background for as long as the app was left there.
+        val lifecycle = LocalLifecycleOwner.current.lifecycle
+        LaunchedEffect(lifecycle) {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (true) {
+                    status = MemcardSyncSettings.status()
+                    running = MemcardSyncSettings.isRunning()
+                    delay(2000)
+                }
             }
         }
 
