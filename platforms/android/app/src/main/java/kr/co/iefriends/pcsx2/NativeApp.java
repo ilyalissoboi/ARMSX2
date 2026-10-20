@@ -1145,9 +1145,10 @@ public class NativeApp {
 	/** False when this build has no sync (no Rust toolchain at build time). */
 	public static native boolean memcardSyncAvailable();
 	/** Starts syncing the slot 1 and 2 cards. Blocks (local database, up to ~10 s of network): call
-	 *  it off the main thread. Returns null on success, else a sentence for the user. */
+	 *  it off the main thread. Returns null on success, else a sentence for the user.
+	 *  passphrase: the storage's end-to-end encryption passphrase, or null for none. */
 	public static native String memcardSyncStart(String dataDir, String deviceName, String appVersion,
-			String remoteUri, String accessKeyId, String secretAccessKey);
+			String remoteUri, String accessKeyId, String secretAccessKey, String passphrase);
 	public static native void memcardSyncStop();
 	public static native boolean memcardSyncRunning();
 	/** Queues a full sync now. */

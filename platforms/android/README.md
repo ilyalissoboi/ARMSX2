@@ -37,9 +37,16 @@ interoperates with PCSX2 on a computer running `emusync watch`.
 - **Core:** `pcsx2/SIO/Memcard/MemcardSync.{h,cpp}`. Hooks in `FileMcd_Reopen` (before
   `MemcardBackup`), `FileMcd_Save`/`EraseBlock`/`Flush`/`EmuClose` and `VMManager::Shutdown`.
   Newer saves are applied before a game opens its cards, waiting at most 3 s for the network.
-- **App:** `com.armsx2.sync.MemcardSyncSettings` keeps the settings. The secret access key is
-  encrypted with an Android Keystore key, and emusync's own data lives in `noBackupFilesDir`.
+- **App:** `com.armsx2.sync.MemcardSyncSettings` keeps the settings. The secret access key and the
+  optional end-to-end encryption passphrase are encrypted with an Android Keystore key. emusync's
+  own data lives in `noBackupFilesDir/emusync-<hash of the storage address>`, one folder per
+  address, since emusync binds a data folder to one storage for good.
   The settings UI is `ui/settings/MemcardSyncSection.kt`.
+- **Encryption:** with a passphrase set, new storage is created end-to-end encrypted and encrypted
+  storage is unlocked; storage that isn't encrypted is refused rather than used unencrypted. It
+  works with encrypted repositories made by `emusync remote add … --encrypt` on a computer, given
+  the same passphrase. Encryption is chosen when the storage is created, so moving existing saves
+  to encrypted storage means a new address (a new folder in the bucket) on every device.
 - **Build:** `app/src/main/cpp/3rdparty/emusync` fetches emusync at a pinned commit (`EMUSYNC_PIN`)
   and cargo-builds `libemusync.so`, the same way as librashader. Like librashader it is optional:
   without cargo or the Rust Android target, `ARMSX2_HAS_EMUSYNC` is off and the feature compiles

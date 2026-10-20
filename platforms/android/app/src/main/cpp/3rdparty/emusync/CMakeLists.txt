@@ -17,8 +17,11 @@
 #   -DEMUSYNC_SOURCE_DIR=/path/to/emusync
 # and the fetch is skipped.
 
-set(EMUSYNC_PIN "9e51d6c908de97d6d150462e512c1a5a482c3fe8"
-	CACHE STRING "Pinned emusync commit. Bump deliberately; never track a branch.")
+# Pinned emusync commit. Bump deliberately; never track a branch. A plain variable, not a cache
+# entry: a cached pin stays at its first value in an existing build folder, so a bump here was
+# silently ignored there (and the build used the old library). Use EMUSYNC_SOURCE_DIR to build
+# against something else.
+set(EMUSYNC_PIN "84883983da39ca28ebf19b035f00e7a01fcdfb0b")
 option(ARMSX2_DISABLE_EMUSYNC "Build without memory card sync even when Rust is available" OFF)
 
 if(ARMSX2_DISABLE_EMUSYNC)
