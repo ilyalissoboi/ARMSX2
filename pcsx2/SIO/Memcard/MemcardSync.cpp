@@ -493,8 +493,10 @@ namespace MemcardSync
 		// A game already running, or still booting, keeps its cards: follow them without touching
 		// them. Booting counts too: sync starts on its own thread, and when it is ready only after the
 		// boot's FileMcd_Reopen (OnCardsReopening found no client then), nothing else would attach the
-		// cards for that whole session.
-		if (VMManager::GetState() != VMState::Shutdown)
+		// cards for that whole session. A stopping VM does not: its shutdown may already have called
+		// OnVMShutdown(), and nothing would end a session begun now.
+		const VMState state = VMManager::GetState();
+		if (state != VMState::Shutdown && state != VMState::Stopping)
 			FollowRunningVM();
 		es_sync_now(s_client);
 		Console.WriteLn("(MemcardSync) Syncing memory cards with %s", config.remote_uri.c_str());
