@@ -282,9 +282,14 @@ namespace MemcardSync
 		s_session_started = std::chrono::steady_clock::now();
 	}
 
+	static constexpr const char* LOCKED_STATUS =
+		"This storage is encrypted. Enter its passphrase in Settings > Network to sync.";
+
 	static std::string DescribeEvent(const es_event& ev)
 	{
 		const char* save = ev.unit_name ? ev.unit_name : "a save";
+		if (ev.status == ES_E_LOCKED && (ev.type == ES_EV_SYNC_FINISHED || ev.type == ES_EV_ERROR))
+			return LOCKED_STATUS;
 		switch (ev.type)
 		{
 			case ES_EV_SYNC_FINISHED:
@@ -403,6 +408,8 @@ namespace MemcardSync
 		{
 			std::lock_guard lock(s_state_lock);
 			s_config = config;
+			// Only needed below, once: not kept for the life of the client like the keys.
+			s_config.passphrase.clear();
 		}
 
 		es_config cfg = ES_CONFIG_INIT;
@@ -426,14 +433,28 @@ namespace MemcardSync
 			return false;
 		}
 
+		const bool encrypted = !config.passphrase.empty();
+		// Applies to the es_remote_add below: create the storage encrypted, or unlock it.
+		if (encrypted)
+			st = es_repo_create_encrypted(s_client, config.passphrase.c_str());
 		const es_credential_provider creds = {nullptr, &GetCredentials};
-		st = es_remote_add(s_client, config.remote_uri.c_str(), &creds);
-		if (st != ES_OK && st != ES_OFFLINE)
+		if (st == ES_OK)
+			st = es_remote_add(s_client, config.remote_uri.c_str(), &creds);
+		// Locked: encrypted storage this device has no key for, and no passphrase was given. The
+		// remote is added; sync runs and snapshots the cards, and uploads once it is unlocked.
+		if (st != ES_OK && st != ES_OFFLINE && st != ES_E_LOCKED)
 		{
 			if (error)
 			{
 				if (st == ES_E_AUTH)
 					*error = "The storage rejected the access key ID or secret.";
+				else if (st == ES_E_PASSPHRASE)
+					*error = "The passphrase does not unlock this storage.";
+				else if (st == ES_E_INCOMPATIBLE && encrypted)
+					*error = "This storage is not encrypted, or was set up by a newer version of emusync. "
+					         "Remove the passphrase to use it, or choose a new folder for encrypted saves.";
+				else if (st == ES_E_INCOMPATIBLE)
+					*error = "This storage was set up by a newer version of emusync, or has changed since this device joined it.";
 				else if (st == ES_E_INVALID_ARG)
 					*error = "The storage address is not valid, or this device already syncs with different storage.";
 				else
@@ -445,7 +466,8 @@ namespace MemcardSync
 			s_config = {};
 			return false;
 		}
-		SetStatus(st == ES_OFFLINE ? "Storage not reachable yet: sync starts once it is." : "Starting…");
+		SetStatus(st == ES_OFFLINE ? "Storage not reachable yet: sync starts once it is." :
+		          st == ES_E_LOCKED ? std::string(LOCKED_STATUS) : "Starting…");
 
 		{
 			std::lock_guard lock(s_worker_lock);

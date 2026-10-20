@@ -146,6 +146,30 @@ fun MemcardSyncSection() {
                 }
             }
             SettingsDivider()
+            // Optional, and never shown back, like the secret. Not trimmed: the desktop CLI keeps
+            // spaces too, and the same passphrase has to unlock the storage on every device.
+            SyncTextRow(
+                controllerId = "memcardSync.passphrase",
+                label = str("memcardSync.passphrase"),
+                description = str("memcardSync.passphrase.desc"),
+                value = "",
+                placeholder = str(if (values.hasPassphrase) "memcardSync.secret.saved" else "memcardSync.passphrase.none"),
+                keyboardType = KeyboardType.Password,
+                secret = true,
+                trim = false,
+                onClear = if (values.hasPassphrase) {
+                    {
+                        MemcardSyncSettings.setPassphrase(context, "")
+                        restart()
+                    }
+                } else null,
+            ) {
+                if (it.isNotEmpty()) {
+                    MemcardSyncSettings.setPassphrase(context, it)
+                    restart()
+                }
+            }
+            SettingsDivider()
             SyncTextRow(
                 controllerId = "memcardSync.deviceName",
                 label = str("memcardSync.deviceName"),
@@ -206,12 +230,14 @@ private fun RowLabel(label: String, description: String?) {
 
 /**
  * A text setting: label, description, and an ordinary text field. What is typed is kept in the
- * field and handed to [onCommit] (trimmed) when editing ends: the keyboard's Done, the field losing
- * focus, or the row leaving the screen. Not on every keystroke, since each commit restarts sync.
+ * field and handed to [onCommit] (trimmed, unless [trim] is false) when editing ends: the keyboard's
+ * Done, the field losing focus, or the row leaving the screen. Not on every keystroke, since each
+ * commit restarts sync.
  *
  * On a controller, A on the row puts the cursor in the field and raises the keyboard; moving the
  * selection off the row ends editing. [secret] hides the text, with a Show / Hide switch, and
- * Android then offers paste but not copy, as for any password field.
+ * Android then offers paste but not copy, as for any password field. [onClear], when set, adds a
+ * Remove button for a stored value the empty field can't express (a secret field never shows it).
  */
 @Composable
 private fun SyncTextRow(
@@ -223,6 +249,8 @@ private fun SyncTextRow(
     keyboardType: KeyboardType,
     capitalization: KeyboardCapitalization = KeyboardCapitalization.None,
     secret: Boolean = false,
+    trim: Boolean = true,
+    onClear: (() -> Unit)? = null,
     onCommit: (String) -> Unit,
 ) {
     var text by remember(value) { mutableStateOf(value) }
@@ -238,10 +266,10 @@ private fun SyncTextRow(
     val latestText by rememberUpdatedState(text)
     val latestCommit by rememberUpdatedState(onCommit)
     fun commit() {
-        val trimmed = latestText.trim()
-        if (trimmed != saved) {
-            saved = trimmed
-            latestCommit(trimmed)
+        val entered = if (trim) latestText.trim() else latestText
+        if (entered != saved) {
+            saved = entered
+            latestCommit(entered)
         }
         // The secret field never holds what was saved; empty it again once it is stored.
         if (secret) {
@@ -284,10 +312,17 @@ private fun SyncTextRow(
             singleLine = true,
             placeholder = placeholder?.let { { Text(it) } },
             visualTransformation = if (secret && !revealed) PasswordVisualTransformation() else VisualTransformation.None,
-            trailingIcon = if (secret) {
+            trailingIcon = if (secret || onClear != null) {
                 {
-                    TextButton(onClick = { revealed = !revealed }) {
-                        Text(str(if (revealed) "memcardSync.hide" else "memcardSync.show"))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (secret) {
+                            TextButton(onClick = { revealed = !revealed }) {
+                                Text(str(if (revealed) "memcardSync.hide" else "memcardSync.show"))
+                            }
+                        }
+                        if (onClear != null) {
+                            TextButton(onClick = onClear) { Text(str("memcardSync.remove")) }
+                        }
                     }
                 }
             } else null,

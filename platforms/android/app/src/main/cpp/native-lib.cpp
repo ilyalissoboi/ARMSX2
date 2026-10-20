@@ -7107,7 +7107,7 @@ extern "C"
 JNIEXPORT jstring JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncStart(JNIEnv *env, jclass clazz, jstring data_dir,
         jstring device_name, jstring app_version, jstring remote_uri, jstring access_key_id,
-        jstring secret_access_key) {
+        jstring secret_access_key, jstring passphrase) {
     // Blocks for the local database and up to ~10 s on the network: call it off the main thread.
     // Returns null on success, else a sentence for the user.
     MemcardSync::Config config;
@@ -7117,6 +7117,9 @@ Java_kr_co_iefriends_pcsx2_NativeApp_memcardSyncStart(JNIEnv *env, jclass clazz,
     config.remote_uri = GetJavaString(env, remote_uri);
     config.access_key_id = GetJavaString(env, access_key_id);
     config.secret_access_key = GetJavaString(env, secret_access_key);
+    // Null or empty: no passphrase (see MemcardSync::Config::passphrase).
+    if (passphrase)
+        config.passphrase = GetJavaString(env, passphrase);
     std::string error;
     if (MemcardSync::Start(config, &error))
         return nullptr;

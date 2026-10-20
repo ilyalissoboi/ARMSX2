@@ -45,7 +45,8 @@ namespace MemcardSync
 	struct Config
 	{
 		/// Private folder for emusync's database and queue. Must not be backed up and restored onto
-		/// another device (Android: Context.getNoBackupFilesDir()/emusync).
+		/// another device. Bound to one storage for good, so use one per remote_uri (Android:
+		/// Context.getNoBackupFilesDir()/emusync-<hash of remote_uri>).
 		std::string data_dir;
 		/// Shown on other devices, e.g. in a save's history.
 		std::string device_name;
@@ -54,6 +55,11 @@ namespace MemcardSync
 		std::string remote_uri;
 		std::string access_key_id;
 		std::string secret_access_key;
+		/// Optional: the storage's end-to-end encryption passphrase. Set, it creates the storage
+		/// encrypted if it is new, or unlocks it if it already is; storage that is not encrypted is
+		/// then refused. Empty, unencrypted storage is used as it is, and encrypted storage this
+		/// device has already unlocked keeps working (emusync keeps its key in data_dir).
+		std::string passphrase;
 	};
 
 	/// Starts syncing, replacing a client that is already running. Blocks while the local database
