@@ -21,7 +21,21 @@
 # entry: a cached pin stays at its first value in an existing build folder, so a bump here was
 # silently ignored there (and the build used the old library). Use EMUSYNC_SOURCE_DIR to build
 # against something else.
-set(EMUSYNC_PIN "84883983da39ca28ebf19b035f00e7a01fcdfb0b")
+set(EMUSYNC_PIN "760171a04a2ccc9a762279c534b083327d6e8fdb")
+# emusync's module caches EMUSYNC_SOURCE_DIR. When that is FetchContent's own folder for emusync_src,
+# it is an earlier fetch, not a checkout given with -D: forget it, or a bump would keep building the
+# old source.
+if(DEFINED CACHE{EMUSYNC_SOURCE_DIR})
+	set(_emusync_fetch_base "${FETCHCONTENT_BASE_DIR}")
+	if(NOT _emusync_fetch_base)
+		set(_emusync_fetch_base "${CMAKE_BINARY_DIR}/_deps")
+	endif()
+	get_filename_component(_emusync_fetched "${_emusync_fetch_base}/emusync_src-src" ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
+	get_filename_component(_emusync_cached "$CACHE{EMUSYNC_SOURCE_DIR}" ABSOLUTE)
+	if(_emusync_cached STREQUAL _emusync_fetched)
+		unset(EMUSYNC_SOURCE_DIR CACHE)
+	endif()
+endif()
 option(ARMSX2_DISABLE_EMUSYNC "Build without memory card sync even when Rust is available" OFF)
 
 if(ARMSX2_DISABLE_EMUSYNC)
