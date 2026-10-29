@@ -133,30 +133,7 @@ struct CheatsPatchesManagerView: View {
                     if store.showMessage, store.lastMessage != nil {
                         feedbackSection
                     }
-                    if PatchStore.hardcoreBlocksPnachContent() {
-                        Section {
-                            Label {
-                                Text(settings.localized("Hardcore Mode is on. Cheats and most patches are blocked, but widescreen and 60fps patches from a trusted database can still be enabled."))
-                                    .fixedSize(horizontal: false, vertical: true)
-                            } icon: {
-                                Image(systemName: "lock.fill")
-                                    .foregroundStyle(.orange)
-                            }
-                        }
-                    } else if PatchStore.hardcorePendingRestart() {
-                    // This screen used to claim everything was blocked the moment Hardcore was
-                    // switched on. It is not: Hardcore arms on a boot, and until then the
-                    // entries below carry on working.
-                    Section {
-                        Label {
-                            Text(settings.localized("Hardcore Mode is switched on but has not taken hold yet. Anything enabled here still works until you boot a game, and will stop then."))
-                                .fixedSize(horizontal: false, vertical: true)
-                        } icon: {
-                            Image(systemName: "clock.badge.exclamationmark")
-                                .foregroundStyle(.orange)
-                        }
-                    }
-                    }
+                    hardcoreSection
                     installedSection
                     availableSection
                     importSection
@@ -391,6 +368,36 @@ struct CheatsPatchesManagerView: View {
             }
         } header: {
             Text(settings.localized("Game Identification"))
+        }
+    }
+
+    // Kept out of body: inline there, it pushed body past what the Swift type checker
+    // finishes in reasonable time.
+    @ViewBuilder
+    private var hardcoreSection: some View {
+        if PatchStore.hardcoreBlocksPnachContent() {
+            Section {
+                Label {
+                    Text(settings.localized("Hardcore Mode is on. Cheats and most patches are blocked, but widescreen and 60fps patches from a trusted database can still be enabled."))
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(.orange)
+                }
+            }
+        } else if PatchStore.hardcorePendingRestart() {
+            // This screen used to claim everything was blocked the moment Hardcore was
+            // switched on. It is not: Hardcore arms on a boot, and until then the
+            // entries below carry on working.
+            Section {
+                Label {
+                    Text(settings.localized("Hardcore Mode is switched on but has not taken hold yet. Anything enabled here still works until you boot a game, and will stop then."))
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "clock.badge.exclamationmark")
+                        .foregroundStyle(.orange)
+                }
+            }
         }
     }
 
