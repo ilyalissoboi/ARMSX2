@@ -195,10 +195,9 @@ fun ShaderManagerSection() {
         }
 
         if (showSources) {
-            // A fixed, pinned list — unlike the driver manager there's no
-            // releases API to poll: libretro publishes the pack at one stable
-            // buildbot URL (the same one RetroArch's own updater pulls), so
-            // there's nothing to fetch before showing it.
+            // A fixed list — unlike the driver manager there's nothing to poll
+            // before showing it: each row is one known pack, and a GitHub-hosted
+            // one only asks for its latest release once the user taps Get.
             ShaderRepo.baseSources().forEach { source ->
                 RemoteShaderRow(
                     controllerId = "shaderPack.remote.${source.id}",

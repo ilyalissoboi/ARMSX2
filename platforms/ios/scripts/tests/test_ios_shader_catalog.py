@@ -88,9 +88,11 @@ class Downloader(unittest.TestCase):
         """Downloading RetroArch Slang Shaders again replaces shaders/shaders_slang."""
         importer = read(SWIFT / "Models/ShaderPackImporter.swift")
         self.assertIn('"https://buildbot.libretro.com/assets/frontend/shaders_slang.zip"', importer)
-        install = at(importer, "install(archiveAt: staged, named: key)", "the base pack install")
+        self.assertIn("await download(ShaderPresetLibrary.basePackFolderName, from: { Self.basePackURL }",
+                      importer, "the base pack doesn't go through the replacing download")
+        install = at(importer, "install(staged, named: key, writing: writing)", "the base pack install")
         cleared = at(importer, "installedName = nil", "clearing the landed folder name")
-        replace = at(importer, "Self.replaceBasePack(with: landed)", "the replace call")
+        replace = at(importer, "Self.replace(key, with: landed)", "the replace call")
         self.assertLess(install, replace, "the base pack folder is replaced before it is installed")
         self.assertLess(install, cleared, "installedName is cleared before the install sets it")
         self.assertLess(cleared, replace,

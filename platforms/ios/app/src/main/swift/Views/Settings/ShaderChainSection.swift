@@ -16,15 +16,19 @@ private struct ShaderPackInstallOptionsView: View {
     let onZip: () -> Void
     let onFolder: () -> Void
     let onBasePack: () -> Void
+    let onPack: (ShaderPackSource) -> Void
 
     @Environment(\.dismiss) private var dismiss
 
-    private let targetOrder = [
-        "shader-install.zip",
-        "shader-install.folder",
-        "shader-install.base-pack",
-        "shader-install.cancel",
-    ]
+    private var targetOrder: [String] {
+        ["shader-install.zip", "shader-install.folder", "shader-install.base-pack"]
+            + ShaderPackImporter.packs.map(Self.packTargetID)
+            + ["shader-install.cancel"]
+    }
+
+    private static func packTargetID(_ pack: ShaderPackSource) -> String {
+        "shader-install.pack." + pack.id
+    }
 
     var body: some View {
         NavigationStack {
@@ -47,6 +51,15 @@ private struct ShaderPackInstallOptionsView: View {
                     systemImage: "arrow.down.circle.fill",
                     action: onBasePack
                 )
+                // Proper names, so not localized.
+                ForEach(ShaderPackImporter.packs) { pack in
+                    installButton(
+                        id: Self.packTargetID(pack),
+                        title: pack.name,
+                        systemImage: "arrow.down.circle",
+                        action: { onPack(pack) }
+                    )
+                }
             }
             .navigationTitle(localized("Install Shader Pack"))
             .navigationBarTitleDisplayMode(.inline)
@@ -251,7 +264,8 @@ struct ShaderChainSection: View {
                     onFolder: {
                         pickerSource = ShaderPackPickerSource(isFolder: true)
                     },
-                    onBasePack: getBasePack
+                    onBasePack: getBasePack,
+                    onPack: getPack
                 )
             }
 
@@ -406,6 +420,14 @@ struct ShaderChainSection: View {
     private func getBasePack() {
         Task {
             await importer.installBasePack()
+            ARMSX2Bridge.retryShaderChain()
+            await params.load(token: presetRef)
+        }
+    }
+
+    private func getPack(_ pack: ShaderPackSource) {
+        Task {
+            await importer.installPack(pack)
             ARMSX2Bridge.retryShaderChain()
             await params.load(token: presetRef)
         }
