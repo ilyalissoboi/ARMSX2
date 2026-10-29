@@ -1138,6 +1138,12 @@ public class NativeApp {
 	 *  and name-en the romanised one. */
 	public static native String getTitlesForSerial(String serial);
 
+	/** GameDB disc-set membership for a serial as
+	 *  "&lt;id&gt;\n&lt;name&gt;\n&lt;name-en&gt;\n&lt;number&gt;\n&lt;disc name&gt;\n&lt;disc name-en&gt;", or ""
+	 *  when the serial isn't in the database or isn't one disc of a set. The library collapses a
+	 *  multi-disc game into one entry by this (see com.armsx2.data.library.DiscSets). */
+	public static native String getDiscSetForSerial(String serial);
+
 	public static native boolean saveStateToSlot(int slot);
 	/** True while the emulated memory card is mid-write, when a state save is refused to protect
 	 *  the card. The counter only ticks down while the VM runs, so it does NOT clear while paused. */

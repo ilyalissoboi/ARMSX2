@@ -148,6 +148,15 @@ InterfaceSettingsWidget::InterfaceSettingsWidget(SettingsWindow* settings_dialog
 	SettingWidgetBinder::BindWidgetToStringSetting(sif, m_ui.language, "UI", "Language", QtHost::GetDefaultLanguage());
 	connect(m_ui.language, &QComboBox::currentIndexChanged, [this]() { emit languageChanged(); });
 
+	m_ui.collapseMultiDisc->setEnabled(!dialog()->isPerGameSettings());
+	if (!dialog()->isPerGameSettings())
+	{
+		SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.collapseMultiDisc, "UI", "CollapseMultiDiscGames", false);
+		connect(m_ui.collapseMultiDisc, &QCheckBox::checkStateChanged, this, [this]() { emit collapseMultiDiscChanged(); });
+	}
+	dialog()->registerWidgetHelp(m_ui.collapseMultiDisc, tr("Collapse Multi-Disc Games"), tr("Unchecked"),
+		tr("Groups multi-disc games and alternate images into one library entry, then asks which image to boot. Different regions and editions remain separate."));
+
 	// Per-game settings is special, we don't want to bind it if we're editing per-game settings.
 	if (!dialog()->isPerGameSettings())
 	{

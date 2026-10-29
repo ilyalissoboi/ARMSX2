@@ -80,6 +80,41 @@ However, YAML is case-sensitive and will allow multiple serials that only differ
 
 **Everything else can be safely assumed to be case sensitive!**
 
+## Library Disc Sets
+
+`discSet` identifies the discs belonging to one release independently of their
+display names or image filenames:
+
+```yaml
+SLUS-20986:
+  name: "Armored Core - Nexus [Disc 1]"
+  region: "NTSC-U"
+  discSet:
+    id: SLUS-20986
+    name: "Armored Core - Nexus"
+    number: 1
+SLUS-21079:
+  name: "Armored Core - Nexus [Disc 2]"
+  region: "NTSC-U"
+  discSet:
+    id: SLUS-20986
+    name: "Armored Core - Nexus"
+    number: 2
+```
+
+Use the first disc's full serial as `id`. Every member must have the same set
+name and region, a unique positive `number`, and its own serial. An optional
+`name-en` supplies the set's English title. Use separate IDs for regional
+releases, reissues, and editions, even when their titles match. Do not derive
+membership from neighboring serial numbers or memory-card filters: the latter
+can link sequels and other games which import saves.
+
+The library refreshes this metadata from GameDB when loading its scan cache, so
+updating a set does not require rescanning the disc images. Unlisted releases
+use conservative title matching. Same-serial/executable-CRC images are only
+duplicate candidates; their paths remain selectable because the executable CRC
+does not establish identical disc content.
+
 ## Compatibility
 
 `compat` can be set to the following values:

@@ -236,6 +236,9 @@ fun HomeScreen(
         }
     }
     LaunchedEffect(directories, nativeReady) { viewModel.load(directories, nativeReady) }
+    // "Collapse multi-disc games" lives in App settings, so the library is listed again the other
+    // way when it is next shown.
+    LaunchedEffect(com.armsx2.CollapseMultiDisc.enabled.value) { viewModel.syncCollapseMultiDisc() }
     // Another screen changed what is in the game folders (an arcade game imported): scan again.
     val refreshRequest = com.armsx2.data.library.LibraryRefresh.requests.intValue
     LaunchedEffect(refreshRequest, nativeReady, directories) {
@@ -1029,7 +1032,14 @@ fun HomeScreen(
         )
     }
 
-    menuGame?.let { game ->
+    menuGame?.let { entry ->
+        // A collapsed multi-disc game: the menu acts on one of its discs, picked with the Disc row
+        // below (disc 1 to start with). Settings, save states, memory cards and the rest are each
+        // disc's own, so acting on "the game" would mean acting on disc 1 without saying so.
+        val menuDiscs = remember(entry.uri, state.allGames) { viewModel.discsOf(entry) }
+        var menuDiscIndex by remember(entry.uri) { mutableStateOf(0) }
+        val menuDisc = menuDiscs?.getOrNull(menuDiscIndex)
+        val game = menuDisc?.game ?: entry
         // Tri-state on purpose: null while identifying, blank when the image cannot be identified.
         // produceState alone cannot tell those apart — both are null — so an unidentifiable game
         // would sit on "…" forever, reading as still-loading when it is actually unknown.
@@ -1065,7 +1075,7 @@ fun HomeScreen(
                     )
                 }
                 Text(
-                    game.displayTitle(EnglishTitles.enabled.value),
+                    entry.displayTitle(EnglishTitles.enabled.value),
                     style = MaterialTheme.typography.titleLarge,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
@@ -1086,9 +1096,18 @@ fun HomeScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 8.dp),
                 )
-                GameMenuAction("▶", str("action.play"), "game-menu.play") {
+                val discLabel = menuDisc?.let { String.format(str("games.disc.number"), it.number) }
+                if (menuDiscs != null && discLabel != null) {
+                    // Cycles like Cover Region below, and keeps the menu open for the same reason.
+                    GameMenuAction("💿", str("games.disc"), "game-menu.disc", trailing = discLabel) {
+                        menuDiscIndex = (menuDiscIndex + 1) % menuDiscs.size
+                    }
+                }
+                // Boots the disc the Disc row shows: picking it there is the question the disc
+                // picker would ask.
+                GameMenuAction("▶", str("action.play"), "game-menu.play", trailing = discLabel) {
                     menuGame = null
-                    viewModel.launch(game)
+                    if (menuDisc != null) viewModel.pickDisc(game) else viewModel.launch(game)
                 }
                 // Save states for this game, straight from the library. Only offered when some
                 // exist — a "Load state" row that opens onto nothing is worse than no row.
@@ -1181,9 +1200,10 @@ fun HomeScreen(
                 }
                 // Only offered when the game is actually in Recently Played — this drops
                 // just this one entry, unlike the library-wide "Show Recently Played" toggle.
-                if (state.recentGames.any { it.uri == game.uri }) {
+                // Recently Played lists the collapsed entry, so that is what leaves it (every disc).
+                if (state.recentGames.any { it.uri == entry.uri }) {
                     GameMenuAction("🕐", str("games.removeRecent"), "game-menu.recent") {
-                        viewModel.removeFromRecent(game)
+                        viewModel.removeFromRecent(entry)
                         menuGame = null
                     }
                 }
@@ -1222,9 +1242,10 @@ fun HomeScreen(
                     menuGame = null
                     categoryGame = game
                 }
-                val hidden = com.armsx2.HiddenGames.isHidden(game)
+                // Hiding is the entry's, not one disc's: a set with one disc hidden still lists.
+                val hidden = (menuDiscs?.map { it.game } ?: listOf(entry)).all(com.armsx2.HiddenGames::isHidden)
                 GameMenuAction(if (hidden) "◍" else "🚫", str(if (hidden) "games.unhide" else "games.hide"), "game-menu.hide") {
-                    viewModel.setHidden(game, !hidden)
+                    viewModel.setHidden(entry, !hidden)
                     menuGame = null
                 }
             }
@@ -1234,6 +1255,14 @@ fun HomeScreen(
 
     categoryGame?.let { game ->
         CategorySheet(game = game, onDismiss = { categoryGame = null })
+    }
+
+    state.discPicker?.let { picker ->
+        DiscPickerSheet(
+            picker = picker,
+            onPick = { viewModel.pickDisc(it) },
+            onDismiss = { viewModel.dismissDiscPicker() },
+        )
     }
 
     quickLoadConfirm?.let { game ->
@@ -1580,6 +1609,90 @@ private fun CategorySheet(game: GameInfo, onDismiss: () -> Unit) {
                             newName = ""
                         },
                     ) { Text(str("games.categories.add")) }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * "Which disc?" for a collapsed multi-disc game ([com.armsx2.CollapseMultiDisc]). A PadModal like
+ * the game menu, so the D-pad walks the discs, A boots one and B backs out without booting.
+ * Each row names the disc's number and own title, then its serial and file, which is what tells
+ * two copies of one disc apart.
+ */
+@Composable
+private fun DiscPickerSheet(picker: DiscPicker, onPick: (GameInfo) -> Unit, onDismiss: () -> Unit) {
+    val forceEn = com.armsx2.EnglishTitles.enabled.value
+    com.armsx2.ui.common.PadModal(
+        key = "disc-picker",
+        onDismiss = onDismiss,
+        alignment = Alignment.BottomCenter,
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 2.dp,
+        ) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState())
+                    .padding(start = 8.dp, end = 8.dp, top = 20.dp, bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    str("games.disc.pick"),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                )
+                Text(
+                    picker.game.displayTitle(forceEn),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                )
+                picker.discs.forEachIndexed { index, disc ->
+                    val pick = { onPick(disc.game) }
+                    Surface(
+                        onClick = pick,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .controllerFocusable(controllerId = "disc-picker.$index", shape = RoundedCornerShape(18.dp), onConfirm = pick),
+                        shape = RoundedCornerShape(18.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
+                    ) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        ) {
+                            Text("💿", color = MaterialTheme.colorScheme.primary, fontSize = 20.sp)
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    String.format(str("games.disc.number"), disc.number),
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                                Text(
+                                    disc.game.displayTitle(forceEn),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    listOfNotNull(disc.game.serial?.takeIf { it.isNotBlank() }, disc.game.fileName)
+                                        .joinToString("  ·  "),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

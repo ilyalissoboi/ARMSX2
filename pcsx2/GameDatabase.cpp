@@ -128,6 +128,30 @@ void GameDatabase::populateEntry(GameDatabaseSchema::GameEntry& gameEntry, const
 	{
 		node["region"] >> gameEntry.region;
 	}
+	if (node.has_child("discSet"))
+	{
+		const auto set = node["discSet"];
+		GameDatabaseSchema::DiscSetInfo info;
+		if (set.is_map() && set.has_child("id") && set.has_child("name") && set.has_child("number"))
+		{
+			set["id"] >> info.id;
+			set["name"] >> info.name;
+			set["number"] >> info.number;
+			if (set.has_child("name-en"))
+				set["name-en"] >> info.name_en;
+		}
+		if (!info.id.empty() && !info.name.empty() && info.number > 0 && info.number <= 99)
+		{
+			info.id = StringUtil::toUpper(info.id);
+			info.disc_name = gameEntry.name;
+			info.disc_name_en = gameEntry.name_en;
+			gameEntry.disc_set = std::move(info);
+		}
+		else
+		{
+			Console.ErrorFmt("GameDB: Invalid disc set specified for serial '{}'.", serial);
+		}
+	}
 	if (node.has_child("compat"))
 	{
 		int val = 0;

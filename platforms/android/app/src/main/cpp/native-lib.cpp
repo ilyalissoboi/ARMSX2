@@ -6785,6 +6785,32 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getTitlesForSerial(JNIEnv* env, jclass, jst
     return env->NewStringUTF(out.c_str());
 }
 
+// The GameDB's disc-set membership for a serial:
+// "<id>\n<name>\n<name-en>\n<number>\n<disc name>\n<disc name-en>", or "" when the serial isn't
+// in the database or belongs to no set (see Docs/GameIndex.md, "Library Disc Sets"). The library
+// groups a multi-disc game under one entry by this, and falls back to the "[Disc N]" labels in
+// its titles for releases the database does not list.
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_getDiscSetForSerial(JNIEnv* env, jclass, jstring jSerial)
+{
+    if (!jSerial) return env->NewStringUTF("");
+    const std::string serial = GetJavaString(env, jSerial);
+    if (serial.empty()) return env->NewStringUTF("");
+
+    const GameDatabaseSchema::GameEntry* db_entry = GameDatabase::findGame(serial);
+    if (!db_entry || !db_entry->disc_set) return env->NewStringUTF("");
+
+    const GameDatabaseSchema::DiscSetInfo& set = *db_entry->disc_set;
+    std::string out = set.id;
+    for (const std::string& field : {set.name, set.name_en, std::to_string(set.number), set.disc_name, set.disc_name_en})
+    {
+        out += '\n';
+        out += field;
+    }
+    return env->NewStringUTF(out.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // BIOS info probe — invoked from the setup wizard while the user is picking
 // a BIOS directory. Takes ownership of `fd` (the caller MUST have detached

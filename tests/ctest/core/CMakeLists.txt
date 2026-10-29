@@ -1,4 +1,6 @@
 add_pcsx2_test(core_test
+	game_list_tests.cpp
+	game_list_database_tests.cpp
 	ee_fpu_regfile_tests.cpp
 	ee_clamp_mode_tests.cpp
 	vu_clamp_mode_tests.cpp
@@ -45,6 +47,10 @@ add_pcsx2_test(core_test
 	ee_cycle_rate_sampler_tests.cpp
 	MockMemoryInterface.h
 	StubHost.cpp
+)
+
+target_compile_definitions(core_test PRIVATE
+	GAME_LIST_TEST_DATABASE_PATH="${PROJECT_SOURCE_DIR}/bin/resources/GameIndex.yaml"
 )
 
 # gsrunner_affinity_tests.cpp includes the runner's own -affinity parse header; the flag
