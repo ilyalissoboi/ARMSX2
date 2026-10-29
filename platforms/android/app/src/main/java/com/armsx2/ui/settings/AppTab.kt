@@ -1026,6 +1026,14 @@ fun AppTab() {
             onChange = { com.armsx2.GridLabels.set(it) },
         )
 
+        // The library lists itself again the other way when it is next shown (HomeScreen).
+        ToggleRow(
+            label = str("app.library.collapseMultiDisc"),
+            value = com.armsx2.CollapseMultiDisc.enabled.value,
+            description = str("app.library.collapseMultiDisc.desc"),
+            onChange = { com.armsx2.CollapseMultiDisc.set(it) },
+        )
+
         IntSliderRow(
             label = str("app.library.coverSize"),
             value = (com.armsx2.ui.UiScale.coverScale.value * 100f).toInt().coerceIn(75, 250),

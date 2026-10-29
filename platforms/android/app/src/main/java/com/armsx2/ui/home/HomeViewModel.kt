@@ -32,7 +32,12 @@ data class HomeUiState(
     val error: String? = null,
     val selectedIndex: Int = 0,
     val initialized: Boolean = false,
+    /** A collapsed multi-disc game being launched, waiting for its disc to be picked. */
+    val discPicker: DiscPicker? = null,
 )
+
+/** The disc picker's game (the collapsed entry, for its title) and the discs it offers. */
+data class DiscPicker(val game: GameInfo, val discs: List<com.armsx2.data.library.DiscChoice>)
 
 class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = GameLibraryRepository(application)
@@ -47,6 +52,13 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun load(romDirectories: List<String>, nativeReady: Boolean) {
         directories = romDirectories
+        // A cached library can be listed before the core is up, and grouped without the GameDB's
+        // disc sets then. Group again once it can answer.
+        if (nativeReady && !collapsedWithNative) {
+            collapsedWithNative = true
+            collapsed = null
+            if (loaded && com.armsx2.CollapseMultiDisc.enabled.value) state.value = buildState(state.value)
+        }
         if (!loaded) {
             loaded = true
             val cached = repository.loadCached()
@@ -153,16 +165,52 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         state.value = buildState(state.value.copy(categoryFilter = category, selectedIndex = 0))
     }
 
+    /**
+     * Boots [game], or, for a collapsed multi-disc game, opens the disc picker instead: the entry
+     * stands for every disc, and which one to boot is the player's call (a save on disc 2 is no use
+     * from disc 1). [launchDisc] boots the one picked.
+     */
     fun launch(game: GameInfo) {
+        val discs = collapsedLibrary()?.discsOf(game)
+        if (discs != null) {
+            state.value = state.value.copy(discPicker = DiscPicker(game, discs))
+            return
+        }
+        launchDisc(game)
+    }
+
+    /** Boots the disc picked from the disc picker. */
+    fun pickDisc(disc: GameInfo) {
+        state.value = state.value.copy(discPicker = null)
+        launchDisc(disc)
+    }
+
+    fun dismissDiscPicker() {
+        state.value = state.value.copy(discPicker = null)
+    }
+
+    /** The discs [game] stands for when it is a collapsed multi-disc game, else null. */
+    fun discsOf(game: GameInfo): List<com.armsx2.data.library.DiscChoice>? = collapsedLibrary()?.discsOf(game)
+
+    /** Lists the library again if "Collapse multi-disc games" was flipped (in App settings) since
+     *  it was last listed. Called on every return to the library, so it does nothing otherwise:
+     *  rebuilding would throw away the selection. */
+    fun syncCollapseMultiDisc() {
+        if (builtCollapsed == com.armsx2.CollapseMultiDisc.enabled.value) return
+        state.value = buildState(state.value.copy(selectedIndex = 0, discPicker = null))
+    }
+
+    private fun launchDisc(game: GameInfo) {
         repository.markPlayed(game)
         state.value = buildState(state.value)
         val launchPath = if (game.uri.scheme == "file") game.uri.path ?: game.uri.toString() else game.uri.toString()
         MainActivityRuntime.launchGame(launchPath, game)
     }
 
-    /** Mark a game hidden (or un-hidden) and refresh the visible list. */
+    /** Mark a game hidden (or un-hidden) and refresh the visible list. A collapsed multi-disc
+     *  game hides every disc, so it stays hidden with the setting turned off again. */
     fun setHidden(game: GameInfo, value: Boolean) {
-        com.armsx2.HiddenGames.setHidden(game, value)
+        members(game).forEach { com.armsx2.HiddenGames.setHidden(it, value) }
         state.value = buildState(state.value)
     }
 
@@ -180,7 +228,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Drop one game from Recently Played (it returns when next launched). */
     fun removeFromRecent(game: GameInfo) {
-        repository.removeFromRecent(game)
+        members(game).forEach(repository::removeFromRecent)
         state.value = buildState(state.value)
     }
 
@@ -190,9 +238,37 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         state.value = buildState(state.value)
     }
 
+    /** The library grouped for "Collapse multi-disc games", built once per scan, or null while
+     *  the setting is off. */
+    private var collapsed: Pair<List<GameInfo>, com.armsx2.data.library.CollapsedLibrary>? = null
+    /** Whether the core is up to look disc sets up in the GameDB; until then only titles group. */
+    private var collapsedWithNative = false
+    /** The setting the visible list was last built with; see [syncCollapseMultiDisc]. */
+    private var builtCollapsed = false
+
+    private fun collapsedLibrary(games: List<GameInfo> = state.value.allGames): com.armsx2.data.library.CollapsedLibrary? {
+        if (!com.armsx2.CollapseMultiDisc.enabled.value) return null
+        collapsed?.takeIf { it.first === games }?.let { return it.second }
+        val useDatabase = collapsedWithNative
+        val library = com.armsx2.data.library.CollapsedLibrary(games) { serial ->
+            if (!useDatabase) null
+            else com.armsx2.data.library.DiscSets.parseInfo(
+                runCatching { kr.co.iefriends.pcsx2.NativeApp.getDiscSetForSerial(serial) }.getOrNull(),
+            )
+        }
+        collapsed = games to library
+        return library
+    }
+
+    /** Every disc [game] stands for: a collapsed game's whole set, otherwise just itself. */
+    private fun members(game: GameInfo): List<GameInfo> = collapsedLibrary()?.members(game) ?: listOf(game)
+
     private fun buildState(base: HomeUiState): HomeUiState {
+        val library = collapsedLibrary(base.allGames)
+        builtCollapsed = library != null
         // Arcade games only narrows Recently Played as well as the library.
         val recents = repository.recentGames(base.allGames.filter(com.armsx2.ArcadeOnly::shows))
+            .let { played -> if (library == null) played else played.map(library::entryFor).distinctBy { it.uri } }
         val recentOrder = recents.mapIndexed { index, game -> game.uri.toString() to index }.toMap()
         val forceEn = com.armsx2.EnglishTitles.enabled.value
         // A category filter narrows the pool before anything else. Cleared implicitly when the
@@ -200,20 +276,25 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         // library stuck showing nothing with no obvious way back.
         val activeCategory = base.categoryFilter?.takeIf { it in com.armsx2.GameCategories.names() }
         val members = activeCategory?.let { com.armsx2.GameCategories.members(it) }
-        val filtered = base.allGames.filter { game ->
-            val query = base.query.trim()
-            (members == null || game.settingsKey?.let { it in members } == true) &&
+        val query = base.query.trim()
+        val filtered = (library?.games ?: base.allGames).filter { game ->
+            // A collapsed multi-disc game is each of its discs: filed under a category if any
+            // disc is, found by any disc's title or serial, and hidden only once every disc is.
+            val discs = library?.members(game) ?: listOf(game)
+            (members == null || discs.any { disc -> disc.settingsKey?.let { it in members } == true }) &&
             com.armsx2.ArcadeOnly.shows(game) &&
             // Exclude games the user marked hidden (long-press → Hide), unless "Show hidden" is on.
-            (com.armsx2.HiddenGames.showHidden.value || !com.armsx2.HiddenGames.isHidden(game)) &&
+            (com.armsx2.HiddenGames.showHidden.value || !discs.all(com.armsx2.HiddenGames::isHidden)) &&
                 (query.isBlank() ||
-                    // Match BOTH names regardless of which is displayed: someone typing
-                    // "Katakamuna" should find a game listed as 片神名, and vice versa.
-                    game.title.contains(query, ignoreCase = true) ||
-                    game.titleEn.contains(query, ignoreCase = true) ||
-                    game.titleSort.contains(query, ignoreCase = true) ||
-                    game.serial?.contains(query, ignoreCase = true) == true ||
-                    game.extension.contains(query, ignoreCase = true))
+                    (discs + game).any { disc ->
+                        // Match BOTH names regardless of which is displayed: someone typing
+                        // "Katakamuna" should find a game listed as 片神名, and vice versa.
+                        disc.title.contains(query, ignoreCase = true) ||
+                            disc.titleEn.contains(query, ignoreCase = true) ||
+                            disc.titleSort.contains(query, ignoreCase = true) ||
+                            disc.serial?.contains(query, ignoreCase = true) == true ||
+                            disc.extension.contains(query, ignoreCase = true)
+                    })
         }
         // sortKey(), not the displayed title: a Japanese title sorts by its kana reading
         // (GameDB name-sort), because sorting the kanji sorts by codepoint — which is the

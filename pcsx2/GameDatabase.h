@@ -112,12 +112,24 @@ namespace GameDatabaseSchema
 		Hypothetical,
 	};
 
+	struct DiscSetInfo
+	{
+		std::string id;
+		std::string name;
+		std::string name_en;
+		u32 number = 0;
+		// Original per-disc names identify disc-specific filename labels even after a custom rename.
+		std::string disc_name;
+		std::string disc_name_en;
+	};
+
 	struct GameEntry
 	{
 		std::string name;
 		std::string name_sort;
 		std::string name_en;
 		std::string region;
+		std::optional<DiscSetInfo> disc_set;
 		Compatibility compat = Compatibility::Unknown;
 		FPRoundMode eeRoundMode = FPRoundMode::MaxCount;
 		FPRoundMode eeDivRoundMode = FPRoundMode::MaxCount;

@@ -496,6 +496,7 @@ void FullscreenUI::UpdateGameDetails(std::string path, std::string serial, std::
 	s_current_disc_serial = std::move(serial);
 	s_current_disc_path = std::move(path);
 	s_current_disc_crc = disc_crc;
+	s_game_list_needs_sort = true;
 }
 
 void FullscreenUI::PauseForMenuOpen(bool set_pause_menu_open)
@@ -2518,13 +2519,15 @@ void FullscreenUI::PopulateGameListEntryList()
 {
 	const int sort = Host::GetBaseIntSettingValue("UI", "FullscreenUIGameSort", 0);
 	const bool reverse = Host::GetBaseBoolSettingValue("UI", "FullscreenUIGameSortReverse", false);
+	const bool collapse_discs = Host::GetBaseBoolSettingValue("UI", "CollapseMultiDiscGames", false);
 	static int s_last_sort = -1;
 	static bool s_last_reverse = false;
 	static bool s_last_prefer_eng = false;
 
 	// Sort can be expensive, try to avoid when possible
 	const u32 count = GameList::GetEntryCount();
-	bool needs_update = sort != s_last_sort || reverse != s_last_reverse || s_last_prefer_eng != s_prefer_english_titles;
+	bool needs_update = s_game_list_needs_sort || sort != s_last_sort || reverse != s_last_reverse ||
+	                    s_last_prefer_eng != s_prefer_english_titles || collapse_discs != s_collapse_multi_disc_games;
 	needs_update |= count != s_last_unsorted_entries.size();
 	if (!needs_update)
 	{
@@ -2544,6 +2547,8 @@ void FullscreenUI::PopulateGameListEntryList()
 	s_last_sort = sort;
 	s_last_reverse = reverse;
 	s_last_prefer_eng = s_prefer_english_titles;
+	s_collapse_multi_disc_games = collapse_discs;
+	s_game_list_needs_sort = false;
 
 	s_game_list_sorted_entries.resize(count);
 	s_last_unsorted_entries.resize(count);
@@ -2551,6 +2556,16 @@ void FullscreenUI::PopulateGameListEntryList()
 	{
 		s_game_list_sorted_entries[i] = GameList::GetEntryByIndex(i);
 		s_last_unsorted_entries[i] = s_game_list_sorted_entries[i];
+	}
+	if (collapse_discs)
+	{
+		s_game_list_sorted_entries.erase(
+			std::remove_if(s_game_list_sorted_entries.begin(), s_game_list_sorted_entries.end(),
+				[](const GameList::Entry* entry) {
+					const GameList::DiscSet* set = GameList::GetDiscSetForEntry(entry);
+					return set && set->GetRepresentative() != entry;
+				}),
+			s_game_list_sorted_entries.end());
 	}
 
 	std::sort(s_game_list_sorted_entries.begin(), s_game_list_sorted_entries.end(),
@@ -2594,19 +2609,23 @@ void FullscreenUI::PopulateGameListEntryList()
 
 				case 5: // Time Played
 				{
-					if (lhs->total_played_time != rhs->total_played_time)
+					const auto lhs_history = GameList::GetDisplayPlayHistory(lhs, s_collapse_multi_disc_games);
+					const auto rhs_history = GameList::GetDisplayPlayHistory(rhs, s_collapse_multi_disc_games);
+					if (lhs_history.total_played_time != rhs_history.total_played_time)
 					{
-						return reverse ? (lhs->total_played_time > rhs->total_played_time) :
-										 (lhs->total_played_time < rhs->total_played_time);
+						return reverse ? (lhs_history.total_played_time > rhs_history.total_played_time) :
+					                     (lhs_history.total_played_time < rhs_history.total_played_time);
 					}
 				}
 				break;
 
 				case 6: // Last Played (reversed by default)
 				{
-					if (lhs->last_played_time != rhs->last_played_time)
+					const auto lhs_history = GameList::GetDisplayPlayHistory(lhs, s_collapse_multi_disc_games);
+					const auto rhs_history = GameList::GetDisplayPlayHistory(rhs, s_collapse_multi_disc_games);
+					if (lhs_history.last_played_time != rhs_history.last_played_time)
 					{
-						return reverse ? (lhs->last_played_time < rhs->last_played_time) : (lhs->last_played_time > rhs->last_played_time);
+						return reverse ? (lhs_history.last_played_time < rhs_history.last_played_time) : (lhs_history.last_played_time > rhs_history.last_played_time);
 					}
 				}
 				break;
@@ -2622,7 +2641,7 @@ void FullscreenUI::PopulateGameListEntryList()
 			}
 
 			// fallback to title when all else is equal
-			const int res = Host::LocaleSensitiveCompare(lhs->GetTitleSort(s_prefer_english_titles), rhs->GetTitleSort(s_prefer_english_titles));
+			const int res = Host::LocaleSensitiveCompare(GameList::GetDisplayTitle(lhs, s_collapse_multi_disc_games, s_prefer_english_titles, true), GameList::GetDisplayTitle(rhs, s_collapse_multi_disc_games, s_prefer_english_titles, true));
 			return reverse ? (res > 0) : (res < 0);
 		});
 }
@@ -2805,7 +2824,7 @@ void FullscreenUI::DrawGameList(const ImVec2& heading_size)
 			const float text_start_x = bb.Min.x + image_size.x + LayoutScale(15.0f);
 			const ImRect title_bb(ImVec2(text_start_x, bb.Min.y), ImVec2(bb.Max.x, midpoint));
 			const ImRect summary_bb(ImVec2(text_start_x, midpoint), bb.Max);
-			const std::string& title = entry->GetTitle(s_prefer_english_titles);
+			const std::string& title = GameList::GetDisplayTitle(entry, s_collapse_multi_disc_games, s_prefer_english_titles);
 
 			ImGui::PushFont(g_large_font.first, g_large_font.second);
 			ImGui::RenderTextClipped(title_bb.Min, title_bb.Max, title.c_str(), title.c_str() + title.size(), nullptr,
@@ -2886,7 +2905,7 @@ void FullscreenUI::DrawGameList(const ImVec2& heading_size)
 		{
 			// title
 			ImGui::PushFont(g_large_font.first, g_large_font.second);
-			const std::string_view full_title(selected_entry->GetTitle(s_prefer_english_titles));
+			const std::string_view full_title(GameList::GetDisplayTitle(selected_entry, s_collapse_multi_disc_games, s_prefer_english_titles));
 			std::string_view title = TrimString(g_large_font, full_title, work_width);
 			text_width = ImGui::CalcTextSize(title.data(), title.data() + title.length(), false, work_width).x;
 			if (title.length() != full_title.length())
@@ -2931,10 +2950,11 @@ void FullscreenUI::DrawGameList(const ImVec2& heading_size)
 			ImGui::Text(" (%s)", GameList::EntryCompatibilityRatingToString(selected_entry->compatibility_rating, true));
 
 			// play time
+			const auto history = GameList::GetDisplayPlayHistory(selected_entry, s_collapse_multi_disc_games);
 			ImGui::TextUnformatted(
-				SmallString::from_format(FSUI_FSTR("Time Played: {}"), GameList::FormatTimespan(selected_entry->total_played_time)));
+				SmallString::from_format(FSUI_FSTR("Time Played: {}"), GameList::FormatTimespan(history.total_played_time)));
 			ImGui::TextUnformatted(
-				SmallString::from_format(FSUI_FSTR("Last Played: {}"), GameList::FormatTimestamp(selected_entry->last_played_time)));
+				SmallString::from_format(FSUI_FSTR("Last Played: {}"), GameList::FormatTimestamp(history.last_played_time)));
 
 			// size
 			ImGui::TextUnformatted(
@@ -3048,7 +3068,7 @@ void FullscreenUI::DrawGameGrid(const ImVec2& heading_size)
 			if (show_titles)
 			{
 				const ImRect title_bb(ImVec2(bb.Min.x, bb.Min.y + image_height + title_spacing), bb.Max);
-				const std::string_view full_title(entry->GetTitle(s_prefer_english_titles));
+				const std::string_view full_title(GameList::GetDisplayTitle(entry, s_collapse_multi_disc_games, s_prefer_english_titles));
 				const std::string_view title = TrimString(g_medium_font, full_title, title_bb.GetWidth());
 				draw_title.clear();
 				fmt::format_to(std::back_inserter(draw_title), "{}{}", title, (title.length() == full_title.length()) ? "" : g_ellipsis);
@@ -3076,11 +3096,55 @@ void FullscreenUI::DrawGameGrid(const ImVec2& heading_size)
 	EndFullscreenWindow();
 }
 
+void FullscreenUI::SelectGameListDisc(std::string path, std::function<void(const std::string&)> callback)
+{
+	ImGuiFullscreen::ChoiceDialogOptions options;
+	std::vector<std::string> paths;
+	if (Host::GetBaseBoolSettingValue("UI", "CollapseMultiDiscGames", false))
+	{
+		const auto lock = GameList::GetLock();
+		if (const GameList::Entry* entry = GameList::GetEntryForPath(path.c_str()))
+		{
+			if (const GameList::DiscSet* set = GameList::GetDiscSetForEntry(entry))
+			{
+				for (const GameList::Entry* disc : set->entries)
+				{
+					paths.push_back(disc->path);
+					std::string title = disc->GetTitle(s_prefer_english_titles);
+					if (const auto number = GameList::GetDiscNumberForEntry(disc))
+						title = fmt::format(FSUI_FSTR("Disc {}: {}"), *number, title);
+					options.emplace_back(fmt::format("{} [{}] - {}", title,
+											 disc->serial, disc->path),
+						false);
+				}
+			}
+		}
+	}
+	if (paths.empty())
+	{
+		callback(path);
+		return;
+	}
+
+	// Capture paths rather than entry pointers, since a scan can replace entries while the dialog is open.
+	OpenChoiceDialog(FSUI_CSTR("Select Disc to Boot"), false, std::move(options),
+		[paths = std::move(paths), callback = std::move(callback)](s32 index, const std::string&, bool) mutable {
+			const std::string selected = index >= 0 ? paths[static_cast<size_t>(index)] : std::string();
+			auto on_selected = std::move(callback);
+			CloseChoiceDialog();
+			if (index >= 0)
+				on_selected(selected);
+		});
+}
+
 void FullscreenUI::HandleGameListActivate(const GameList::Entry* entry)
 {
-	// launch game
-	if (!OpenLoadStateSelectorForGameResume(entry))
-		DoStartPath(entry->path);
+	SelectGameListDisc(entry->path, [](const std::string& path) {
+		const auto lock = GameList::GetLock();
+		const GameList::Entry* disc = GameList::GetEntryForPath(path.c_str());
+		if (disc && !OpenLoadStateSelectorForGameResume(disc))
+			DoStartPath(path);
+	});
 }
 
 void FullscreenUI::HandleGameListOptions(const GameList::Entry* entry)
@@ -3094,54 +3158,75 @@ void FullscreenUI::HandleGameListOptions(const GameList::Entry* entry)
 		{FSUI_ICONSTR(ICON_FA_COMPACT_DISC, "Full Boot"), false},
 	};
 
-	const time_t entry_played_time = GameList::GetCachedPlayedTimeForSerial(entry->serial);
+	const time_t entry_played_time = GameList::GetDisplayPlayHistory(entry, s_collapse_multi_disc_games).total_played_time;
 	if (entry_played_time)
 		options.emplace_back(FSUI_ICONSTR(ICON_FA_STOPWATCH, "Reset Play Time"), false);
 	options.emplace_back(FSUI_ICONSTR(ICON_FA_SQUARE_XMARK, "Close Menu"), false);
 
-	const bool has_resume_state = VMManager::HasSaveStateInSlot(entry->serial.c_str(), entry->crc, -1);
-	OpenChoiceDialog(entry->GetTitle(s_prefer_english_titles).c_str(), false, std::move(options),
-		[has_resume_state, entry_path = entry->path, entry_serial = entry->serial, entry_title = entry->title, entry_played_time]
-		(s32 index, const std::string& title, bool checked) {
+	OpenChoiceDialog(GameList::GetDisplayTitle(entry, s_collapse_multi_disc_games, s_prefer_english_titles).c_str(), false, std::move(options),
+		[entry_path = entry->path, entry_serial = entry->serial,
+			entry_title = GameList::GetDisplayTitle(entry, s_collapse_multi_disc_games, s_prefer_english_titles), entry_played_time,
+			entry_snapshot = *entry, collapse_discs = s_collapse_multi_disc_games](s32 index, const std::string& title, bool checked) {
 			switch (index)
 			{
 				case 0: // Open Game Properties
 					SwitchToGameSettings(entry_path);
 					break;
 				case 1: // Resume Game
-					DoStartPath(entry_path, has_resume_state ? std::optional<s32>(-1) : std::optional<s32>());
-					break;
+				{
+					const std::string path = entry_path;
+					CloseChoiceDialog();
+					SelectGameListDisc(path, [](const std::string& disc_path) {
+						const auto lock = GameList::GetLock();
+						const GameList::Entry* disc = GameList::GetEntryForPath(disc_path.c_str());
+						if (disc)
+						{
+							const bool has_resume = VMManager::HasSaveStateInSlot(disc->serial.c_str(), disc->crc, -1);
+							DoStartPath(disc_path, has_resume ? std::optional<s32>(-1) : std::optional<s32>());
+						}
+					});
+					return;
+				}
 				case 2: // Load State
-					OpenLoadStateSelectorForGame(entry_path);
-					break;
+				{
+					const std::string path = entry_path;
+					CloseChoiceDialog();
+					SelectGameListDisc(path, [](const std::string& disc_path) { OpenLoadStateSelectorForGame(disc_path); });
+					return;
+				}
 				case 3: // Default Boot
-					DoStartPath(entry_path);
-					break;
 				case 4: // Fast Boot
-					DoStartPath(entry_path, std::nullopt, true);
-					break;
 				case 5: // Full Boot
-					DoStartPath(entry_path, std::nullopt, false);
-					break;
+				{
+					const std::string path = entry_path;
+					const std::optional<bool> fast_boot = index == 3 ? std::nullopt : std::optional<bool>(index == 4);
+					CloseChoiceDialog();
+					SelectGameListDisc(path, [fast_boot](const std::string& disc_path) { DoStartPath(disc_path, std::nullopt, fast_boot); });
+					return;
+				}
 				case 6:
-					{
-						// Close Menu
-						if (!entry_played_time)
-							break;
+				{
+					// Close Menu
+					if (!entry_played_time)
+						break;
 
-						// Reset Play Time
-						OpenConfirmMessageDialog(FSUI_ICONSTR(ICON_FA_STOPWATCH, "Confirm Reset"),
-							fmt::format(FSUI_FSTR("Are you sure you want to reset the play time for '{}' ({})?\n\n"
-												  "Your current play time is {}.\n\nThis action cannot be undone."),
-											entry_title.empty() ? FSUI_STR("empty title") : entry_title,
-											entry_serial.empty() ? FSUI_STR("no serial") : entry_serial,
-											GameList::FormatTimespan(entry_played_time, true)),
-							[entry_serial](bool result) {
-								if (result)
-									GameList::ClearPlayedTimeForSerial(entry_serial);
-							}, false);
-					}
-					break;
+					// Reset Play Time
+					const std::string message = fmt::format(
+						FSUI_FSTR("Are you sure you want to reset the play time for '{}' ({})?\n\n"
+								  "Your current play time is {}.\n\nThis action cannot be undone."),
+						entry_title.empty() ? FSUI_STR("empty title") : entry_title,
+						entry_serial.empty() ? FSUI_STR("no serial") : entry_serial,
+						GameList::FormatTimespan(entry_played_time, true));
+					const auto on_confirm = [entry_snapshot, collapse_discs](bool result) {
+						if (result)
+						{
+							GameList::ClearPlayedTimeForEntry(&entry_snapshot, collapse_discs);
+							s_game_list_needs_sort = true;
+						}
+					};
+					OpenConfirmMessageDialog(FSUI_ICONSTR(ICON_FA_STOPWATCH, "Confirm Reset"), message, on_confirm, false);
+				}
+				break;
 				default: // Close Menu
 					break;
 			}
@@ -4481,6 +4566,8 @@ TRANSLATE_NOOP("FullscreenUI", "Change View");
 TRANSLATE_NOOP("FullscreenUI", "Launch Options");
 TRANSLATE_NOOP("FullscreenUI", "Startup Error");
 TRANSLATE_NOOP("FullscreenUI", "Select Disc Image");
+TRANSLATE_NOOP("FullscreenUI", "Select Disc to Boot");
+TRANSLATE_NOOP("FullscreenUI", "Disc {}: {}");
 TRANSLATE_NOOP("FullscreenUI", "Select Disc Drive");
 TRANSLATE_NOOP("FullscreenUI", "WARNING: Memory Card Busy");
 TRANSLATE_NOOP("FullscreenUI", "Resume Game");

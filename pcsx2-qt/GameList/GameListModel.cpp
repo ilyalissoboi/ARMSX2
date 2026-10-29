@@ -108,6 +108,8 @@ void GameListModel::setCoverScale(float scale)
 
 void GameListModel::refreshCovers()
 {
+	// Discard jobs rendering titles from before a library setting change.
+	m_cover_scale_counter.fetch_add(1, std::memory_order_release);
 	m_cover_pixmap_cache.Clear();
 	refresh();
 }
@@ -141,7 +143,8 @@ void GameListModel::loadOrGenerateCover(const GameList::Entry* ge)
 	// while there's outstanding jobs, the old jobs won't proceed (at the wrong size), or get added into the grid.
 	const u32 counter = m_cover_scale_counter.load(std::memory_order_acquire);
 
-	QFuture<QPixmap> future = QtConcurrent::run([this, entry = *ge, counter]() -> QPixmap {
+	const std::string display_title = GameList::GetDisplayTitle(ge, m_collapse_multi_disc, m_prefer_english_titles);
+	QFuture<QPixmap> future = QtConcurrent::run([this, entry = *ge, counter, display_title]() -> QPixmap {
 		QPixmap image;
 
 		// Initial check that the scale is unchanged before we run costly image generation.
@@ -154,7 +157,7 @@ void GameListModel::loadOrGenerateCover(const GameList::Entry* ge)
 			// Create placeholder image if no user-provided cover exists.
 			if (image.isNull())
 			{
-				const std::string& title = entry.GetTitle(m_prefer_english_titles);
+				const std::string& title = display_title;
 				image = createPlaceholderImage(m_placeholder_pixmap, getCoverArtWidth(), getCoverArtHeight(), m_cover_scale, m_dpr, title);
 			}
 			// Create resized image from user-provided cover.
@@ -260,7 +263,7 @@ QVariant GameListModel::data(const QModelIndex& index, const int role) const
 					return QString::fromStdString(ge->serial);
 
 				case Column_Title:
-					return QString::fromStdString(ge->GetTitle(m_prefer_english_titles));
+					return QString::fromStdString(GameList::GetDisplayTitle(ge, m_collapse_multi_disc, m_prefer_english_titles));
 
 				case Column_FileTitle:
 					return QtUtils::StringViewToQString(Path::GetFileTitle(ge->path));
@@ -269,16 +272,19 @@ QVariant GameListModel::data(const QModelIndex& index, const int role) const
 					return QString::fromStdString(fmt::format("{:08X}", ge->crc));
 
 				case Column_TimePlayed:
-					return ge->total_played_time ? formatTimespan(ge->total_played_time) : QVariant();
+				{
+					const auto history = GameList::GetDisplayPlayHistory(ge, m_collapse_multi_disc);
+					return history.total_played_time ? formatTimespan(history.total_played_time) : QVariant();
+				}
 
 				case Column_LastPlayed:
-					return QString::fromStdString(GameList::FormatTimestamp(ge->last_played_time));
+					return QString::fromStdString(GameList::FormatTimestamp(GameList::GetDisplayPlayHistory(ge, m_collapse_multi_disc).last_played_time));
 
 				case Column_Size:
 					return QString("%1 MB").arg(static_cast<double>(ge->total_size) / 1048576.0, 0, 'f', 2);
 
 				case Column_Cover:
-					return m_show_titles_for_covers ? QString::fromStdString(ge->GetTitle(m_prefer_english_titles)) : QVariant();
+					return m_show_titles_for_covers ? QString::fromStdString(GameList::GetDisplayTitle(ge, m_collapse_multi_disc, m_prefer_english_titles)) : QVariant();
 
 				default:
 					return QVariant();
@@ -376,6 +382,7 @@ void GameListModel::refresh()
 
 bool GameListModel::titlesLessThan(const int left_row, const int right_row) const
 {
+	const auto lock = GameList::GetLock();
 	if (left_row < 0 || left_row >= static_cast<int>(GameList::GetEntryCount()) || right_row < 0 ||
 		right_row >= static_cast<int>(GameList::GetEntryCount()))
 	{
@@ -384,8 +391,8 @@ bool GameListModel::titlesLessThan(const int left_row, const int right_row) cons
 
 	const GameList::Entry* left = GameList::GetEntryByIndex(left_row);
 	const GameList::Entry* right = GameList::GetEntryByIndex(right_row);
-	return QtHost::LocaleSensitiveCompare(QString::fromStdString(left->GetTitleSort(m_prefer_english_titles)),
-				QString::fromStdString(right->GetTitleSort(m_prefer_english_titles))) < 0;
+	return QtHost::LocaleSensitiveCompare(QString::fromStdString(GameList::GetDisplayTitle(left, m_collapse_multi_disc, m_prefer_english_titles, true)),
+			   QString::fromStdString(GameList::GetDisplayTitle(right, m_collapse_multi_disc, m_prefer_english_titles, true))) < 0;
 }
 
 bool GameListModel::lessThan(const QModelIndex& left_index, const QModelIndex& right_index, const int column) const
@@ -473,18 +480,22 @@ bool GameListModel::lessThan(const QModelIndex& left_index, const QModelIndex& r
 
 		case Column_TimePlayed:
 		{
-			if (left->total_played_time == right->total_played_time)
+			const auto left_history = GameList::GetDisplayPlayHistory(left, m_collapse_multi_disc);
+			const auto right_history = GameList::GetDisplayPlayHistory(right, m_collapse_multi_disc);
+			if (left_history.total_played_time == right_history.total_played_time)
 				return titlesLessThan(left_row, right_row);
 
-			return (left->total_played_time < right->total_played_time);
+			return left_history.total_played_time < right_history.total_played_time;
 		}
 
 		case Column_LastPlayed:
 		{
-			if (left->last_played_time == right->last_played_time)
+			const auto left_history = GameList::GetDisplayPlayHistory(left, m_collapse_multi_disc);
+			const auto right_history = GameList::GetDisplayPlayHistory(right, m_collapse_multi_disc);
+			if (left_history.last_played_time == right_history.last_played_time)
 				return titlesLessThan(left_row, right_row);
 
-			return (left->last_played_time < right->last_played_time);
+			return left_history.last_played_time < right_history.last_played_time;
 		}
 
 		default:
@@ -494,6 +505,7 @@ bool GameListModel::lessThan(const QModelIndex& left_index, const QModelIndex& r
 
 void GameListModel::loadSettings()
 {
+	m_collapse_multi_disc = Host::GetBaseBoolSettingValue("UI", "CollapseMultiDiscGames", false);
 	m_prefer_english_titles = Host::GetBaseBoolSettingValue("UI", "PreferEnglishGameList", false);
 }
 

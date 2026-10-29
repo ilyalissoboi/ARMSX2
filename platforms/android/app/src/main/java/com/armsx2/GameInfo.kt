@@ -46,6 +46,24 @@ object EnglishTitles {
 }
 
 /**
+ * List each multi-disc game once, and ask which disc to boot when it is launched
+ * (see [com.armsx2.data.library.DiscSets] for how discs are matched).
+ *
+ * Default OFF, as on desktop (`UI/CollapseMultiDiscGames`): turning it on hides entries, and a
+ * library that silently lost its Disc 2 tiles would look like a scan bug. Off restores every disc
+ * as its own entry; nothing about a disc is stored differently either way.
+ */
+object CollapseMultiDisc {
+    private const val KEY = "library.collapseMultiDisc"
+    val enabled = mutableStateOf(false)
+    fun load() { enabled.value = MainActivityRuntime.prefs.getBoolean(KEY, false) }
+    fun set(value: Boolean) {
+        enabled.value = value
+        MainActivityRuntime.prefs.edit().putBoolean(KEY, value).apply()
+    }
+}
+
+/**
  * Per-game display-name overrides. Modded discs routinely report a garbage internal title —
  * "UN6 A35" for a Naruto Ultimate Ninja 5 mod, "5" for a Tekken 6 one — and the GameDB can't
  * correct them, because the serial still belongs to the base game it was built from. The user

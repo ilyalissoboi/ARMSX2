@@ -27,6 +27,9 @@
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <map>
+#include <numeric>
+#include <set>
 #include <string_view>
 #include <utility>
 
@@ -96,6 +99,535 @@ static std::vector<GameList::Entry> s_entries;
 static std::recursive_mutex s_mutex;
 static GameList::CacheMap s_cache_map;
 static std::FILE* s_cache_write_stream = nullptr;
+static bool s_disc_sets_dirty = true;
+static std::vector<GameList::DiscSet> s_disc_sets;
+static std::unordered_map<std::string, size_t> s_disc_set_by_path;
+
+namespace
+{
+	struct NumberedDiscTitle
+	{
+		std::string title;
+		u32 number;
+	};
+
+	bool IsSpace(char c)
+	{
+		return std::isspace(static_cast<unsigned char>(c)) != 0;
+	}
+
+	bool IsSeparator(char c)
+	{
+		return IsSpace(c) || c == '-' || c == '_' || c == ':' || c == '.';
+	}
+
+	std::string NormalizeDiscText(std::string_view text)
+	{
+		std::string result;
+		for (size_t offset = 0; offset < text.size();)
+		{
+			char32_t ch;
+			const size_t length = StringUtil::DecodeUTF8(text, offset, &ch);
+			if (length == 0)
+			{
+				result.push_back(text[offset++]);
+				continue;
+			}
+			offset += length;
+			if (ch >= 0xFF01 && ch <= 0xFF5E)
+				ch -= 0xFEE0; // Full-width ASCII letters, digits and delimiters.
+			else if (ch == 0x3000 || ch == 0xA0)
+				ch = ' ';
+			else if (ch >= 0x2010 && ch <= 0x2014)
+				ch = '-';
+			StringUtil::EncodeAndAppendUTF8(result, ch);
+		}
+		return result;
+	}
+
+	std::string MatchingKey(std::string_view text)
+	{
+		const std::string normalized = NormalizeDiscText(text);
+		std::string key;
+		bool space = false;
+		// Keep non-ASCII text intact; locale-dependent case folding needs proper testing.
+		for (const unsigned char ch : normalized)
+		{
+			if (ch < 0x80 && !std::isalnum(ch))
+			{
+				space = !key.empty();
+				continue;
+			}
+			if (space)
+				key.push_back(' ');
+			space = false;
+			key.push_back(ch < 0x80 ? static_cast<char>(std::tolower(ch)) : static_cast<char>(ch));
+		}
+		return key;
+	}
+
+	bool MatchesToken(std::string_view text, size_t offset, std::string_view token)
+	{
+		return offset + token.size() <= text.size() && StringUtil::compareNoCase(text.substr(offset, token.size()), token);
+	}
+
+	std::optional<u32> ReadDiscNumber(std::string_view text, size_t* offset)
+	{
+		const size_t start = *offset;
+		while (*offset < text.size() && text[*offset] >= '0' && text[*offset] <= '9')
+			++*offset;
+		if (*offset != start)
+		{
+			const auto number = StringUtil::FromChars<u32>(text.substr(start, *offset - start));
+			return number && *number > 0 && *number <= 99 ? number : std::nullopt;
+		}
+		while (*offset < text.size() && (text[*offset] == 'I' || text[*offset] == 'i' || text[*offset] == 'V' ||
+											text[*offset] == 'v' || text[*offset] == 'X' || text[*offset] == 'x'))
+		{
+			++*offset;
+		}
+		static constexpr std::string_view roman[] = {
+			"I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X",
+			"XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX"};
+		for (u32 i = 0; i < std::size(roman); i++)
+		{
+			if (StringUtil::compareNoCase(text.substr(start, *offset - start), roman[i]))
+				return i + 1;
+		}
+		return std::nullopt;
+	}
+
+	std::optional<NumberedDiscTitle> ParseDiscTitle(std::string_view title)
+	{
+		const std::string text = NormalizeDiscText(title);
+		static constexpr std::string_view labels[] = {"disc", "disk", "dvd", "cd", "ディスク", "光盘", "光碟", "디스크"};
+		for (size_t pos = 0; pos < text.size(); pos++)
+		{
+			if (pos > 0 && !IsSeparator(text[pos - 1]) && text[pos - 1] != '[' && text[pos - 1] != '(')
+				continue;
+			for (const std::string_view label : labels)
+			{
+				if (!MatchesToken(text, pos, label))
+					continue;
+				size_t start = pos;
+				while (start > 0 && IsSpace(text[start - 1]))
+					--start;
+				char close = 0;
+				if (start > 0 && (text[start - 1] == '[' || text[start - 1] == '('))
+					close = text[--start] == '[' ? ']' : ')';
+				size_t end = pos + label.size();
+				while (end < text.size() && IsSeparator(text[end]))
+					++end;
+				const auto number = ReadDiscNumber(text, &end);
+				if (!number)
+					continue;
+				const size_t number_end = end;
+				while (end < text.size() && IsSpace(text[end]))
+					++end;
+				if (MatchesToken(text, end, "of") || (end < text.size() && text[end] == '/'))
+				{
+					end += text[end] == '/' ? 1 : 2;
+					while (end < text.size() && IsSpace(text[end]))
+						++end;
+					const auto count = ReadDiscNumber(text, &end);
+					if (!count || *count < *number)
+						continue;
+					while (end < text.size() && IsSpace(text[end]))
+						++end;
+				}
+				else if (!close)
+				{
+					end = number_end;
+				}
+				if (close)
+				{
+					if (end == text.size() || text[end] != close)
+						continue;
+					++end;
+				}
+				if (end < text.size() && !IsSpace(text[end]) && text[end] != '[' && text[end] != '(' && text[end] != '-')
+					continue;
+				while (start > 0 && IsSeparator(text[start - 1]))
+					--start;
+				std::string base(text.substr(0, start));
+				const std::string_view suffix = StringUtil::StripWhitespace(std::string_view(text).substr(end));
+				if (!base.empty() && !suffix.empty())
+					base.push_back(' ');
+				base.append(suffix);
+				StringUtil::StripWhitespace(&base);
+				if (!base.empty())
+					return NumberedDiscTitle{std::move(base), *number};
+			}
+		}
+		return std::nullopt;
+	}
+
+	std::string GetDiscSetTitle(const std::string& title)
+	{
+		auto parsed = ParseDiscTitle(title);
+		return parsed ? std::move(parsed->title) : title;
+	}
+
+	std::set<std::string> GetTitleTags(std::string_view title)
+	{
+		const std::string text = NormalizeDiscText(title);
+		std::set<std::string> tags;
+		for (size_t start = 0; start < text.size(); start++)
+		{
+			if (text[start] != '[' && text[start] != '(')
+				continue;
+			const size_t end = text.find(text[start] == '[' ? ']' : ')', start + 1);
+			if (end == std::string::npos)
+				continue;
+			const std::string_view tag = std::string_view(text).substr(start, end - start + 1);
+			const auto disc = ParseDiscTitle(fmt::format("Title {}", tag));
+			if (!disc || disc->title != "Title")
+				tags.insert(MatchingKey(tag));
+			start = end;
+		}
+		return tags;
+	}
+
+	std::string GetReleaseQualifiers(const GameList::Entry& entry)
+	{
+		auto tags = GetTitleTags(Path::GetFileTitle(entry.path));
+		// Database titles already carry edition information. Explicit metadata can also identify
+		// per-disc labels such as Cy Girls' Ice/Aska, without stripping arbitrary filename tags.
+		const std::string empty;
+		for (const std::string* title : {&entry.title, &entry.title_en,
+				 entry.disc_set ? &entry.disc_set->disc_name : &empty,
+				 entry.disc_set ? &entry.disc_set->disc_name_en : &empty})
+		{
+			for (const std::string& tag : GetTitleTags(*title))
+			{
+				tags.erase(tag);
+				if (entry.disc_set)
+				{
+					if (const auto disc = ParseDiscTitle(tag))
+					{
+						const std::string label = MatchingKey(disc->title);
+						tags.erase(label);
+						if (label == "english")
+							tags.erase("en");
+						else if (label == "japanese")
+							tags.erase("ja");
+					}
+				}
+			}
+		}
+		if (!entry.disc_set)
+		{
+			for (const std::string* title : {&entry.title, &entry.title_en})
+			{
+				const auto title_tags = GetTitleTags(*title);
+				tags.insert(title_tags.begin(), title_tags.end());
+			}
+		}
+		if (entry.region == GameList::Region::NTSC_U)
+		{
+			tags.erase("usa");
+			tags.erase("us");
+		}
+		else if (entry.region == GameList::Region::NTSC_J)
+		{
+			tags.erase("japan");
+			tags.erase("jp");
+		}
+		else if (entry.region >= GameList::Region::PAL_A && entry.region < GameList::Region::Count)
+		{
+			tags.erase("europe");
+			tags.erase("eur");
+		}
+		std::string result;
+		for (const std::string& tag : tags)
+			fmt::format_to(std::back_inserter(result), "{}\n", tag);
+		return result;
+	}
+
+	class DiscSetUnion
+	{
+	public:
+		explicit DiscSetUnion(size_t size)
+			: m_parents(size)
+		{
+			std::iota(m_parents.begin(), m_parents.end(), 0);
+		}
+		size_t Find(size_t i)
+		{
+			while (m_parents[i] != i)
+			{
+				m_parents[i] = m_parents[m_parents[i]];
+				i = m_parents[i];
+			}
+			return i;
+		}
+		void Join(size_t lhs, size_t rhs)
+		{
+			lhs = Find(lhs);
+			rhs = Find(rhs);
+			m_parents[std::max(lhs, rhs)] = std::min(lhs, rhs);
+		}
+
+	private:
+		std::vector<size_t> m_parents;
+	};
+} // namespace
+
+const GameList::Entry* GameList::DiscSet::GetRepresentative() const
+{
+	return entries.front();
+}
+
+GameList::PlayHistory GameList::DiscSet::GetPlayHistory() const
+{
+	PlayHistory history;
+	std::unordered_map<std::string, std::time_t> serial_times;
+	for (const Entry* entry : entries)
+	{
+		history.last_played_time = std::max(history.last_played_time, entry->last_played_time);
+		const std::string key = entry->serial.empty() ? "path:" + entry->path : "serial:" + StringUtil::toUpper(entry->serial);
+		// Copies and discs sharing a serial read the same cumulative playtime record.
+		// Take its newest value once, rather than counting each image as a separate session.
+		auto& time = serial_times[key];
+		time = std::max(time, entry->total_played_time);
+	}
+	for (const auto& [serial, time] : serial_times)
+		history.total_played_time += time;
+	return history;
+}
+
+std::optional<u32> GameList::GetDiscNumberForEntry(const Entry* entry)
+{
+	if (entry->disc_set)
+		return entry->disc_set->number;
+	std::optional<u32> number;
+	for (const std::string* title : {&entry->title, &entry->title_en})
+	{
+		if (const auto parsed = ParseDiscTitle(*title))
+		{
+			if (number && *number != parsed->number)
+				return std::nullopt;
+			number = parsed->number;
+		}
+	}
+	if (!number)
+	{
+		if (const auto parsed = ParseDiscTitle(Path::GetFileTitle(entry->path)))
+			number = parsed->number;
+	}
+	return number;
+}
+
+std::vector<GameList::DiscSet> GameList::BuildDiscSets(std::span<const Entry> entries)
+{
+	DiscSetUnion matches(entries.size());
+	std::vector<u32> numbers(entries.size());
+	std::vector<std::string> known_ids(entries.size());
+	std::map<std::string, std::vector<size_t>> by_alias;
+	std::map<std::string, std::vector<size_t>> by_image_id;
+	std::unordered_map<std::string, size_t> by_set_id;
+
+	for (size_t i = 0; i < entries.size(); i++)
+	{
+		const Entry& entry = entries[i];
+		if (!entry.IsDisc())
+			continue;
+		numbers[i] = GetDiscNumberForEntry(&entry).value_or(0);
+		const std::string release = fmt::format("{}\n{}\n{}", static_cast<u32>(entry.type),
+			static_cast<u32>(entry.region), GetReleaseQualifiers(entry));
+		const std::string family = StringUtil::toUpper(std::string_view(entry.serial).substr(0, entry.serial.find('-')));
+		std::set<std::string> names;
+		if (entry.disc_set)
+		{
+			known_ids[i] = StringUtil::toUpper(entry.disc_set->id);
+			const auto [it, inserted] = by_set_id.emplace(release + '\n' + known_ids[i], i);
+			if (!inserted)
+				matches.Join(i, it->second);
+		}
+		else
+		{
+			if (numbers[i] != 0)
+			{
+				for (const std::string* title : {&entry.title, &entry.title_en})
+				{
+					if (const auto parsed = ParseDiscTitle(*title))
+						names.insert(MatchingKey(parsed->title));
+				}
+			}
+			if (numbers[i] != 0 && names.empty())
+			{
+				if (const auto parsed = ParseDiscTitle(Path::GetFileTitle(entry.path)))
+				{
+					numbers[i] = parsed->number;
+					names.insert(MatchingKey(parsed->title));
+					if (!entry.title.empty())
+						names.insert(MatchingKey(entry.title));
+				}
+			}
+			// Issue numbers on standalone demo/sampler discs are not disc-set ordinals.
+			if (std::any_of(names.begin(), names.end(), [](const std::string& name) {
+					return name.find("demo") != std::string::npos || name.find("sampler") != std::string::npos || name.find("magazine") != std::string::npos;
+				}))
+				names.clear();
+		}
+		for (const std::string& name : names)
+		{
+			if (!name.empty())
+				by_alias[release + '\n' + family + '\n' + name].push_back(i);
+		}
+		if (!entry.serial.empty() && entry.crc != 0)
+		{
+			const std::string title = entry.disc_set ? entry.disc_set->name : GetDiscSetTitle(entry.title);
+			by_image_id[fmt::format("{}\n{}\n{}\n{}", release, StringUtil::toUpper(entry.serial), entry.crc, MatchingKey(title))].push_back(i);
+		}
+	}
+
+	for (const auto& [key, members] : by_alias)
+	{
+		for (const size_t i : members)
+			matches.Join(members.front(), i);
+	}
+	for (const auto& [key, members] : by_image_id)
+	{
+		std::set<u32> ordinals;
+		std::set<std::string> ids;
+		for (const size_t i : members)
+		{
+			if (numbers[i] != 0)
+				ordinals.insert(numbers[i]);
+			if (!known_ids[i].empty())
+				ids.insert(known_ids[i]);
+		}
+		// Some discs reuse an executable/serial. Only group candidate images of the same ordinal.
+		if (ordinals.size() > 1 || ids.size() > 1)
+			continue;
+		for (const size_t i : members)
+		{
+			if (!ordinals.empty())
+				numbers[i] = *ordinals.begin();
+			matches.Join(members.front(), i);
+		}
+	}
+
+	std::map<size_t, std::vector<size_t>> groups;
+	for (size_t i = 0; i < entries.size(); i++)
+	{
+		if (entries[i].IsDisc())
+			groups[matches.Find(i)].push_back(i);
+	}
+	std::vector<DiscSet> sets;
+	for (auto& [root, members] : groups)
+	{
+		if (members.size() < 2)
+			continue;
+		std::set<u32> ordinals;
+		std::set<std::pair<std::string, u32>> image_ids;
+		std::map<std::pair<std::string, u32>, std::set<u32>> versions;
+		std::map<u32, std::set<std::string>> serials_by_number;
+		bool identified = true;
+		for (const size_t i : members)
+		{
+			const Entry& entry = entries[i];
+			if (numbers[i] != 0)
+				ordinals.insert(numbers[i]);
+			const std::string serial = StringUtil::toUpper(entry.serial);
+			if (numbers[i] != 0 && !serial.empty())
+				serials_by_number[numbers[i]].insert(serial);
+			identified &= !serial.empty() && entry.crc != 0;
+			image_ids.emplace(serial, entry.crc);
+			if (!serial.empty() && entry.crc != 0)
+				versions[{serial, numbers[i]}].insert(entry.crc);
+		}
+		if (std::any_of(versions.begin(), versions.end(), [](const auto& version) { return version.second.size() > 1; }))
+			continue; // An unlabelled revision cannot safely be paired with the other discs.
+		if (std::any_of(serials_by_number.begin(), serials_by_number.end(), [](const auto& number) { return number.second.size() > 1; }))
+			continue; // More than one release supplies the same ordinal; naming alone is ambiguous.
+		if (ordinals.size() < 2 && !(identified && image_ids.size() == 1))
+			continue;
+		std::sort(members.begin(), members.end(), [&entries, &numbers](size_t lhs, size_t rhs) {
+			if (numbers[lhs] != numbers[rhs])
+				return numbers[lhs] < numbers[rhs];
+			if (entries[lhs].serial != entries[rhs].serial)
+				return entries[lhs].serial < entries[rhs].serial;
+			return entries[lhs].path < entries[rhs].path;
+		});
+		DiscSet set;
+		for (const size_t i : members)
+		{
+			const Entry& entry = entries[i];
+			set.entries.push_back(&entry);
+			if (set.title.empty())
+				set.title = entry.disc_set ? entry.disc_set->name : GetDiscSetTitle(entry.title);
+			if (set.title_en.empty())
+				set.title_en = entry.disc_set ? entry.disc_set->name_en : GetDiscSetTitle(entry.title_en);
+			if (set.title_sort.empty())
+				set.title_sort = GetDiscSetTitle(entry.title_sort); // A set name is no kana sort key; empty sorts by title.
+		}
+		sets.push_back(std::move(set));
+	}
+	return sets;
+}
+
+const GameList::DiscSet* GameList::GetDiscSetForEntry(const Entry* entry)
+{
+	if (s_disc_sets_dirty)
+	{
+		s_disc_set_by_path.clear();
+		s_disc_sets = BuildDiscSets(s_entries);
+		for (size_t i = 0; i < s_disc_sets.size(); i++)
+		{
+			for (const Entry* member : s_disc_sets[i].entries)
+				s_disc_set_by_path.emplace(member->path, i);
+		}
+		s_disc_sets_dirty = false;
+	}
+	const auto it = s_disc_set_by_path.find(entry->path);
+	return it != s_disc_set_by_path.end() ? &s_disc_sets[it->second] : nullptr;
+}
+
+const std::string& GameList::GetDisplayTitle(const Entry* entry, bool collapse_discs, bool force_en, bool sort)
+{
+	if (collapse_discs)
+	{
+		if (const DiscSet* set = GetDiscSetForEntry(entry))
+		{
+			if (force_en && !set->title_en.empty())
+				return set->title_en;
+			return sort && !set->title_sort.empty() ? set->title_sort : set->title;
+		}
+	}
+	return sort ? entry->GetTitleSort(force_en) : entry->GetTitle(force_en);
+}
+
+GameList::PlayHistory GameList::GetDisplayPlayHistory(const Entry* entry, bool collapse_discs)
+{
+	if (collapse_discs)
+	{
+		if (const DiscSet* set = GetDiscSetForEntry(entry))
+			return set->GetPlayHistory();
+	}
+	return {entry->last_played_time, entry->total_played_time};
+}
+
+void GameList::ClearPlayedTimeForEntry(const Entry* entry, bool collapse_discs)
+{
+	std::set<std::string> serials;
+	{
+		const auto lock = GetLock();
+		const DiscSet* set = collapse_discs ? GetDiscSetForEntry(entry) : nullptr;
+		if (set)
+		{
+			for (const Entry* disc : set->entries)
+				serials.insert(disc->serial);
+		}
+		else
+		{
+			serials.insert(entry->serial);
+		}
+	}
+	for (const std::string& serial : serials)
+		ClearPlayedTimeForSerial(serial);
+}
 
 const char* GameList::EntryTypeToString(EntryType type, bool translate)
 {
@@ -494,6 +1026,7 @@ bool GameList::GetIsoListEntry(const std::string& path, GameList::Entry* entry)
 		entry->title = std::move(db_entry->name);
 		entry->title_sort = std::move(db_entry->name_sort);
 		entry->title_en = std::move(db_entry->name_en);
+		entry->disc_set = db_entry->disc_set;
 		entry->compatibility_rating = db_entry->compat;
 		entry->region = ParseDatabaseRegion(db_entry->region);
 	}
@@ -816,6 +1349,8 @@ bool GameList::AddFileFromCache(const std::string& path, std::time_t timestamp, 
 	// Skip over invalid entries.
 	if (entry.type == EntryType::Invalid)
 		return true;
+	if (const GameDatabaseSchema::GameEntry* game = GameDatabase::findGame(entry.serial))
+		entry.disc_set = game->disc_set;
 
 	auto iter = played_time_map.find(entry.serial);
 	if (iter != played_time_map.end())
@@ -825,6 +1360,7 @@ bool GameList::AddFileFromCache(const std::string& path, std::time_t timestamp, 
 	}
 
 	s_entries.push_back(std::move(entry));
+	s_disc_sets_dirty = true;
 	return true;
 }
 
@@ -886,6 +1422,7 @@ bool GameList::ScanFile(std::string path, std::time_t timestamp, std::unique_loc
 		s_entries.erase(it);
 
 	s_entries.push_back(std::move(entry));
+	s_disc_sets_dirty = true;
 	return true;
 }
 
@@ -962,6 +1499,7 @@ void GameList::Refresh(bool invalidate_cache, bool only_cache, ProgressCallback*
 	{
 		std::unique_lock lock(s_mutex);
 		old_entries.swap(s_entries);
+		s_disc_sets_dirty = true;
 	}
 
 	const std::vector<std::string> excluded_paths(Host::GetBaseStringListSetting("GameList", "ExcludedPaths"));

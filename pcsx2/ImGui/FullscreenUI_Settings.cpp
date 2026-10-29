@@ -2304,6 +2304,9 @@ void FullscreenUI::DrawInterfaceSettingsPage()
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_GLOBE, "Prefer English Game Titles"),
 		FSUI_CSTR("For games with both a title in the game's native language and one in English, prefer the English title. Affects how game titles are displayed on the game list, window title and Discord Presence"), "UI",
 		"PreferEnglishGameList", false);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_COMPACT_DISC, "Collapse Multi-Disc Games"),
+		FSUI_CSTR("Groups multi-disc games and alternate images into one library entry, then asks which image to boot. Different regions and editions remain separate."),
+		"UI", "CollapseMultiDiscGames", false);
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_CIRCLE_INFO, "Use Save State Selector"),
 		FSUI_CSTR("Show a save state selector UI when switching slots instead of showing a notification bubble."),
 		"EmuCore", "UseSavestateSelector", true);
@@ -6852,6 +6855,8 @@ TRANSLATE_NOOP("FullscreenUI", "Clear Settings");
 TRANSLATE_NOOP("FullscreenUI", "Theme");
 TRANSLATE_NOOP("FullscreenUI", "Default To Game List");
 TRANSLATE_NOOP("FullscreenUI", "Prefer English Game Titles");
+TRANSLATE_NOOP("FullscreenUI", "Collapse Multi-Disc Games");
+TRANSLATE_NOOP("FullscreenUI", "Groups multi-disc games and alternate images into one library entry, then asks which image to boot. Different regions and editions remain separate.");
 TRANSLATE_NOOP("FullscreenUI", "Use Save State Selector");
 TRANSLATE_NOOP("FullscreenUI", "Background Image");
 TRANSLATE_NOOP("FullscreenUI", "Select Background Image");

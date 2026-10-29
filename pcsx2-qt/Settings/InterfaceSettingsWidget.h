@@ -23,6 +23,7 @@ Q_SIGNALS:
 	void languageChanged();
 	void backgroundChanged();
 	void preferEnglishGameListChanged();
+	void collapseMultiDiscChanged();
 
 private Q_SLOTS:
 	void onRenderToSeparateWindowChanged();

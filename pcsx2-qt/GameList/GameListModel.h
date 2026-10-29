@@ -60,6 +60,8 @@ public:
 
 	bool lessThan(const QModelIndex& left_index, const QModelIndex& right_index, int column) const;
 
+	bool getCollapseMultiDisc() const { return m_collapse_multi_disc; }
+
 	bool getShowCoverTitles() const { return m_show_titles_for_covers; }
 	void setShowCoverTitles(bool enabled) { m_show_titles_for_covers = enabled; }
 
@@ -95,6 +97,7 @@ private:
 	bool m_show_titles_for_covers = false;
 	bool m_show_full_titles_for_covers = false;
 	bool m_prefer_english_titles = false;
+	bool m_collapse_multi_disc = false;
 
 	std::array<QString, Column_Count> m_column_display_names;
 	std::array<QPixmap, static_cast<u32>(GameList::EntryType::Count)> m_type_pixmaps;

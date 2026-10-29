@@ -299,8 +299,9 @@ private:
 
 	QString getDiscDevicePath(const QString& title);
 
+	std::optional<GameList::Entry> selectGameListDisc(const GameList::Entry& entry);
 	void startGameListEntry(
-		const GameList::Entry& entry, std::optional<s32> save_slot = std::nullopt, std::optional<bool> fast_boot = std::nullopt, bool load_backup = false);
+		const GameList::Entry& entry, std::optional<s32> save_slot = std::nullopt, std::optional<bool> fast_boot = std::nullopt, bool load_backup = false, bool disc_selected = false);
 	void setGameListEntryCoverImage(const GameList::Entry& entry);
 	void clearGameListEntryPlayTime(const GameList::Entry& entry, const time_t entry_played_time);
 	void goToWikiPage(const GameList::Entry& entry);
@@ -311,7 +312,9 @@ private:
 	std::optional<bool> promptForResumeState(const QString& save_state_path);
 	void loadSaveStateSlot(s32 slot, bool load_backup = false);
 	void loadSaveStateFile(const QString& filename, const QString& state_filename);
-	void populateLoadStateMenu(QMenu* menu, const QString& filename, const QString& serial, quint32 crc);
+	void populateGameListLoadStateMenu(QMenu* menu, const GameList::Entry& entry);
+	void populateLoadStateMenu(QMenu* menu, const QString& filename, const QString& serial, quint32 crc,
+		const GameList::Entry* game_list_entry = nullptr);
 	void populateSaveStateMenu(QMenu* menu, const QString& serial, quint32 crc);
 	void doStartFile(std::optional<CDVD_SourceType> source, const QString& path);
 	void doDiscChange(CDVD_SourceType source, const QString& path);

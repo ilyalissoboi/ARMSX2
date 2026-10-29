@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -81,6 +82,8 @@ namespace GameList
 		std::string title;
 		std::string title_sort;
 		std::string title_en;
+		// Refreshed from GameDB even when the remaining entry comes from the scan cache.
+		std::optional<GameDatabaseSchema::DiscSetInfo> disc_set;
 		u64 total_size = 0;
 		std::time_t last_modified_time = 0;
 		std::time_t last_played_time = 0;
@@ -105,6 +108,38 @@ namespace GameList
 		__fi bool IsDisc() const { return (type == EntryType::PS1Disc || type == EntryType::PS2Disc); }
 		__fi bool IsArcade() const { return type == EntryType::Arcade; }
 	};
+
+	struct PlayHistory
+	{
+		std::time_t last_played_time = 0;
+		std::time_t total_played_time = 0;
+	};
+
+	// Disc sets are a library view. Every disc retains its original boot and save-state identity.
+	struct DiscSet
+	{
+		std::string title;
+		std::string title_sort;
+		std::string title_en;
+		std::vector<const Entry*> entries;
+
+		const Entry* GetRepresentative() const;
+		PlayHistory GetPlayHistory() const;
+	};
+
+	/// Matches release-specific disc-set IDs, then title aliases and serial/CRC image candidates.
+	/// All image paths remain selectable; executable CRCs are not proof of identical disc content.
+	/// Returned pointers refer to entries in the supplied span, which must outlive the sets.
+	std::vector<DiscSet> BuildDiscSets(std::span<const Entry> entries);
+	std::optional<u32> GetDiscNumberForEntry(const Entry* entry);
+
+	/// Requires the game list lock. The returned set is valid until the next list mutation.
+	const DiscSet* GetDiscSetForEntry(const Entry* entry);
+	const std::string& GetDisplayTitle(const Entry* entry, bool collapse_discs, bool force_en = false, bool sort = false);
+	/// Requires the game list lock. Combines playtime once per serial for collapsed sets.
+	PlayHistory GetDisplayPlayHistory(const Entry* entry, bool collapse_discs);
+	/// Clears every member serial when collapsed. Acquires the game list lock internally.
+	void ClearPlayedTimeForEntry(const Entry* entry, bool collapse_discs);
 
 	const char* EntryTypeToString(EntryType type, bool translate);
 	const char* RegionToString(Region region, bool translate);

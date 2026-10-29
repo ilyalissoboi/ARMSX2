@@ -1739,7 +1739,10 @@ void MainWindow::onGameListSelectionChanged()
 
 void MainWindow::onGameListEntryActivated()
 {
-	const std::optional<GameList::Entry> entry = m_game_list_widget->getSelectedEntry();
+	std::optional<GameList::Entry> entry = m_game_list_widget->getSelectedEntry();
+	if (!entry.has_value())
+		return;
+	entry = selectGameListDisc(*entry);
 	if (!entry.has_value())
 		return;
 
@@ -1768,7 +1771,7 @@ void MainWindow::onGameListEntryActivated()
 	}
 
 	// only resume if the option is enabled, and we have one for this game
-	startGameListEntry(*entry, resume.value() ? std::optional<s32>(-1) : std::optional<s32>(), std::nullopt);
+	startGameListEntry(*entry, resume.value() ? std::optional<s32>(-1) : std::optional<s32>(), std::nullopt, false, true);
 }
 
 void MainWindow::onGameListEntryContextMenuRequested(const QPoint& point)
@@ -1805,7 +1808,13 @@ void MainWindow::onGameListEntryContextMenuRequested(const QPoint& point)
 		connect(menu.addAction(tr("Exclude From List")), &QAction::triggered,
 			[this, entry]() { getSettingsWindow()->getGameListSettingsWidget()->addExcludedPath(entry->path); });
 
-		const time_t entry_played_time = GameList::GetCachedPlayedTimeForSerial(entry->serial);
+		std::time_t entry_played_time;
+		{
+			const auto lock = GameList::GetLock();
+			entry_played_time = GameList::GetDisplayPlayHistory(&*entry,
+				Host::GetBaseBoolSettingValue("UI", "CollapseMultiDiscGames", false))
+			                        .total_played_time;
+		}
 		// Best two options given zero play time are to grey this out or to not show it at all.
 		if (entry_played_time)
 			connect(menu.addAction(tr("Reset Play Time")), &QAction::triggered, [this, entry, entry_played_time]() { clearGameListEntryPlayTime(*entry, entry_played_time); });
@@ -1845,21 +1854,27 @@ void MainWindow::onGameListEntryContextMenuRequested(const QPoint& point)
 			{
 				action = menu.addAction(tr("Boot and Debug"));
 				connect(action, &QAction::triggered, [this, entry]() {
+					const auto disc = selectGameListDisc(*entry);
+					if (!disc)
+						return;
 					DebugInterface::setPauseOnEntry(true);
-					startGameListEntry(*entry);
+					startGameListEntry(*disc, std::nullopt, std::nullopt, false, true);
 					DebuggerWindow::getInstance()->show();
 				});
 			}
 #endif
 
 			menu.addSeparator();
-			populateLoadStateMenu(&menu, QString::fromStdString(entry->path), QString::fromStdString(entry->serial), entry->crc);
+			populateGameListLoadStateMenu(&menu, *entry);
 		}
 		else if (entry->IsDisc())
 		{
 			action = menu.addAction(tr("Change Disc"));
 			connect(action, &QAction::triggered, [this, entry]() {
-				g_emu_thread->changeDisc(CDVD_SourceType::Iso, QString::fromStdString(entry->path));
+				const auto disc = selectGameListDisc(*entry);
+				if (!disc)
+					return;
+				g_emu_thread->changeDisc(CDVD_SourceType::Iso, QString::fromStdString(disc->path));
 				switchToEmulationView();
 			});
 			QtUtils::MarkActionAsDefault(action);
@@ -1961,6 +1976,8 @@ void MainWindow::onStartFullscreenUITriggered()
 
 void MainWindow::onFullscreenUIStateChange(bool running)
 {
+	if (!running)
+		m_game_list_widget->refreshGridCovers();
 	m_ui.actionStartFullscreenUI->setText(running ? tr("Stop Big Picture Mode") : tr("Start Big Picture &Mode"));
 	m_ui.actionToolbarStartFullscreenUI->setText(running ? tr("Exit Big Picture", "In Toolbar") : tr("Big Picture", "In Toolbar"));
 }
@@ -3246,6 +3263,8 @@ SettingsWindow* MainWindow::getSettingsWindow()
 		m_settings_window = new SettingsWindow();
 		connect(m_settings_window->getInterfaceSettingsWidget(), &InterfaceSettingsWidget::themeChanged, this, &MainWindow::onThemeChanged);
 		connect(m_settings_window->getInterfaceSettingsWidget(), &InterfaceSettingsWidget::languageChanged, this, &MainWindow::onLanguageChanged);
+		connect(m_settings_window->getInterfaceSettingsWidget(), &InterfaceSettingsWidget::collapseMultiDiscChanged,
+			m_game_list_widget, &GameListWidget::refreshGridCovers);
 		connect(m_settings_window->getInterfaceSettingsWidget(), &InterfaceSettingsWidget::backgroundChanged, m_game_list_widget, [this] { m_game_list_widget->setCustomBackground(); });
 		connect(m_settings_window->getInterfaceSettingsWidget(), &InterfaceSettingsWidget::preferEnglishGameListChanged, this, [] {
 			g_main_window->m_game_list_widget->refreshGridCovers();
@@ -3388,8 +3407,51 @@ QString MainWindow::getDiscDevicePath(const QString& title)
 	return ret;
 }
 
-void MainWindow::startGameListEntry(const GameList::Entry& entry, std::optional<s32> save_slot, std::optional<bool> fast_boot, bool load_backup)
+std::optional<GameList::Entry> MainWindow::selectGameListDisc(const GameList::Entry& entry)
 {
+	if (!Host::GetBaseBoolSettingValue("UI", "CollapseMultiDiscGames", false))
+		return entry;
+
+	std::vector<GameList::Entry> discs;
+	{
+		const auto lock = GameList::GetLock();
+		const GameList::DiscSet* set = GameList::GetDiscSetForEntry(&entry);
+		if (!set)
+			return entry;
+		for (const GameList::Entry* disc : set->entries)
+			discs.push_back(*disc);
+	}
+
+	// Copy entries before entering a modal event loop: a background scan may replace the list.
+	QStringList options;
+	const bool prefer_english = Host::GetBaseBoolSettingValue("UI", "PreferEnglishGameList", false);
+	for (const GameList::Entry& disc : discs)
+	{
+		QString title = QString::fromStdString(disc.GetTitle(prefer_english));
+		if (const auto number = GameList::GetDiscNumberForEntry(&disc))
+			title = tr("Disc %1: %2").arg(*number).arg(title);
+		options.append(tr("%1 [%2] - %3").arg(title, QString::fromStdString(disc.serial), QDir::toNativeSeparators(QString::fromStdString(disc.path))));
+	}
+	bool accepted = false;
+	const QString selected = QInputDialog::getItem(this, tr("Select Disc"), tr("Which disc would you like to boot?"),
+		options, 0, false, &accepted);
+	const qsizetype index = options.indexOf(selected);
+	if (!accepted || index < 0)
+		return std::nullopt;
+	return discs[static_cast<size_t>(index)];
+}
+
+void MainWindow::startGameListEntry(const GameList::Entry& entry, std::optional<s32> save_slot, std::optional<bool> fast_boot,
+	bool load_backup, bool disc_selected)
+{
+	// Explicit save-state actions already identify a disc by serial and CRC.
+	if (!disc_selected && !save_slot.has_value())
+	{
+		const auto disc = selectGameListDisc(entry);
+		if (disc)
+			startGameListEntry(*disc, save_slot, fast_boot, load_backup, true);
+		return;
+	}
 	std::shared_ptr<VMBootParameters> params = std::make_shared<VMBootParameters>();
 	params->fast_boot = fast_boot;
 
@@ -3461,14 +3523,20 @@ void MainWindow::setGameListEntryCoverImage(const GameList::Entry& entry)
 
 void MainWindow::clearGameListEntryPlayTime(const GameList::Entry& entry, const time_t entry_played_time)
 {
+	const bool collapse_discs = Host::GetBaseBoolSettingValue("UI", "CollapseMultiDiscGames", false);
+	std::string title;
+	{
+		const auto lock = GameList::GetLock();
+		title = GameList::GetDisplayTitle(&entry, collapse_discs, Host::GetBaseBoolSettingValue("UI", "PreferEnglishGameList", false));
+	}
 	if (QMessageBox::question(this, tr("Confirm Reset"),
 			tr("Are you sure you want to reset the play time for '%1' (%2)?\n\nYour current play time is %3.\n\nThis action cannot be undone.")
-				.arg(entry.title.empty() ? tr("empty title") : QString::fromStdString(entry.title),
+				.arg(title.empty() ? tr("empty title") : QString::fromStdString(title),
 					entry.serial.empty() ? tr("no serial") : QString::fromStdString(entry.serial),
 					QString::fromStdString(GameList::FormatTimespan(entry_played_time, true))),
 			(QMessageBox::Yes | QMessageBox::No), QMessageBox::No) == QMessageBox::Yes)
 	{
-		GameList::ClearPlayedTimeForSerial(entry.serial);
+		GameList::ClearPlayedTimeForEntry(&entry, collapse_discs);
 		m_game_list_widget->refresh(false, false);
 	}
 }
@@ -3605,7 +3673,7 @@ void MainWindow::loadSaveStateFile(const QString& filename, const QString& state
 	if (s_vm_valid)
 	{
 		if (!filename.isEmpty() && s_current_disc_path != filename)
-			g_emu_thread->changeDisc(CDVD_SourceType::Iso, s_current_disc_path);
+			g_emu_thread->changeDisc(CDVD_SourceType::Iso, filename);
 		g_emu_thread->loadState(state_filename);
 	}
 	else
@@ -3623,13 +3691,61 @@ static QString formatTimestampForSaveStateMenu(time_t timestamp)
 	return qtime.toString(QLocale::system().dateTimeFormat(QLocale::ShortFormat));
 }
 
-void MainWindow::populateLoadStateMenu(QMenu* menu, const QString& filename, const QString& serial, quint32 crc)
+void MainWindow::populateGameListLoadStateMenu(QMenu* menu, const GameList::Entry& entry)
+{
+	std::vector<GameList::Entry> discs;
+	if (Host::GetBaseBoolSettingValue("UI", "CollapseMultiDiscGames", false))
+	{
+		const auto lock = GameList::GetLock();
+		if (const GameList::DiscSet* set = GameList::GetDiscSetForEntry(&entry))
+		{
+			for (const GameList::Entry* disc : set->entries)
+				discs.push_back(*disc);
+		}
+	}
+	if (discs.empty())
+		discs.push_back(entry);
+	QMenu* states_menu = discs.size() > 1 ? menu->addMenu(tr("Load State")) : menu;
+	const bool prefer_english = Host::GetBaseBoolSettingValue("UI", "PreferEnglishGameList", false);
+	for (const GameList::Entry& disc : discs)
+	{
+		QMenu* disc_menu = states_menu;
+		if (discs.size() > 1)
+		{
+			QString title = QString::fromStdString(disc.GetTitle(prefer_english));
+			if (const auto number = GameList::GetDiscNumberForEntry(&disc))
+				title = tr("Disc %1: %2").arg(*number).arg(title);
+			disc_menu = states_menu->addMenu(tr("%1 [%2] - %3").arg(title, QString::fromStdString(disc.serial), QtUtils::StringViewToQString(Path::GetFileName(disc.path))));
+		}
+		populateLoadStateMenu(disc_menu, QString::fromStdString(disc.path), QString::fromStdString(disc.serial), disc.crc, &disc);
+	}
+}
+
+void MainWindow::populateLoadStateMenu(QMenu* menu, const QString& filename, const QString& serial, quint32 crc,
+	const GameList::Entry* game_list_entry)
 {
 	if (serial.isEmpty())
 		return;
 
 	const bool is_right_click_menu = (menu != m_ui.menuLoadState);
 	bool has_any_states = false;
+	// Each action owns the disc it was enumerated for. A refresh or selection change must
+	// not redirect a numbered/backup slot to the collapsed representative's save states.
+	const auto load_slot = [this, entry = game_list_entry ? std::optional<GameList::Entry>(*game_list_entry) : std::nullopt](s32 slot, bool backup) {
+		if (!entry)
+		{
+			loadSaveStateSlot(slot, backup);
+		}
+		else if (!s_vm_valid)
+		{
+			startGameListEntry(*entry, slot, std::nullopt, backup, true);
+		}
+		else
+		{
+			loadSaveStateFile(QString::fromStdString(entry->path),
+				QString::fromStdString(VMManager::GetSaveStateFileName(entry->serial.c_str(), entry->crc, slot, backup)));
+		}
+	};
 
 	QAction* action = menu->addAction(is_right_click_menu ? tr("Load State File...") : tr("Load From File..."));
 	connect(action, &QAction::triggered, [this, filename]() {
@@ -3652,7 +3768,7 @@ void MainWindow::populateLoadStateMenu(QMenu* menu, const QString& filename, con
 		if (FileSystem::StatFile(state_filename.c_str(), &sd))
 		{
 			action = menu->addAction(tr("Resume (%2)").arg(formatTimestampForSaveStateMenu(sd.ModificationTime)));
-			connect(action, &QAction::triggered, [this]() { loadSaveStateSlot(-1); });
+			connect(action, &QAction::triggered, [load_slot]() { load_slot(-1, false); });
 
 			// Make bold to indicate it's the default choice when double-clicking
 			QtUtils::MarkActionAsDefault(action);
@@ -3675,7 +3791,7 @@ void MainWindow::populateLoadStateMenu(QMenu* menu, const QString& filename, con
 			continue;
 
 		action = menu->addAction(tr("Load Slot %1 (%2)").arg(i).arg(formatTimestampForSaveStateMenu(sd.ModificationTime)));
-		connect(action, &QAction::triggered, [this, i]() { loadSaveStateSlot(i); });
+		connect(action, &QAction::triggered, [load_slot, i]() { load_slot(i, false); });
 		has_any_states = true;
 	}
 
@@ -3687,7 +3803,7 @@ void MainWindow::populateLoadStateMenu(QMenu* menu, const QString& filename, con
 			continue;
 
 		action = menu->addAction(tr("Load Backup Slot %1 (%2)").arg(i).arg(formatTimestampForSaveStateMenu(sd.ModificationTime)));
-		connect(action, &QAction::triggered, [this, i]() { loadSaveStateSlot(i, true); });
+		connect(action, &QAction::triggered, [load_slot, i]() { load_slot(i, true); });
 		has_any_states = true;
 	}
 

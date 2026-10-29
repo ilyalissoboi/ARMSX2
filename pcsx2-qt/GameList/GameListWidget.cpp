@@ -97,21 +97,26 @@ public:
 
 	bool filterAcceptsRow(int source_row, const QModelIndex& source_parent) const override
 	{
-		if (m_filter_type != GameList::EntryType::Count ||
-			m_filter_region != GameList::Region::Count ||
-			!m_filter_name.isEmpty())
+		const auto lock = GameList::GetLock();
+		const GameList::Entry* entry = GameList::GetEntryByIndex(source_row);
+		if (!entry)
+			return false;
+		const GameList::DiscSet* set = m_model->getCollapseMultiDisc() ? GameList::GetDiscSetForEntry(entry) : nullptr;
+		if (set && set->GetRepresentative() != entry)
+			return false;
+		if (m_filter_type != GameList::EntryType::Count && entry->type != m_filter_type)
+			return false;
+		if (m_filter_region != GameList::Region::Count && entry->region != m_filter_region)
+			return false;
+		if (!m_filter_name.isEmpty())
 		{
-			const auto lock = GameList::GetLock();
-			const GameList::Entry* entry = GameList::GetEntryByIndex(source_row);
-			if (m_filter_type != GameList::EntryType::Count && entry->type != m_filter_type)
-				return false;
-			if (m_filter_region != GameList::Region::Count && entry->region != m_filter_region)
-				return false;
-			if (!m_filter_name.isEmpty() &&
-				!QString::fromStdString(entry->path).contains(m_filter_name, Qt::CaseInsensitive) &&
-				!QString::fromStdString(entry->serial).contains(m_filter_name, Qt::CaseInsensitive) &&
-				!QString::fromStdString(entry->title).contains(m_filter_name, Qt::CaseInsensitive) &&
-				!QString::fromStdString(entry->title_en).contains(m_filter_name, Qt::CaseInsensitive))
+			const auto matches = [this](const GameList::Entry* disc) {
+				return QString::fromStdString(disc->path).contains(m_filter_name, Qt::CaseInsensitive) ||
+				       QString::fromStdString(disc->serial).contains(m_filter_name, Qt::CaseInsensitive) ||
+				       QString::fromStdString(disc->title).contains(m_filter_name, Qt::CaseInsensitive) ||
+				       QString::fromStdString(disc->title_en).contains(m_filter_name, Qt::CaseInsensitive);
+			};
+			if (set ? std::none_of(set->entries.begin(), set->entries.end(), matches) : !matches(entry))
 				return false;
 		}
 
