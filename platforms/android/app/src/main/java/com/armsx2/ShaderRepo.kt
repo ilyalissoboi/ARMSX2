@@ -6,7 +6,9 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
+import kr.co.iefriends.pcsx2.HttpClient
 import kr.co.iefriends.pcsx2.NativeApp
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
@@ -22,7 +24,7 @@ import java.util.zip.ZipFile
  *  1. [listInstalled] — enumerate packs extracted under
  *     `<assetCopyRoot>/shaders/<id>/`, with the number of presets each
  *     one contributes.
- *  2. [sources] / [download] — the pinned list of remote packs, and
+ *  2. [sources] / [download] — the fixed list of remote packs, and
  *     download + extract of a pick into the shaders dir.
  *  3. …and that's it. There is no [CustomDriver.applyToNative] analogue:
  *     the presets are picked up by the existing Renderer-tab preset
@@ -57,9 +59,19 @@ object ShaderRepo {
      *  unnamed pack). */
     data class ShaderSource(
         val name: String,
-        val url: String,
         val id: String,
         val description: String,
+        /** A fixed download URL, for a host that publishes one stable artifact (the buildbot). */
+        val url: String? = null,
+        /**
+         * `owner/repo` whose LATEST GitHub release supplies the pack, resolved when the user
+         * taps Get rather than pinned here, so a new upstream release reaches users without an
+         * app update. [assetPattern] picks the pack out of that release's assets: these
+         * releases ship several zips (Lola Retro has 86Box/Amiberry/Kodi ports beside the
+         * RetroArch one), and the file names carry the version.
+         */
+        val githubRepo: String? = null,
+        val assetPattern: Regex? = null,
         /**
          * Pack id whose shaders this one's presets are written against, or null when it
          * stands alone.
@@ -70,6 +82,10 @@ object ShaderRepo {
          * so it is not installable as a pack of its own: it must land INSIDE the base
          * pack's folder, and it is inert without it. Both facts follow from this field —
          * [download] merges instead of renaming, and refuses when the base is missing.
+         *
+         * Where inside is read off the presets themselves ([companionSubtree]), not
+         * assumed: Retro Crisis has shipped both `shaders/shaders_slang/retro crisis/…` and
+         * a bare `retro crisis/…`, and following its latest release means taking either.
          */
         val requiresPack: String? = null,
         /**
@@ -94,7 +110,7 @@ object ShaderRepo {
      *  what they'd get in RetroArch: ~51MB, ~5.6k files, ~2.5k presets, with
      *  the category dirs (crt/, handheld/, bezel/…) at the ZIP ROOT.
      *
-     *  Only the one source. The GitHub `slang-shaders/archive/master.zip`
+     *  The only source of the base pack. The GitHub `slang-shaders/archive/master.zip`
      *  mirror used to sit alongside it and was dropped (2026-07-16) for not
      *  installing reliably — the buildbot artifact is the one that works, and
      *  it's also the one RetroArch itself ships, so a second entry bought
@@ -108,25 +124,35 @@ object ShaderRepo {
             id = "shaders_slang",
             description = "libretro buildbot · ~51 MB",
         ),
-        // A self-contained CRT preset (NewPixie fork, MIT/Unlicense) that GitHub serves
-        // only as a full-repo archive — the actual RetroArch chain is four levels down,
-        // beside a ReShade port we don't want. keepSubtree lands just that subtree, so it
-        // installs as a clean one-preset pack. Pinned to a commit because the repo cuts no
-        // releases, so nothing upstream can silently change what a user installed.
+        // A self-contained CRT preset (NewPixie fork, MIT/Unlicense). The release zip is the
+        // whole repo — the RetroArch chain sits four levels down, beside a ReShade port we
+        // don't want — so keepSubtree lands just that subtree as a clean one-preset pack.
+        // The `-variants-` zip beside it is the dev tree; the plain one is the release.
         ShaderSource(
             name = "CRT-SatPixie",
-            url = "https://github.com/Conkwer/satpixie-crt-shader/archive/8c08dd137b77a0e00e27f1a57b8a4d4bd6ac8889.zip",
             id = "satpixie_crt",
-            description = "Self-contained CRT · 1 preset",
+            description = "Self-contained CRT",
+            githubRepo = "Conkwer/satpixie-crt-shader",
+            assetPattern = Regex("""satpixie-crt-shader-\d+\.zip"""),
             keepSubtree = "RetroArch/shaders/shaders_slang/crt/",
         ),
-        // Preset pack for guest-advanced, pinned to a dated release rather than the
-        // repo's HEAD so an upstream retune can't silently change what a user installed.
+        // Self-contained CRT pack (MIT). The RetroArch zip nests everything under one
+        // `lola-retro/` root, which extract strips, and every preset reaches its stages as
+        // `../shaders/…` inside that tree — so it installs whole, no keepSubtree needed.
+        ShaderSource(
+            name = "Lola Retro",
+            id = "lola_retro",
+            description = "Self-contained CRT · presets per display and system",
+            githubRepo = "zoran123456/lola-retro",
+            assetPattern = Regex("""lola-retro-v[\d.]+\.zip"""),
+        ),
+        // Preset pack for guest-advanced.
         ShaderSource(
             name = "Retro Crisis · GDV-NTSC",
-            url = "https://github.com/RetroCrisis/Retro-Crisis-GDV-NTSC/releases/download/20260321/Retro.Crisis.GDV-NTSC.2026.03.21.zip",
             id = "retro_crisis_gdv_ntsc",
-            description = "666 presets · ~0.4 MB",
+            description = "GDV-NTSC presets per system",
+            githubRepo = "RetroCrisis/Retro-Crisis-GDV-NTSC",
+            assetPattern = Regex("""Retro\.Crisis\.GDV-NTSC\..+\.zip"""),
             requiresPack = "shaders_slang",
         ),
     )
@@ -382,9 +408,14 @@ object ShaderRepo {
                 Log.w(TAG, "install: ${source.id} needs '${source.requiresPack}' installed first")
                 return null
             }
-            if (!fetchToFile(source.url, tmpZip, onDownload, isCancelled)) return null
+            val url = downloadUrl(source) ?: return null
             if (isCancelled()) return null
-            if (!extract(tmpZip, tmpDir, onExtract, source.keepSubtree, isCancelled)) return null
+            if (!fetchToFile(url, tmpZip, onDownload, isCancelled)) return null
+            if (isCancelled()) return null
+            // A companion keeps its archive root: [companionSubtree] decides what to drop,
+            // and the root may be the very folder its presets need (`retro crisis/`).
+            val strip = source.requiresPack == null
+            if (!extract(tmpZip, tmpDir, onExtract, source.keepSubtree, strip, isCancelled)) return null
             if (isCancelled()) return null
 
             val presets = countPresets(tmpDir)
@@ -395,15 +426,20 @@ object ShaderRepo {
                 return null
             }
 
-            // Companion: MERGE into the shaders root, so its zip's own `shaders_slang/…`
-            // structure lands beside the base pack's `crt/` and the relative references
-            // resolve. Renaming onto a target would replace the base pack outright.
-            // Standalone: the original rename into shaders/<id>.
+            // Companion: MERGE into the base pack's folder, so its presets land beside the
+            // base pack's `crt/` and the relative references resolve. Renaming onto a target
+            // would replace the base pack outright. Standalone: the rename into shaders/<id>.
             val root = shadersRoot(context)
-            val targetDir = if (source.requiresPack != null) root else File(root, source.id)
+            val companionDir = source.requiresPack?.let { base ->
+                companionSubtree(tmpDir, base) ?: run {
+                    Log.w(TAG, "install: ${source.id} has no preset that places it under '$base'")
+                    return null
+                }
+            }
+            val targetDir = File(root, source.requiresPack ?: source.id)
             val committed = ShaderIndex.change(root) {
-                if (source.requiresPack != null) {
-                    mergeInto(tmpDir, targetDir)
+                if (companionDir != null) {
+                    mergeInto(companionDir, targetDir)
                     true
                 } else {
                     if (targetDir.exists()) targetDir.deleteRecursively()
@@ -422,6 +458,67 @@ object ShaderRepo {
         }
     }
 
+    private fun userAgent(): String = "ARMSX2/" + runCatching {
+        NativeApp.getBuildVersion()
+    }.getOrNull().orEmpty().ifEmpty { "dev" }
+
+    /** [source]'s fixed URL, or the matching asset of its repo's latest release. Null when
+     *  the release can't be read or has no asset matching [ShaderSource.assetPattern]. */
+    private fun downloadUrl(source: ShaderSource): String? {
+        source.url?.let { return it }
+        val repo = source.githubRepo ?: return null
+        val pattern = source.assetPattern ?: return null
+        val api = "https://api.github.com/repos/$repo/releases/latest"
+        val resp = runCatching {
+            HttpClient.doRequest(api, "GET", null, userAgent(), 15000)
+        }.getOrNull()
+        if (resp == null || resp.statusCode != 200 || resp.data.isEmpty()) {
+            Log.w(TAG, "release: $api -> status=${resp?.statusCode}")
+            return null
+        }
+        val release = runCatching { JSONObject(String(resp.data, Charsets.UTF_8)) }.getOrNull() ?: return null
+        val assets = release.optJSONArray("assets") ?: return null
+        for (i in 0 until assets.length()) {
+            val asset = assets.optJSONObject(i) ?: continue
+            if (!pattern.matches(asset.optString("name"))) continue
+            val url = asset.optString("browser_download_url")
+            if (url.isEmpty()) continue
+            Log.i(TAG, "release: ${source.id} ${release.optString("tag_name")} -> $url")
+            return url
+        }
+        Log.w(TAG, "release: $repo ${release.optString("tag_name")} has no asset matching $pattern")
+        return null
+    }
+
+    /**
+     * The folder under [tree] to merge into the [base] pack's folder, or null if no preset
+     * in [tree] says where it belongs.
+     *
+     * Read off a preset that reaches into the base pack: one at
+     * `x/y/p.slangp` naming `../../../shaders_slang/…` must sit three folders below the
+     * shaders root, i.e. two below `shaders_slang/`. So of its archive folders, the last
+     * two are kept and everything above them is the archive's own wrapping — dropped
+     * whatever it is called. An archive with too few folders to fill the depth can't be
+     * placed, and is refused rather than installed with every preset broken.
+     */
+    internal fun companionSubtree(tree: File, base: String): File? {
+        val ref = Regex("""((?:\.\./)+)""" + Regex.escape(base) + "/")
+        val anchor = tree.walkTopDown()
+            .filter { it.isFile && it.extension.equals("slangp", ignoreCase = true) }
+            .sortedBy { it.path }
+            .firstNotNullOfOrNull { preset ->
+                ref.find(runCatching { preset.readText() }.getOrDefault(""))
+                    ?.let { preset to it.groupValues[1].length / 3 }
+            } ?: return null
+        val (preset, depth) = anchor
+        val folders = preset.parentFile!!.relativeTo(tree).invariantSeparatorsPath
+            .split('/').filter { it.isNotEmpty() }
+        val keep = depth - 1
+        if (keep < 0 || folders.size < keep) return null
+        val wrapping = folders.take(folders.size - keep)
+        return if (wrapping.isEmpty()) tree else File(tree, wrapping.joinToString("/"))
+    }
+
     /**
      * Stream a URL to [dest], reporting bytes as they land.
      *
@@ -438,9 +535,7 @@ object ShaderRepo {
         onProgress: ((Long, Long) -> Unit)?,
         isCancelled: () -> Boolean,
     ): Boolean {
-        val userAgent = "ARMSX2/" + runCatching {
-            NativeApp.getBuildVersion()
-        }.getOrNull().orEmpty().ifEmpty { "dev" }
+        val userAgent = userAgent()
 
         var conn: HttpURLConnection? = null
         try {
@@ -507,6 +602,7 @@ object ShaderRepo {
         targetDir: File,
         onProgress: ((Int, Int) -> Unit)?,
         keepSubtree: String? = null,
+        stripCommonRoot: Boolean = true,
         isCancelled: () -> Boolean,
     ): Boolean {
         // Canonical (not absolute): resolves symlinks and `..`, so the
@@ -526,7 +622,7 @@ object ShaderRepo {
                 // common root so both install with the same layout — and so preset
                 // labels (which are paths relative to shaders/) don't carry a dead
                 // `slang-shaders-master/` segment.
-                val strip = commonRootPrefix(entries)
+                val strip = if (stripCommonRoot) commonRootPrefix(entries) else ""
                 var done = 0
                 var reported = 0
 
