@@ -1077,6 +1077,8 @@
     <ClInclude Include="GS\Renderers\Common\GSVertex.h" />
     <ClInclude Include="GS\Renderers\HW\GSVertexHW.h" />
     <ClInclude Include="GS\Renderers\HW\GSAlphaKnownBits.h" />
+    <ClInclude Include="GS\Renderers\HW\GSExactDirtyMapping.h" />
+    <ClInclude Include="GS\Renderers\HW\GSTargetRebase.h" />
     <ClInclude Include="GS\Renderers\HW\GSDepthCoverage.h" />
     <ClInclude Include="GS\Renderers\HW\GSDrawAlphaMask.h" />
     <ClInclude Include="GS\Renderers\HW\GSDrawLog.h" />
@@ -1088,6 +1090,7 @@
     <ClInclude Include="GS\Renderers\Common\GSVertexTrace.h" />
     <ClInclude Include="GS\Renderers\Common\GSFieldShiftDetector.h" />
     <ClInclude Include="GS\Renderers\Common\GSFieldShiftPolicy.h" />
+    <ClInclude Include="GS\Renderers\Common\GSBlendCarry.h" />
     <ClInclude Include="GS\Renderers\Common\GSBlendConstantPolicy.h" />
     <ClInclude Include="GS\Renderers\Common\GSBackThreadPolicy.h" />
     <ClInclude Include="GS\Renderers\Common\GSCopyRoadBlendingPolicy.h" />

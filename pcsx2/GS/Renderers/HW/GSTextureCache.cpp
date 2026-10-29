@@ -9,17 +9,22 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
 #include "GS/GSXXH.h"
+#include "GSExactDirtyMapping.h"
+#include "GSTargetRebase.h"
 
 #include "common/Console.h"
 #include "common/BitUtils.h"
 #include "common/HashCombine.h"
 #include "common/SmallString.h"
 
+#include <algorithm>
 #include <atomic>
 
 #include "fmt/format.h"
 
+#include <bit>
 #include <cinttypes>
+#include <cstring>
 #include <math.h>
 
 #ifdef __APPLE__
@@ -360,6 +365,222 @@ bool GSTextureCache::FullRectDirty(Target* target)
 	return FullRectDirty(target, GSUtil::GetChannelMask(target->m_TEX0.PSM));
 }
 
+static bool s_union_retire = true;
+static GSTextureCache::UnionRetireStats s_union_retire_stats;
+
+void GSTextureCache::SetUnionRetire(bool enable)
+{
+	s_union_retire = enable;
+}
+
+bool GSTextureCache::GetUnionRetire()
+{
+	return s_union_retire;
+}
+
+GSTextureCache::UnionRetireStats GSTextureCache::GetUnionRetireStats()
+{
+	return s_union_retire_stats;
+}
+
+void GSTextureCache::ResetUnionRetireStats()
+{
+	s_union_retire_stats = {};
+}
+
+bool GSTextureCache::DirtyRectsCover(const GSDirtyRectList& list, u32 psm, u32 bw, u32 rgba_mask, const GSVector4i& area_v, GSVector2i* hole)
+{
+	// A list longer than this is not swept: the target stays, which is what it did before.
+	static constexpr size_t MAX_RECTS = 128;
+
+	// Plain integers throughout: the rectangles are compared with each other many times over.
+	struct IRect
+	{
+		int x, y, z, w;
+	};
+	const IRect area = {area_v.x, area_v.y, area_v.z, area_v.w};
+	if (area.z <= area.x || area.w <= area.y)
+		return false;
+
+	const u32 bw1 = std::max(bw, 1u);
+	const auto counts = [&](const GSDirtyRect& d) {
+		return d.psm == psm && std::max(d.bw, 1u) == bw1 && (d.rgba._u32 & rgba_mask) == rgba_mask;
+	};
+
+	// The pixel an earlier test found in no rectangle, if it is still in none: then the list does not cover the
+	// area and nothing else needs looking at. The pixel is checked against this list, so an old one is only
+	// ever a missed shortcut. Most changes to a list that is not about to cover its target leave it uncovered.
+	if (hole && hole->x >= area.x && hole->x < area.z && hole->y >= area.y && hole->y < area.w)
+	{
+		const int hx = hole->x, hy = hole->y;
+		bool hit = false;
+		for (const GSDirtyRect& d : list)
+		{
+			if (hx >= d.r.x && hx < d.r.z && hy >= d.r.y && hy < d.r.w && counts(d))
+			{
+				hit = true;
+				break;
+			}
+		}
+		if (!hit)
+			return false;
+	}
+
+	IRect rects[MAX_RECTS];
+	size_t n = 0;
+	s64 area_sum = 0;
+	// The area and every rectangle that counts have their edges on an 8 pixel grid (blocks are 8 pixels or a
+	// multiple of it), which is the usual case, and then a bitmap of 8x8 cells answers exactly and faster.
+	bool on_grid = ((area.x | area.y | area.z | area.w) & 7) == 0;
+	for (const GSDirtyRect& d : list)
+	{
+		if (!counts(d))
+			continue;
+
+		const IRect r = {std::max(d.r.x, area.x), std::max(d.r.y, area.y), std::min(d.r.z, area.z), std::min(d.r.w, area.w)};
+		if (r.z <= r.x || r.w <= r.y)
+			continue;
+		if (r.x == area.x && r.y == area.y && r.z == area.z && r.w == area.w)
+			return true;
+		if (n == MAX_RECTS)
+			return false;
+
+		rects[n++] = r;
+		area_sum += static_cast<s64>(r.z - r.x) * (r.w - r.y);
+		on_grid &= ((r.x | r.y | r.z | r.w) & 7) == 0;
+	}
+
+	// The union is no larger than the sum of the areas.
+	if (area_sum < static_cast<s64>(area.z - area.x) * (area.w - area.y))
+		return false;
+
+	s_union_retire_stats.sweeps++;
+
+	if (on_grid)
+	{
+		static constexpr size_t MAX_WORDS = 1024;
+		const int cells_x = (area.z - area.x) >> 3;
+		const int cells_y = (area.w - area.y) >> 3;
+		const size_t row_words = static_cast<size_t>(cells_x + 63) >> 6;
+		if (row_words * static_cast<size_t>(cells_y) <= MAX_WORDS)
+		{
+			u64 cells[MAX_WORDS];
+			std::memset(cells, 0, row_words * static_cast<size_t>(cells_y) * sizeof(u64));
+			for (size_t i = 0; i < n; i++)
+			{
+				const int x0 = (rects[i].x - area.x) >> 3, x1 = (rects[i].z - area.x) >> 3;
+				const int y0 = (rects[i].y - area.y) >> 3, y1 = (rects[i].w - area.y) >> 3;
+				const int w0 = x0 >> 6, w1 = (x1 - 1) >> 6;
+				if (w0 == w1)
+				{
+					// The cells x0..x1 of one word.
+					const int lo = x0 & 63, count = x1 - x0;
+					const u64 mask = (count == 64 ? ~u64(0) : ((u64(1) << count) - 1)) << lo;
+					for (int y = y0; y < y1; y++)
+						cells[static_cast<size_t>(y) * row_words + static_cast<size_t>(w0)] |= mask;
+				}
+				else
+				{
+					for (int y = y0; y < y1; y++)
+					{
+						u64* const row = &cells[static_cast<size_t>(y) * row_words];
+						for (int w = w0; w <= w1; w++)
+						{
+							const int lo = std::max(x0 - w * 64, 0);
+							const int hi = std::min(x1 - w * 64, 64);
+							row[w] |= (hi == 64 ? ~u64(0) : ((u64(1) << hi) - 1)) & ~((u64(1) << lo) - 1);
+						}
+					}
+				}
+			}
+
+			for (int y = 0; y < cells_y; y++)
+			{
+				const u64* const row = &cells[static_cast<size_t>(y) * row_words];
+				for (size_t w = 0; w < row_words; w++)
+				{
+					const int left = cells_x - static_cast<int>(w) * 64;
+					const u64 want = left >= 64 ? ~u64(0) : ((u64(1) << left) - 1);
+					const u64 missing = want & ~row[w];
+					if (missing != 0)
+					{
+						if (hole)
+						{
+							const int cx = static_cast<int>(w) * 64 + std::countr_zero(missing);
+							*hole = GSVector2i(area.x + cx * 8, area.y + y * 8);
+						}
+						return false;
+					}
+				}
+			}
+			return true;
+		}
+	}
+
+	// Sweep across the distinct left and right edges. Inside one strip between two neighbouring edges a
+	// rectangle either spans the whole strip or misses it, so the strip is covered when the rectangles
+	// that span it, taken from the top down, leave no gap between area.y and area.w.
+	std::sort(rects, rects + n, [](const IRect& a, const IRect& b) { return a.y < b.y; });
+
+	int xs[2 * MAX_RECTS + 2];
+	size_t m = 0;
+	xs[m++] = area.x;
+	xs[m++] = area.z;
+	for (size_t i = 0; i < n; i++)
+	{
+		xs[m++] = rects[i].x;
+		xs[m++] = rects[i].z;
+	}
+	std::sort(xs, xs + m);
+	m = static_cast<size_t>(std::unique(xs, xs + m) - xs);
+
+	for (size_t i = 0; i + 1 < m; i++)
+	{
+		const int x0 = xs[i];
+		const int x1 = xs[i + 1];
+		int reach = area.y;
+		for (size_t k = 0; k < n && reach < area.w; k++)
+		{
+			const IRect& r = rects[k];
+			if (r.x > x0 || r.z < x1)
+				continue;
+			if (r.y > reach)
+			{
+				// The pixel at (x0, reach) is in no rectangle: the ones that span this strip and start no
+				// higher than reach all end at or above it, and the rest start below it.
+				if (hole)
+					*hole = GSVector2i(x0, reach);
+				return false;
+			}
+			reach = std::max(reach, r.w);
+		}
+		if (reach < area.w)
+		{
+			if (hole)
+				*hole = GSVector2i(x0, reach);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool GSTextureCache::FullRectDirtyByUnion(Target* target)
+{
+	// One rectangle is FullRectDirty's case. An unchanged list was tested when it last changed.
+	if (!s_union_retire || target->m_dirty.size() < 2 || target->m_dirty_adds == target->m_dirty_cover_checked)
+		return false;
+
+	target->m_dirty_cover_checked = target->m_dirty_adds;
+	s_union_retire_stats.tests++;
+
+	if (!DirtyRectsCover(target->m_dirty, target->m_TEX0.PSM, target->m_TEX0.TBW, GSUtil::GetChannelMask(target->m_TEX0.PSM), target->m_valid, &target->m_dirty_hole))
+		return false;
+
+	s_union_retire_stats.retired++;
+	return true;
+}
+
 void GSTextureCache::AddDirtyRectTarget(Target* target, GSVector4i rect, u32 psm, u32 bw, RGBAMask rgba, bool req_linear)
 {
 	bool skipdirty = false;
@@ -402,6 +623,7 @@ void GSTextureCache::AddDirtyRectTarget(Target* target, GSVector4i rect, u32 psm
 	{
 		GL_INS("TC: Dirty rect added for BP %x rect %d,%d->%d->%d", target->m_TEX0.TBP0, rect.x, rect.y, rect.z, rect.w);
 		target->m_dirty.push_back(GSDirtyRect(rect, psm, bw, rgba, req_linear));
+		target->m_dirty_adds++;
 
 		if (!target->m_drawn_since_read.rempty())
 		{
@@ -885,9 +1107,42 @@ GSVector4i GSTextureCache::TranslateAlignedRectByPage(Target* t, u32 sbp, u32 sp
 	return TranslateAlignedRectByPage(t->m_TEX0.TBP0, t->m_end_block, t->m_TEX0.TBW, t->m_TEX0.PSM, t->m_valid, sbp, spsm, sbw, src_r, is_invalidation);
 }
 
+bool GSTextureCache::TryDirtyRectByC32Blocks(u32 sbp, u32 spsm, u32 sbw,
+	Target* target, const GSVector4i& rect)
+{
+	// Preserve the legacy policy if validity extends past the allocation: growth may
+	// still need those pending uploads. Bounding block intervals are not ownership.
+	if (spsm != PSMCT32 || target->m_TEX0.PSM != PSMCT32 ||
+		!target->m_valid.rintersect(target->GetUnscaledRect()).eq(target->m_valid))
+		return false;
+
+	const GSExactDirtyMapping::Layout& source = m_written_c32_blocks.source;
+	const GSExactDirtyMapping::Rect& write = m_written_c32_blocks.write;
+	if (source.bp != sbp || source.bw != sbw ||
+		write.x != rect.x || write.y != rect.y || write.z != rect.z || write.w != rect.w)
+	{
+		m_written_c32_blocks = GSExactDirtyMapping::BuildWrittenC32Blocks(
+			{sbp, sbw, spsm}, {rect.x, rect.y, rect.z, rect.w});
+	}
+
+	const GSVector4i& valid = target->m_valid;
+	const auto plan = GSExactDirtyMapping::MapWrittenC32Blocks(m_written_c32_blocks,
+		{target->m_TEX0.TBP0, target->m_TEX0.TBW, target->m_TEX0.PSM},
+		{valid.x, valid.y, valid.z, valid.w});
+	if (!plan.supported)
+		return false;
+
+	RGBAMask rgba;
+	rgba._u32 = GSUtil::GetChannelMask(spsm);
+	for (const GSExactDirtyMapping::Rect& dirty : plan.rects)
+		AddDirtyRectTarget(target, GSVector4i(dirty.x, dirty.y, dirty.z, dirty.w),
+			target->m_TEX0.PSM, target->m_TEX0.TBW, rgba);
+	return true; // An empty exact mapping must not fall back to a bounding interval.
+}
+
 void GSTextureCache::DirtyRectByPage(u32 sbp, u32 spsm, u32 sbw, Target* t, GSVector4i src_r)
 {
-	if (src_r.rempty())
+	if (src_r.rempty() || TryDirtyRectByC32Blocks(sbp, spsm, sbw, t, src_r))
 		return;
 
 	const u32 start_bp = GSLocalMemory::GetStartBlockAddress(sbp, sbw, spsm, src_r);
@@ -2698,6 +2953,69 @@ void GSTextureCache::RescaleHelper::SetNewSize(const GSVector2i& new_size, float
 	m_new_scaled_size = ScaleRenderTargetSize(new_size, scale);
 }
 
+void GSTextureCache::CommitTargetRebase(Target* target, GSTexture* texture,
+	const GSTargetRebase::Plan& plan)
+{
+	GSTexture* const old_texture = target->m_texture;
+	// Sources still describe the old BP and allocation. Remove them before publishing
+	// the replacement; recycle only after no cache source can retain the old texture.
+	InvalidateSourcesFromTarget(target);
+	m_target_memory_usage = m_target_memory_usage - old_texture->GetMemUsage() + texture->GetMemUsage();
+	target->m_texture = texture;
+	target->m_TEX0.TBP0 = plan.preserved_start;
+	target->m_unscaled_size = GSVector2i(plan.rebased[2], plan.rebased[3]);
+	target->m_valid = GSVector4i(plan.rebased[0], plan.rebased[1], plan.rebased[2], plan.rebased[3]);
+	target->m_drawn_since_read = target->m_valid;
+	target->m_end_block = GSLocalMemory::GetEndBlockAddress(target->m_TEX0.TBP0,
+		target->m_TEX0.TBW, target->m_TEX0.PSM, target->m_valid);
+	// Retain existing RGB/alpha authority, alpha scale and known bits. A copy proves no new channels.
+	g_gs_device->Recycle(old_texture);
+#ifdef PCSX2_DEVBUILD
+	if (GSConfig.UseDebugDevice)
+		target->m_texture->SetDebugName(SmallString::from_format("RT 0x{:X} {} BW={} {}x{}",
+			static_cast<u32>(target->m_TEX0.TBP0), GSUtil::GetPSMName(target->m_TEX0.PSM),
+			static_cast<u32>(target->m_TEX0.TBW), target->m_unscaled_size.x, target->m_unscaled_size.y));
+#endif
+}
+
+bool GSTextureCache::TryRebaseTargetForOverwrite(Target* target, const GIFRegTEX0& incoming,
+	const GSVector4i& draw_rect, const Source* source, const Target* depth,
+	u32 width_page_offset, bool is_shuffle)
+{
+	const GSVector4i& valid = target->m_valid;
+	const GSVector4i& drawn = target->m_drawn_since_read;
+	GSTargetRebase::Safety safety;
+	safety.clean = target->m_dirty.empty();
+	safety.non_shuffle = !is_shuffle;
+	safety.zero_width_page_offset = width_page_offset == 0;
+	safety.no_current_source_reference = !source || source->m_from_target != target;
+	safety.no_bound_depth_reference = depth != target;
+	safety.existing_color_target = target->m_type == RenderTarget;
+	safety.native_scale = target->m_scale == 1.0f;
+	safety.native_extent_matches_valid = target->m_texture &&
+		target->m_unscaled_size.x == valid.z && target->m_unscaled_size.y == valid.w &&
+		target->m_texture->GetWidth() == valid.z && target->m_texture->GetHeight() == valid.w;
+	safety.valid_rgb = target->m_valid_rgb;
+	const GSTargetRebase::Plan plan = GSTargetRebase::MakeRebasePlan(
+		{target->m_TEX0.TBP0, target->m_TEX0.TBW, target->m_TEX0.PSM},
+		{valid.x, valid.y, valid.z, valid.w}, {drawn.x, drawn.y, drawn.z, drawn.w},
+		{incoming.TBP0, incoming.TBW, incoming.PSM},
+		{draw_rect.x, draw_rect.y, draw_rect.z, draw_rect.w}, safety);
+	if (plan.reason != GSTargetRebase::Reason::Preserve)
+		return false;
+
+	// Reuse CreateTarget's suffix-copy pattern at native scale, with a disjoint page
+	// proof before allocation and no cache mutation if allocation fails.
+	const GSVector2i size(plan.rebased[2], plan.rebased[3]);
+	GSTexture* const texture = g_gs_device->CreateCompatible(target->m_texture, size, false, PreferReusedLabelledTexture());
+	if (!texture)
+		return false;
+	const GSVector4i copy_source(plan.preserved[0], plan.preserved[1], plan.preserved[2], plan.preserved[3]);
+	g_gs_device->CopyRect(target->m_texture, texture, copy_source, 0, 0);
+	CommitTargetRebase(target, texture, plan);
+	return true;
+}
+
 GSTextureCache::Target* GSTextureCache::LookupDrawTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, int type,
 	bool used, u32 fbmask, bool preload, bool preserve_rgb, bool preserve_alpha, const GSVector4i draw_rect,
 	bool is_shuffle, bool possible_clear, bool preserve_scale, GSTextureCache::Source* src, GSTextureCache::Target* ds, int offset)
@@ -2923,6 +3241,11 @@ GSTextureCache::Target* GSTextureCache::LookupDrawTarget(GIFRegTEX0 TEX0, const 
 						{
 							if (iteration == 0)
 							{
+								if (TryRebaseTargetForOverwrite(t, TEX0, draw_rect, src, ds, widthpage_offset, is_shuffle))
+								{
+									++i;
+									continue;
+								}
 								GL_INS("TC: Deleting RT BP 0x%x BW %d PSM %s due to change in target", t->m_TEX0.TBP0, t->m_TEX0.TBW, GSUtil::GetPSMName(t->m_TEX0.PSM));
 								InvalidateSourcesFromTarget(t);
 								i = list->erase(i);
@@ -5371,7 +5694,7 @@ void GSTextureCache::InvalidateVideoMem(const GSOffset& off, const GSVector4i& r
 						else
 							AddDirtyRectTarget(t, r, psm, bw, rgba);
 
-						if (FullRectDirty(t))
+						if (FullRectDirty(t) || FullRectDirtyByUnion(t))
 						{
 							InvalidateSourcesFromTarget(t);
 							i = list.erase(j);
@@ -5389,7 +5712,7 @@ void GSTextureCache::InvalidateVideoMem(const GSOffset& off, const GSVector4i& r
 					// Try the hard way for partial invalidation.
 					DirtyRectByPage(bp, psm, bw, t, r);
 
-					if (FullRectDirty(t, rgba._u32))
+					if (FullRectDirty(t, rgba._u32) || FullRectDirtyByUnion(t))
 					{
 						InvalidateSourcesFromTarget(t);
 						i = list.erase(j);

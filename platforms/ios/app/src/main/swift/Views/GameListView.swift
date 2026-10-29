@@ -3127,6 +3127,8 @@ struct GameListView: View {
                             }
                         }
                     }
+                    // Otherwise the Cover Source keyboard shortens the library and portrait switches to cover flow.
+                    .ignoresSafeArea(.keyboard)
                     // Keep card glass in one persistent sampling group without
                     // absorbing either half of the depth-split orb field.
                     .stableMenuContentGlassContainer()
@@ -3279,6 +3281,7 @@ struct GameListView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(settings.localized("Boot BIOS"))
+                        .fixedSize()
                     }
                 }
                 ToolbarItem(id: "menu.import", placement: .topBarTrailing) {
@@ -3291,6 +3294,7 @@ struct GameListView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel(settings.localized("Import Games"))
                 }
+                .prefersVerticalBar()
                 ToolbarItem(id: "menu.layout", placement: .topBarTrailing) {
                     Menu {
                         Button {
@@ -8963,6 +8967,7 @@ struct GameListView: View {
         }
         .padding()
         .frame(maxWidth: .infinity, minHeight: 240)
+        .centredInLeadingPaneOnFold()
     }
 
     private func loadGames(

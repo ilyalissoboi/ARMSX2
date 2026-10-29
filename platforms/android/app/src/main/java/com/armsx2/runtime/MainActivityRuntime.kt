@@ -871,6 +871,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (restartNow) {
                         start()
                     } else {
+                        failPendingFileLoadOnBoot()
                         WindowImpl.toolbarVisible.value = true
                         WindowImpl.showLibrary.value = false
                         WindowImpl.overlayVisible.value = false
@@ -1332,6 +1333,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (restartNow) {
                         start()
                     } else {
+                        failPendingFileLoadOnBoot()
                         // BIOS exit had no cleanup at all — it relied entirely on stop()'s racy
                         // branch, so quitting the BIOS also left the launcher stuck in its rotation.
                         onReturnedToLibrary()
@@ -1448,6 +1450,7 @@ open class MainActivityRuntime : ComponentActivity() {
             if (!shouldStop) {
                 // Nothing left to stop (the VM self-terminated). Still reconcile the library
                 // state — this early return also used to leak a stale per-game rotation.
+                if (!vmRestartAfterStop) failPendingFileLoadOnBoot()
                 onReturnedToLibrary()
                 return
             }
@@ -1480,6 +1483,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     if (restartNow) {
                         start()
                     } else {
+                        failPendingFileLoadOnBoot()
                         synchronized(vmLifecycleLock) {
                             WindowImpl.toolbarVisible.value = true
                             WindowImpl.showLibrary.value = false
@@ -1601,6 +1605,20 @@ open class MainActivityRuntime : ComponentActivity() {
         @Volatile
         private var pendingSlotLoadOnBoot: Int? = null
 
+        @Volatile
+        private var pendingFileLoadOnBoot: PendingFileLoad? = null
+
+        private data class PendingFileLoad(val path: String, val onResult: (Boolean) -> Unit)
+
+        private fun failPendingFileLoadOnBoot() {
+            val request = synchronized(vmLifecycleLock) {
+                val pending = pendingFileLoadOnBoot ?: return
+                pendingFileLoadOnBoot = null
+                pending
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).post { request.onResult(false) }
+        }
+
         // The last game we booted, retained across exit-to-library so the Save Manager can
         // re-launch + load a save AFTER the game was exited. Kept SEPARATE from currentGame
         // (which stop() nulls for settings-scope) so it can't resurrect per-game scope in the
@@ -1611,6 +1629,21 @@ open class MainActivityRuntime : ComponentActivity() {
         {
             val game = currentGame.value ?: contextGame.value ?: return false
             return launchGameFromSaveSlot(game, slot)
+        }
+
+        fun launchCurrentGameFromSaveFile(path: String, onResult: (Boolean) -> Unit): Boolean {
+            val game = currentGame.value ?: contextGame.value ?: return false
+            val launchPath = if (game.uri.scheme == "file") {
+                game.uri.path ?: game.uri.toString()
+            } else {
+                game.uri.toString()
+            }
+            if (launchPath.isBlank() || path.isBlank()) return false
+            pendingFileLoadOnBoot = PendingFileLoad(path, onResult)
+            pendingSlotLoadOnBoot = null
+            pendingAutoLoadOnBoot = false
+            launchGame(launchPath, game)
+            return true
         }
 
         /**
@@ -1628,6 +1661,7 @@ open class MainActivityRuntime : ComponentActivity() {
             }
             if (launchPath.isBlank()) return false
             pendingSlotLoadOnBoot = slot
+            pendingFileLoadOnBoot = null
             pendingAutoLoadOnBoot = false
             launchGame(launchPath, game)
             return true
@@ -1757,9 +1791,11 @@ open class MainActivityRuntime : ComponentActivity() {
         fun onVmRunning() {
             adoptExternalGameIdentity()
             val requestedSlot = pendingSlotLoadOnBoot
-            val loadAutosave = pendingAutoLoadOnBoot && requestedSlot == null
-            if (requestedSlot == null && !loadAutosave) return
+            val requestedFile = pendingFileLoadOnBoot
+            val loadAutosave = pendingAutoLoadOnBoot && requestedSlot == null && requestedFile == null
+            if (requestedSlot == null && requestedFile == null && !loadAutosave) return
             pendingSlotLoadOnBoot = null
+            pendingFileLoadOnBoot = null
             pendingAutoLoadOnBoot = false
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
             val tryLoad = object : Runnable {
@@ -1767,7 +1803,10 @@ open class MainActivityRuntime : ComponentActivity() {
                 var lastFrame = -1
                 var advancingPolls = 0
                 override fun run() {
-                    if (vmStopInProgress || eState.value == EmuState.STOPPED) return
+                    if (vmStopInProgress || eState.value == EmuState.STOPPED) {
+                        requestedFile?.onResult?.invoke(false)
+                        return
+                    }
                     // Wait until the renderer is actually PRESENTING frames before restoring the
                     // state. A boot-time load that fires as soon as the disc CRC is known — before
                     // the present loop is flowing — leaves the restored frame undisplayed (a black
@@ -1782,6 +1821,13 @@ open class MainActivityRuntime : ComponentActivity() {
                     lastFrame = frame
                     if (advancingPolls < 3) {
                         if (++attempts < 60) handler.postDelayed(this, 250)
+                        else requestedFile?.onResult?.invoke(false)
+                        return
+                    }
+                    if (requestedFile != null) {
+                        val status = runCatching { NativeApp.loadStateFromFile(requestedFile.path) }.getOrDefault(-1)
+                        if (status == 0 && ++attempts < 60) handler.postDelayed(this, 250)
+                        else requestedFile.onResult(status == 1)
                         return
                     }
                     val loaded = runCatching {
@@ -3301,7 +3347,34 @@ open class MainActivityRuntime : ComponentActivity() {
         return event.keyCode
     }
 
+    private fun dispatchSystemImeKeyEvent(event: KeyEvent): Boolean {
+        val kc = event.keyCode
+        val isController = event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
+            event.isFromSource(InputDevice.SOURCE_JOYSTICK)
+        if (kc != KeyEvent.KEYCODE_BACK && !isController) {
+            return when (kc) {
+                KeyEvent.KEYCODE_TAB, KeyEvent.KEYCODE_NAVIGATE_NEXT, KeyEvent.KEYCODE_NAVIGATE_PREVIOUS -> true
+                // Alt+Up/Down are the field's Home/End; plain Up/Down would only move focus.
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN ->
+                    if (event.isAltPressed) super.dispatchKeyEvent(event) else true
+                else -> super.dispatchKeyEvent(event)
+            }
+        }
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            when (kc) {
+                KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_DPAD_CENTER,
+                KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BACK ->
+                    com.armsx2.ui.home.LibraryKeyboard.close()
+                KeyEvent.KEYCODE_BUTTON_X -> com.armsx2.ui.home.LibraryKeyboard.backspace()
+            }
+        }
+        return true
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Before anything can consume it: whether the pad is driving the menus decides whether
+        // selection highlights show at all.
+        com.armsx2.ui.common.PadInput.onKey(event)
         // The library screensaver sees every key first: any input resets its clock, and the press
         // that wakes it goes no further, so it can't also start a game.
         if (com.armsx2.ui.home.LibraryScreensaver.onKey(event)) return true
@@ -3549,6 +3622,9 @@ open class MainActivityRuntime : ComponentActivity() {
         if (com.armsx2.ui.home.LibraryKeyboard.visible.value) {
             // The phone's volume keys stay the system's, as they are with any modal up.
             if (isVolumeKey(kc)) return false
+            if (com.armsx2.ui.home.LibraryKeyboard.useSystemIme.value) {
+                return dispatchSystemImeKeyEvent(event)
+            }
             if (event.action == KeyEvent.ACTION_DOWN) {
                 when (kc) {
                     KeyEvent.KEYCODE_DPAD_UP -> com.armsx2.ui.home.LibraryKeyboard.move(0, -1)
@@ -3921,7 +3997,7 @@ open class MainActivityRuntime : ComponentActivity() {
                     return true
                 }
                 ControllerMappings.SysHotkey.ACHIEVEMENTS -> {
-                    if (down) com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Options)
+                    if (down) com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Achievements)
                     return true
                 }
                 ControllerMappings.SysHotkey.CLOSE_GAME -> {
@@ -4326,6 +4402,8 @@ open class MainActivityRuntime : ComponentActivity() {
     // on every other device — see maybeCorrectTouchScale). ALWAYS returns super, so it can never
     // block or consume a tap.
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // A touch hands the menus back from the pad, so selection highlights hide (PadInput).
+        com.armsx2.ui.common.PadInput.onTouch(ev)
         if (com.armsx2.ui.home.LibraryScreensaver.onTouch(ev)) return true
         maybeCorrectTouchScale(ev)
         return super.dispatchTouchEvent(ev)
@@ -4563,6 +4641,7 @@ open class MainActivityRuntime : ComponentActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        com.armsx2.ui.common.PadInput.onMotion(ev)
         if (com.armsx2.ui.home.LibraryScreensaver.onMotion(ev)) return true
         // Controller-input diagnostic (ARMSX2_JOYCON): logged before ANY gate so it
         // captures the raw axes even mid-(re)bind and for SOURCE_DPAD-only events the
@@ -5650,7 +5729,7 @@ open class MainActivityRuntime : ComponentActivity() {
             ControllerMappings.SysHotkey.GYRO_RECENTER -> recenterGyro()
             ControllerMappings.SysHotkey.RES_UP -> stepResolution(1)
             ControllerMappings.SysHotkey.RES_DOWN -> stepResolution(-1)
-            ControllerMappings.SysHotkey.ACHIEVEMENTS -> com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Options)
+            ControllerMappings.SysHotkey.ACHIEVEMENTS -> com.armsx2.ui.emulation.EmulationMenuInputController.open(com.armsx2.ui.emulation.EmulationMenuTab.Achievements)
             ControllerMappings.SysHotkey.CLOSE_GAME -> confirmCloseGame(quit = false)
             ControllerMappings.SysHotkey.QUIT_APP -> confirmCloseGame(quit = true)
             ControllerMappings.SysHotkey.SAVE_AND_EXIT -> closeGame(saveAutosave = true)

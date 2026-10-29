@@ -231,6 +231,37 @@ private enum OverlayRoute: Equatable {
     case pausedPresenting(QuickMenuDestination)
 }
 
+/// The portrait game height, and with `refitting` (the Duo) the pad layout fitted to the deck below.
+/// The outer screen's game gives up height so the pad keeps `PadPortraitFit.outerMinimumScale`.
+@MainActor
+func portraitGameSplit(
+    _ geo: GeometryProxy,
+    deckHeight: CGFloat,
+    fold: CGRect?,
+    refitting snapshot: PadLayoutSnapshot?,
+    analogStickScale: Float
+) -> (gameHeight: CGFloat, fitted: PadLayoutSnapshot?, fit: PadPortraitFit?) {
+    let barBase = geo.safeAreaInsets.bottom - GameplayControllerShortcutHelpOverlay.homeIndicatorSink(geo.safeAreaInsets.bottom)
+    let stickScale = min(max(CGFloat(analogStickScale), 0.8), 1.6)
+    let envelope = snapshot?.portraitEnvelope(analogStickScale: stickScale)
+    let padFloor = envelope.map {
+        max(0, deckHeight - ($0.height * PadPortraitFit.outerMinimumScale + PadPortraitFit.topGap + barBase))
+    } ?? .infinity
+    let gameHeight = fold?.minY ?? min(geo.size.width * 3 / 4, deckHeight * 0.6, padFloor)
+    let deck = CGSize(width: geo.size.width, height: deckHeight - gameHeight - (fold?.height ?? 0))
+    let fit = envelope.flatMap { PadPortraitFit(envelope: $0, deck: deck, barBase: barBase) }
+    let fitted = fit.flatMap { snapshot?.fittedToPortraitDeck($0, size: deck, analogStickScale: stickScale) } ?? snapshot
+    return (gameHeight, fitted, fit)
+}
+
+/// The Duo's inner screen keeps the landscape pad and menu button inside the safe area.
+@MainActor
+func landscapePadInsets(_ geo: GeometryProxy, screen: CGSize) -> EdgeInsets {
+    AppState.shared.hingePresent && usesLargeLayout(windowSize: screen)
+        ? EdgeInsets(top: 0, leading: geo.safeAreaInsets.leading, bottom: 0, trailing: geo.safeAreaInsets.trailing)
+        : EdgeInsets()
+}
+
 /// Gameplay presentation used after Emulation-Only Mode finishes startup cleanup.
 /// With every release switch enabled, this keeps only the existing Metal surface.
 struct EmulationOnlyGameView: View {
@@ -275,15 +306,26 @@ struct EmulationOnlyGameView: View {
                 if appState.emulationOnlyPresentation.showsVirtualControls && !isLandscape {
                     VStack(spacing: 0) {
                         let deckHeight = screen.height - geometry.safeAreaInsets.top
-                        let gameHeight = min(geometry.size.width * 3 / 4, deckHeight * 0.6)
+                        let fold = geometry.activeFold(book: false)
+                        let (gameHeight, fittedSnapshot, fit) = portraitGameSplit(
+                            geometry,
+                            deckHeight: deckHeight,
+                            fold: fold,
+                            refitting: appState.hingePresent
+                                ? appState.emulationOnlyPresentation.padLayoutSnapshot ?? PadLayoutStore.shared.snapshot() : nil,
+                            analogStickScale: settings.analogStickScale
+                        )
                         accessibleMetalSurface
                             .frame(height: gameHeight)
                             .clipped()
                             .overlay { dynamicCrosshairOverlay }
+                        if let fold {
+                            Color.black.frame(height: fold.height)
+                        }
 
                         ZStack {
                             Color.black
-                            retainedVirtualControls(isLandscape: false)
+                            retainedVirtualControls(isLandscape: false, screen: screen, fittedSnapshot: fittedSnapshot, fitScale: fittedSnapshot == nil ? nil : fit?.scale ?? 1)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
@@ -291,10 +333,12 @@ struct EmulationOnlyGameView: View {
                     // Same top safe-area strip as the full game screen, same reason.
                     .background(Color.black.ignoresSafeArea())
                 } else {
+                    let padInsets = landscapePadInsets(geometry, screen: screen)
                     ZStack {
                         accessibleMetalSurface
                         if appState.emulationOnlyPresentation.showsVirtualControls {
-                            retainedVirtualControls(isLandscape: true)
+                            retainedVirtualControls(isLandscape: true, screen: screen)
+                                .padding(padInsets)
                         }
                         dynamicCrosshairOverlay
                     }
@@ -311,12 +355,14 @@ struct EmulationOnlyGameView: View {
             .accessibilityAddTraits(.isImage)
     }
 
-    private func retainedVirtualControls(isLandscape: Bool) -> some View {
+    private func retainedVirtualControls(isLandscape: Bool, screen: CGSize, fittedSnapshot: PadLayoutSnapshot? = nil, fitScale: CGFloat? = nil) -> some View {
         VirtualControllerView(
             isLandscape: isLandscape,
-            layoutSnapshot: appState.emulationOnlyPresentation.padLayoutSnapshot,
+            layoutSnapshot: fittedSnapshot ?? appState.emulationOnlyPresentation.padLayoutSnapshot,
             skinDescriptor: appState.emulationOnlyPresentation.padSkinDescriptor,
-            touchActionSession: touchActionSession
+            touchActionSession: touchActionSession,
+            largeLayout: usesLargeLayout(windowSize: screen),
+            fitScale: fitScale
         )
         .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
     }
@@ -380,6 +426,8 @@ struct GameScreenView: View {
     @State private var overlayRoute: OverlayRoute = .hidden
     // The pause menu child last opened. Its row takes focus when the card returns.
     @State private var pauseMenuChild: QuickMenuDestination?
+    @State private var pauseCardFoldMemory: QuickMenuFoldMemory?
+    @State private var cheatsSession = CheatsPatchesManagerView.Session()
     @State private var runtimePerGameSettingsEntry: ISOEntry?
     @State private var runtimePerGameSettings: [String: Any]?
     @State private var runtimePerGameStartsInGameController = false
@@ -448,7 +496,8 @@ struct GameScreenView: View {
                 frameMode: .landscapePanel,
                 // Room for the controller shortcut bar, which shows while this card is up.
                 bottomReserve: controllerInput?.hasConnectedController == true
-                    ? GameplayControllerShortcutHelpOverlay.pauseCardReserve : 0
+                    ? GameplayControllerShortcutHelpOverlay.pauseCardReserve : 0,
+                spreadsAcrossFold: true
             ) { metrics in
                 QuickMenuView(
                     settings: settings,
@@ -465,6 +514,7 @@ struct GameScreenView: View {
                     gameTitle: currentRuntimeGameName(),
                     variant: metrics.variant,
                     returningFrom: pauseMenuChild,
+                    foldMemory: $pauseCardFoldMemory,
                     activePadLayoutName: activePadLayoutDisplayName,
                     activeControllerSkinName:
                         effectivePadSkinDescriptor.displayName,
@@ -567,7 +617,8 @@ struct GameScreenView: View {
                     SaveStatesPanel(
                         settings: settings,
                         undo: saveStateUndo,
-                        variant: metrics.variant,
+                        // A portrait leaf beside iPhone Duo's fold is phone-sized, so it takes the phone rows.
+                        variant: metrics.isLandscape || !screenIsLandscape ? metrics.variant : .phonePortrait,
                         landscape: screenIsLandscape,
                         gameTitle: currentRuntimeGameName(),
                         statusHandler: { message, isImportant in
@@ -604,6 +655,33 @@ struct GameScreenView: View {
                 }
             case .resetROM:
                 runtimeResetROMAlert
+            case .speed where appState.hingePartiallyOpen:
+                GameOverlayContainer(frameMode: .landscapePanel) { _ in
+                    SpeedControlPanel(settings: settings, onClose: { overlayRoute = .paused })
+                        .glassSurface(clear: false, cornerRadius: 26)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(.escape) { overlayRoute = .paused }
+            case .retroAchievements where appState.hingePartiallyOpen:
+                GameOverlayContainer(frameMode: .landscapePanel) { _ in
+                    RetroAchievementsGamePanel(settings: settings, onClose: { overlayRoute = .paused })
+                        .glassSurface(clear: false, cornerRadius: 26)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(.escape) { overlayRoute = .paused }
+            case .cheats where appState.hingePartiallyOpen:
+                GameOverlayContainer(frameMode: .landscapePanel) { _ in
+                    CheatsPatchesManagerView(
+                        isoName: ARMSX2Bridge.currentGameISOName() ?? "",
+                        gameTitle: "",
+                        launchContext: .inGame,
+                        controllerInput: controllerInput,
+                        onClose: { overlayRoute = .paused },
+                        session: cheatsSession
+                    )
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(.escape) { overlayRoute = .paused }
             case .speed, .cheats,
                  .retroAchievements:
                 // These destinations are lazy sheet contents. Their route is
@@ -669,6 +747,7 @@ struct GameScreenView: View {
 
             Group {
                 if isLandscape {
+                    let padInsets = landscapePadInsets(geo, screen: screen)
                     // Landscape: full-screen layout so pad coordinates match the layout editor.
                     ZStack {
                         PhoneGameSurface()
@@ -684,13 +763,16 @@ struct GameScreenView: View {
                                 isLandscape: true,
                                 layoutSnapshot: effectivePadLayoutSnapshot,
                                 skinDescriptor: effectivePadSkinDescriptor,
-                                touchActionSession: touchActionSession
+                                touchActionSession: touchActionSession,
+                                largeLayout: usesLargeLayout(windowSize: screen)
                             )
+                            .padding(padInsets)
                             .id(padRebuildToken)
                             .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
                         }
                         dynamicCrosshairOverlay
                         menuButtonOverlay(isLandscape: true)
+                            .padding(padInsets)
                             .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
                     }
                     .ignoresSafeArea()
@@ -701,7 +783,16 @@ struct GameScreenView: View {
                     VStack(spacing: 0) {
                         // The deck ignores the bottom inset, so it runs to the foot of the window.
                         let deckHeight = screen.height - geo.safeAreaInsets.top
-                        let gameHeight = min(geo.size.width * 3 / 4, deckHeight * 0.6)
+                        // Tabletop only: a fold running down a portrait window leaves the layout alone.
+                        let fold = geo.activeFold(book: false)
+                        let (gameHeight, fittedSnapshot, fit) = portraitGameSplit(
+                            geo,
+                            deckHeight: deckHeight,
+                            fold: fold,
+                            refitting: appState.hingePresent && effectiveVirtualPadVisible
+                                ? effectivePadLayoutSnapshot ?? PadLayoutStore.shared.snapshot() : nil,
+                            analogStickScale: settings.analogStickScale
+                        )
                         PhoneGameSurface()
                             .frame(height: gameHeight)
                             .clipped()
@@ -717,14 +808,19 @@ struct GameScreenView: View {
                                     dynamicCrosshairOverlay
                                 }
                             }
+                        if let fold {
+                            Color.black.frame(height: fold.height)
+                        }
 
                         if effectiveVirtualPadVisible {
                             ZStack {
                                 Color.black
                                 VirtualControllerView(
-                                    layoutSnapshot: effectivePadLayoutSnapshot,
+                                    layoutSnapshot: fittedSnapshot ?? effectivePadLayoutSnapshot,
                                     skinDescriptor: effectivePadSkinDescriptor,
-                                    touchActionSession: touchActionSession
+                                    touchActionSession: touchActionSession,
+                                    largeLayout: usesLargeLayout(windowSize: screen),
+                                    fitScale: fittedSnapshot == nil ? nil : fit?.scale ?? 1
                                 )
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .gameplayLaunchChrome(visible: appState.gameplayLaunchControlsVisible)
@@ -775,7 +871,8 @@ struct GameScreenView: View {
                 isoName: ARMSX2Bridge.currentGameISOName() ?? "",
                 gameTitle: "",
                 launchContext: .inGame,
-                controllerInput: controllerInput
+                controllerInput: controllerInput,
+                session: cheatsSession
             )
             .presentationDetents([.medium, .large])
         }
@@ -800,11 +897,19 @@ struct GameScreenView: View {
         .overlay {
             // The same shortcut bar under the pause menu. It goes the moment the menu closes.
             if overlayRoute == .paused {
-                GameplayControllerShortcutHelpOverlay(
-                    settings: settings,
-                    controllerInput: controllerInput,
-                    overPauseMenu: true
-                )
+                GeometryReader { geo in
+                    let insets = geo.safeAreaInsets
+                    let window = CGSize(width: geo.size.width + insets.leading + insets.trailing,
+                                        height: geo.size.height + insets.top + insets.bottom)
+                    // iPhone Duo's inner pause card shows the tiles in its footer instead.
+                    if !(appState.hingePresent && usesLargeLayout(windowSize: window)) {
+                        GameplayControllerShortcutHelpOverlay(
+                            settings: settings,
+                            controllerInput: controllerInput,
+                            overPauseMenu: true
+                        )
+                    }
+                }
                     .transition(.identity)
             }
         }
@@ -840,7 +945,7 @@ struct GameScreenView: View {
         }
         // VM pause follows `overlayRoute` alone: any route but `.hidden` keeps it paused.
         .onChange(of: overlayRoute) { _, route in
-            if route == .hidden { pauseMenuChild = nil }
+            if route == .hidden { (pauseMenuChild, pauseCardFoldMemory) = (nil, nil) }
             if route == .paused {
                 // Child dismissal and background re-entry can expose the pause
                 // card without going through either explicit open action.
@@ -1618,6 +1723,7 @@ struct GameScreenView: View {
             )
         case .cheats:
             MenuAudioPackManager.shared.playEvent(.uiToast)
+            cheatsSession = CheatsPatchesManagerView.Session()
             overlayRoute = .pausedPresenting(destination)
         case .controllerSkin:
             openRuntimeControllerSkinPicker()
@@ -1754,10 +1860,11 @@ struct GameScreenView: View {
     /// has already moved the route to `.hidden`, in which case the dismissal is a no-op so it
     /// does not clobber the intentional return to gameplay.
     private func childPresentedBinding(_ child: QuickMenuDestination) -> Binding<Bool> {
+        // Half open, runtimeQuickMenuOverlay hosts the child instead and a fold keeps the route.
         Binding(
-            get: { overlayRoute == .pausedPresenting(child) },
+            get: { overlayRoute == .pausedPresenting(child) && !appState.hingePartiallyOpen },
             set: { isPresented in
-                guard !isPresented else { return }
+                guard !isPresented, !appState.hingePartiallyOpen else { return }
                 if case .pausedPresenting(let active) = overlayRoute, active == child {
                     overlayRoute = .paused
                 }
@@ -2508,6 +2615,7 @@ private struct RetroAchievementsGamePanel: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.menuControllerInputRouter) private var controllerInput
     let settings: SettingsStore
+    var onClose: (() -> Void)? = nil
 
     @State private var entries: [RetroAchievementEntry] = []
     @State private var state: [String: Any] = [:]
@@ -2536,11 +2644,13 @@ private struct RetroAchievementsGamePanel: View {
                     }
                 }
             }
+            // Hosted beside the fold, the panel's glass shows through as it does in Cheats.
+            .scrollContentBackground(onClose == nil ? .automatic : .hidden)
             .navigationTitle(settings.localized("RetroAchievements"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(settings.localized("Done")) {
-                        dismiss()
+                        close()
                     }
                 }
             }
@@ -2557,11 +2667,15 @@ private struct RetroAchievementsGamePanel: View {
             scopeKey: "runtime.retro-achievements",
             priority: 345,
             onBack: {
-                dismiss()
+                close()
                 return true
             },
             usesExplicitTargetGeometryOnly: true
         )
+    }
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
     }
 
     private var summarySection: some View {
@@ -2803,6 +2917,7 @@ private struct SpeedControlPanel: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.menuControllerInputRouter) private var controllerInput
     @State private var hardcoreActive = false
+    var onClose: (() -> Void)? = nil
 
     // Done sits in the toolbar above the rows, so it comes first.
     private static let controllerTargetOrder = [
@@ -2855,18 +2970,19 @@ private struct SpeedControlPanel: View {
                     }
                 }
             }
+            .scrollContentBackground(onClose == nil ? .automatic : .hidden)
             .navigationTitle(settings.localized("Speed / Fast Forward"))
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button(settings.localized("Done")) {
-                        dismiss()
+                        close()
                     }
                     .controllerAccessibilityActionTarget(
                         id: "runtime.speed.done",
                         label: settings.localized("Done"),
                         activationFeedback: .back
                     ) {
-                        dismiss()
+                        close()
                     }
                 }
             }
@@ -2884,7 +3000,7 @@ private struct SpeedControlPanel: View {
             priority: 345,
             orbStyle: .plain,
             onBack: {
-                dismiss()
+                close()
                 return true
             },
             confinesHorizontalFocusMovement: true,
@@ -2893,6 +3009,10 @@ private struct SpeedControlPanel: View {
             preferredInitialFocusLabel: "runtime.speed.fast-forward",
             declaredTargetOrder: Self.controllerTargetOrder
         )
+    }
+
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
     }
 
     private var fastForwardEnabledBinding: Binding<Bool> {

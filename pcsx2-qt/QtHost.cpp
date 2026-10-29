@@ -19,6 +19,7 @@
 
 #include "pcsx2/CDVD/CDVDcommon.h"
 #include "pcsx2/Achievements.h"
+#include "pcsx2/AutoTune/AutoTuneStore.h"
 #include "pcsx2/BuildVersion.h"
 #include "pcsx2/Catalog/DriverPacks.h"
 #include "pcsx2/CDVD/CDVD.h"
@@ -85,7 +86,7 @@ namespace QtHost
 	static void HookSignals();
 	static void RegisterTypes();
 	static void InitializeClipboard();
-	static bool RunSetupWizard();
+	static bool RunSetupWizard(bool* restart_for_driver);
 	std::optional<bool> DownloadFile(QWidget* parent, const QString& title, std::string url, std::vector<u8>* data);
 } // namespace QtHost
 
@@ -1546,6 +1547,11 @@ std::string QtHost::GetRuntimeDownloadedResourceURL(std::string_view name)
 	return fmt::format("{}/{}", RUNTIME_RESOURCES_URL, Path::URLEncode(name));
 }
 
+void QtHost::NoteGameSettingEdited(SettingsInterface* sif, const char* section, const char* key)
+{
+	AutoTune::DisableForManualChange(*sif, section, key, Host::GetBaseBoolSettingValue("EmuCore", "AutoTune", false));
+}
+
 bool QtHost::SaveGameSettings(SettingsInterface* sif, bool delete_if_empty)
 {
 	INISettingsInterface* ini = static_cast<INISettingsInterface*>(sif);
@@ -2419,7 +2425,7 @@ void QtHost::InitializeClipboard()
 	}
 }
 
-bool QtHost::RunSetupWizard()
+bool QtHost::RunSetupWizard(bool* restart_for_driver)
 {
 	SetupWizardDialog dialog;
 	if (dialog.exec() == QDialog::Rejected)
@@ -2428,6 +2434,7 @@ bool QtHost::RunSetupWizard()
 	// Remove the flag.
 	Host::SetBaseBoolSettingValue("UI", "SetupWizardIncomplete", false);
 	Host::CommitBaseSettingChanges();
+	*restart_for_driver = dialog.driverPackInstalled();
 	return true;
 }
 
@@ -2509,11 +2516,27 @@ int main(int argc, char* argv[])
 	// flag is left set so FullscreenUI picks it up on startup.
 	const bool start_big_picture_mode = s_start_big_picture_mode || Host::GetBaseBoolSettingValue("UI", "StartBigPictureMode", false);
 
+	bool restart_for_driver = false;
 	int result;
-	if (s_run_setup_wizard && !start_big_picture_mode && !QtHost::RunSetupWizard())
+	if (s_run_setup_wizard && !start_big_picture_mode && !QtHost::RunSetupWizard(&restart_for_driver))
 	{
 		result = EXIT_FAILURE;
 		goto shutdown_and_exit;
+	}
+
+	// The wizard installed a GPU driver pack. A pack is read when the process starts, so start again now,
+	// before the main window and the emulation thread's renderer exist.
+	if (restart_for_driver)
+	{
+		std::string restart_error;
+		if (DriverPacks::RelaunchAtExit(&restart_error))
+		{
+			result = EXIT_SUCCESS;
+			goto shutdown_and_exit;
+		}
+		QMessageBox::warning(nullptr, QObject::tr("GPU Driver"),
+			QObject::tr("The GPU driver is installed and selected, but ARMSX2 cannot restart itself (%1). Close ARMSX2 and start it again to use it.")
+				.arg(QString::fromStdString(restart_error)));
 	}
 
 	// Create all window objects, the emuthread might still be starting up at this point.

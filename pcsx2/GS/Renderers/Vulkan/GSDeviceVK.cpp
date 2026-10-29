@@ -1532,14 +1532,15 @@ VkRenderPass GSDeviceVK::GetRenderPassForRestarting(VkRenderPass pass)
 		if (it.second != pass)
 			continue;
 
+		// The restarted pass continues the one that was open, so it loads what that pass drew. A
+		// DONT_CARE kept from the first opening (an invalidated target) throws it away instead: on a
+		// tiler the pass then starts from undefined tile memory and stores it over everything drawn
+		// before the restart.
 		RenderPassCacheKey modified_key;
 		modified_key.key = it.first;
-		if (modified_key.color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		if (modified_key.depth_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-		if (modified_key.stencil_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-			modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+		modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 
 		if (modified_key.key == it.first)
 			return pass;
@@ -2170,6 +2171,11 @@ void GSDeviceVK::SubmitCommandBuffer(VKSwapChain* present_swap_chain)
 
 			return;
 		}
+
+		// The surface turned (device rotated, window moved to a display mounted the other way):
+		// rebuild with the new pre-rotation next frame. Other SUBOPTIMALs keep the swap chain.
+		if (res == VK_SUBOPTIMAL_KHR && present_swap_chain->HasSurfaceRotationChanged())
+			m_resize_requested = true;
 
 		// Grab the next image as soon as possible, that way we spend less time blocked on the next
 		// submission. Don't care if it fails, we'll deal with that at the presentation call site.
@@ -3332,6 +3338,11 @@ bool GSDeviceVK::SupportsExclusiveFullscreen() const
 	return false;
 }
 
+DisplayRotation GSDeviceVK::GetSurfacePreRotation() const
+{
+	return m_swap_chain ? m_swap_chain->GetPreRotation() : DisplayRotation::Rot0;
+}
+
 void GSDeviceVK::DestroySurface()
 {
 	WaitForGPUIdle();
@@ -3479,9 +3490,12 @@ GSDevice::PresentResult GSDeviceVK::DoBeginPresent(bool frame_skip)
 
 	// SUBOPTIMAL is a success: the image is acquired and presentable. Adreno returns it when the
 	// compositor changes state (the touch overlay redrawing), and rebuilding the swap chain for it
-	// blanks the window. Rebuilding would not clear it either, since preTransform stays identity.
-	// Real size changes arrive as a host resize, an Android surface change, or OUT_OF_DATE.
+	// blanks the window, so it is rebuilt only when the surface's rotation changed (the swap chain
+	// is pre-rotated to it; see VKSwapChain::GetPreRotation). Real size changes arrive as a host
+	// resize, an Android surface change, or OUT_OF_DATE.
 	VkResult res = m_resize_requested ? VK_ERROR_OUT_OF_DATE_KHR : m_swap_chain->AcquireNextImage();
+	if (res == VK_SUBOPTIMAL_KHR && m_swap_chain->HasSurfaceRotationChanged())
+		m_resize_requested = true;
 	if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
 	{
 		m_swap_chain->ReleaseCurrentImage();
@@ -4123,7 +4137,7 @@ GSSelfReadRoadDecision GSDeviceVK::ResolveSelfReadRoad()
 	road_inputs.driver_orders_declared_loop = GetMobileDriverProfile().orders_declared_feedback_loop &&
 		(!order_on_request || m_optional_extensions.vk_ext_rasterization_order_attachment_access);
 	// The database saying this part belongs on the declared loop with our own barriers kept: Turnip on
-	// Adreno 730 and up, where the copy road renders wrong.
+	// Adreno 730 and up and on the 722, where the copy road renders wrong.
 	road_inputs.driver_prefers_declared_loop_with_barriers =
 		GetMobileDriverProfile().prefers_declared_loop_with_barriers;
 	road_inputs.override_texture_barriers = GSConfig.OverrideTextureBarriers;
@@ -4256,6 +4270,8 @@ void GSDeviceVK::ResolveFeatureTable()
 	// does it through GpuProfileDetector::SetForcedBugs, which is already folded into the profile
 	// by the time this reads it.
 	m_features.broken_blend_constant = GetMobileDriverProfile().HasBug(DriverBug::BrokenBlendConstant);
+
+	m_features.native_counter_draws = true;
 
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
@@ -5048,16 +5064,17 @@ void GSDeviceVK::DoStretchRect(GSTextureVK* sTex, const GSVector4& sRect, GSText
 	DrawStretchRect(sRect, dRect, size);
 }
 
-// Rotate a logical-NDC point (x, y) into physical-NDC by GSConfig.Rotation.
-// Used by the present pass to map a quad laid out for a logically-rotated
-// window onto the unrotated swapchain viewport.
+// Rotate a logical-NDC point (x, y) into physical-NDC by `rotation`, the present rotation
+// (the user's DisplayRotation plus the swap chain pre-rotation, GSDevice::GetPresentRotation).
+// Used by the present pass to map a quad laid out for the logical window onto the swap chain
+// image.
 //   Rot0:   (x,  y)
 //   Rot90:  (y, -x)   (image rotates 90° CW on the panel)
 //   Rot180: (-x,-y)
 //   Rot270: (-y, x)   (image rotates 90° CCW on the panel)
-static void RotateNDCForPresent(float& x, float& y)
+static void RotateNDCForPresent(DisplayRotation rotation, float& x, float& y)
 {
-	switch (GSConfig.Rotation)
+	switch (rotation)
 	{
 		case DisplayRotation::Rot90:
 		{
@@ -5101,16 +5118,17 @@ void GSDeviceVK::DrawStretchRect(const GSVector4& sRect, const GSVector4& dRect,
 	// Present pass: map logical-NDC (computed against the rotated window) onto
 	// the unrotated physical swapchain viewport. Non-present passes pass the
 	// real dst-texture size in `ds` and must not rotate.
-	if (m_is_presenting && GSConfig.Rotation != DisplayRotation::Rot0)
+	const DisplayRotation rotation = m_is_presenting ? GetPresentRotation() : DisplayRotation::Rot0;
+	if (rotation != DisplayRotation::Rot0)
 	{
 		float tlx = left, tly = top;
 		float trx = right, try_ = top;
 		float blx = left, bly = bottom;
 		float brx = right, bry = bottom;
-		RotateNDCForPresent(tlx, tly);
-		RotateNDCForPresent(trx, try_);
-		RotateNDCForPresent(blx, bly);
-		RotateNDCForPresent(brx, bry);
+		RotateNDCForPresent(rotation, tlx, tly);
+		RotateNDCForPresent(rotation, trx, try_);
+		RotateNDCForPresent(rotation, blx, bly);
+		RotateNDCForPresent(rotation, brx, bry);
 
 		const GSVertexPT1 vertices[] = {
 			{GSVector4(tlx, tly, 0.5f, 1.0f), GSVector2(sRect.x, sRect.y)},
@@ -6964,9 +6982,10 @@ void GSDeviceVK::RenderImGui()
 	// uScale/uTranslate map pixel coords directly to NDC. Rotation transforms
 	// logical pixels into the physical pixel space of the swapchain viewport,
 	// so uScale must always be in physical units (not logical) for both the
-	// rotated and unrotated paths.
-	const float phys_w = static_cast<float>(m_window_info.surface_width);
-	const float phys_h = static_cast<float>(m_window_info.surface_height);
+	// rotated and unrotated paths. Physical is the swap chain image, whose axes
+	// are swapped from the window's under a 90/270 pre-rotation.
+	const float phys_w = static_cast<float>(m_swap_chain ? m_swap_chain->GetImageWidth() : m_window_info.surface_width);
+	const float phys_h = static_cast<float>(m_swap_chain ? m_swap_chain->GetImageHeight() : m_window_info.surface_height);
 	const GSVector4 uniforms(2.0f / phys_w, 2.0f / phys_h, -1.0f, -1.0f);
 
 	SetUtilityPushConstants(&uniforms, sizeof(uniforms));
@@ -6985,34 +7004,21 @@ void GSDeviceVK::RenderImGui()
 	// maps a logical pixel (lx, ly) on a (lw, lh) logical surface to a
 	// physical pixel on the (phys_w, phys_h) swapchain. Rotation is around
 	// the geometric centre of each surface.
-	const bool rotate = (GSConfig.Rotation != DisplayRotation::Rot0);
+	const DisplayRotation rotation = GetPresentRotation();
+	const bool rotate = (rotation != DisplayRotation::Rot0);
 	const GSVector2i pres = GetPresentationSize();
 	const float lw = static_cast<float>(pres.x);
 	const float lh = static_cast<float>(pres.y);
+	// The turn is RotateNDCForPresent's, the one the game image gets. That works in y-up
+	// coordinates (the present vertex shader flips y) and ImGui's pixels are y-down, so y is
+	// flipped around it; applying the same formula to y-down pixels turns the overlay the other
+	// way, 180 degrees off the game at Rot90/Rot270.
 	const auto rotate_pixel = [&](float lx, float ly, float& px, float& py) {
-		const float lcx = lx - lw * 0.5f;
-		const float lcy = ly - lh * 0.5f;
-		float pcx = lcx;
-		float pcy = lcy;
-		switch (GSConfig.Rotation)
-		{
-			case DisplayRotation::Rot90:
-				pcx = lcy;
-				pcy = -lcx;
-				break;
-			case DisplayRotation::Rot180:
-				pcx = -lcx;
-				pcy = -lcy;
-				break;
-			case DisplayRotation::Rot270:
-				pcx = -lcy;
-				pcy = lcx;
-				break;
-			default:
-				break;
-		}
-		px = pcx + phys_w * 0.5f;
-		py = pcy + phys_h * 0.5f;
+		float x = lx - lw * 0.5f;
+		float y = lh * 0.5f - ly;
+		RotateNDCForPresent(rotation, x, y);
+		px = x + phys_w * 0.5f;
+		py = phys_h * 0.5f - y;
 	};
 
 	for (int n = 0; n < draw_data->CmdLists.Size; n++)
@@ -7885,54 +7891,27 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
 	const double tfx_compile_ms =
 		Common::Timer::ConvertValueToMilliseconds(Common::Timer::GetCurrentValue() - tfx_compile_start);
 	if (tfx_compile_ms >= 20.0)
-	{
-		Console.Warning("@@ANDROID_TFXCOMPILE@@ %.1f ms for one pipeline (n=%u since last cache flush)",
-			tfx_compile_ms, m_tfx_pipeline_compile_counter + 1);
-	}
+		Console.Warning("@@ANDROID_TFXCOMPILE@@ %.1f ms for one pipeline", tfx_compile_ms);
 	m_tfx_pipelines.emplace(p, pipeline);
 	if (pipeline != VK_NULL_HANDLE)
 		RecordTFXPipelineKey(p);
 
-	// Persist the pipeline cache every N new compiles so an Android OOM-kill
-	// or crash mid-session doesn't throw away pipelines that compiled after
-	// the last onPause flush. Android gets a larger threshold because the log
-	// showed repeated synchronous disk writes during normal gameplay in heavy
-	// scenes; onPause still performs a final flush.
-#ifdef __ANDROID__
-	static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 256;
-#else
-	static constexpr u32 PIPELINE_CACHE_FLUSH_THRESHOLD = 32;
-#endif
-	if (g_vulkan_shader_cache && ++m_tfx_pipeline_compile_counter >= PIPELINE_CACHE_FLUSH_THRESHOLD)
-	{
-		m_tfx_pipeline_compile_counter = 0;
-		g_vulkan_shader_cache->FlushPipelineCache();
-	}
+	// The pipeline cache reaches the disk from the shader cache's background writer, about once a
+	// minute while it changes: never from here.
 	return pipeline;
 }
 
 namespace
 {
-#pragma pack(push, 4)
-	struct TFXKeyFileRecord
-	{
-		GSDeviceVK::PipelineSelector key;
-		/// The last session that drew with this key.
-		u32 last_session;
-		/// GSCacheFile::SealRecord's checksum of the fields above.
-		u32 checksum;
-	};
-#pragma pack(pop)
-	static constexpr u32 TFX_KEY_RECORD_SIZE = sizeof(TFXKeyFileRecord);
+	/// The key list's entries: a pipeline key with the last session that drew with it (a u32), and
+	/// the number of the latest session (under an empty key).
+	static constexpr u16 KEY_TYPE_PIPELINE = 1;
+	static constexpr u16 KEY_TYPE_SESSION = 2;
 
 	/// Keys drawn with in this many of the game's most recent sessions are built ahead of use; older
-	/// ones stay in the file but cost no memory. A key not drawn with in KEEP_SESSIONS is dropped.
+	/// ones stay in the list but cost no memory. A key not drawn with in KEEP_SESSIONS is dropped.
 	static constexpr u32 PRECOMPILE_SESSIONS = 4;
 	static constexpr u32 KEEP_SESSIONS = 32;
-
-	/// Key files kept in the directory, one per game and device configuration; the least recently
-	/// played go first.
-	static constexpr size_t MAX_TFX_KEY_FILES = 128;
 
 	/// Pipelines built ahead of use, in the order the game first used them.
 	static size_t GetMaxPrecompiledTFXPipelines()
@@ -7941,7 +7920,7 @@ namespace
 		return (GetPhysicalMemory() >= 6 * GB) ? 2048 : 768;
 	}
 
-	/// Keys come from a file this build wrote (the stamp holds the build identity) and each record
+	/// Keys come from a list this build wrote (the stamp holds the build identity) and each record
 	/// passed its checksum, so these always hold. They are checked anyway, since a bad key would be
 	/// compiled on a worker thread: every field that indexes a table or names an enum, and every bit
 	/// a real key leaves zero.
@@ -7962,64 +7941,6 @@ namespace
 			   p.cms._free == 0 && p.ps.atst <= GSShader::PS_ATST::NOTEQUAL && p.ps.afail <= GSShader::PS_AFAIL::RGB_ONLY_SW_Z &&
 			   p.ps.rov_depth <= GSShader::PS_ROV_DEPTH::READ_ONLY &&
 			   p.ps.blend_hw <= static_cast<u32>(HWBlendType::INV_SRC_DST_BLEND_HALF);
-	}
-
-	/// Builds whose lists are kept: two builds sharing a data root (stable and nightly) each keep
-	/// theirs, and the lists of builds no longer run are removed.
-	static constexpr size_t KEEP_BUILDS = 3;
-
-	/// The build token of a key file name, `<serial>_<crc>_<config>_<build>[_debug].bin`.
-	static std::string_view TFXKeyFileBuild(std::string_view name)
-	{
-		name = name.substr(0, name.rfind('.'));
-		if (name.size() > 6 && name.substr(name.size() - 6) == "_debug")
-			name = name.substr(0, name.size() - 6);
-		const size_t pos = name.rfind('_');
-		return (pos == std::string_view::npos) ? std::string_view() : name.substr(pos + 1);
-	}
-
-	static void PruneTFXKeyFiles(const std::string& dir, std::string_view current_build)
-	{
-		FileSystem::FindResultsArray files;
-		if (!FileSystem::FindFiles(dir.c_str(), "*.bin", FILESYSTEM_FIND_FILES, &files))
-			return;
-
-		// Newest use of each build's lists; the current build always stays.
-		std::vector<std::pair<std::string, s64>> builds;
-		for (const FILESYSTEM_FIND_DATA& fd : files)
-		{
-			const std::string build(TFXKeyFileBuild(Path::GetFileName(fd.FileName)));
-			auto it = std::find_if(builds.begin(), builds.end(), [&build](const auto& b) { return b.first == build; });
-			if (it == builds.end())
-				builds.emplace_back(build, static_cast<s64>(fd.ModificationTime));
-			else
-				it->second = std::max(it->second, static_cast<s64>(fd.ModificationTime));
-		}
-		std::sort(builds.begin(), builds.end(), [&current_build](const auto& a, const auto& b) {
-			if ((a.first == current_build) != (b.first == current_build))
-				return a.first == current_build;
-			return a.second > b.second;
-		});
-		if (builds.size() > KEEP_BUILDS)
-			builds.resize(KEEP_BUILDS);
-
-		std::vector<FILESYSTEM_FIND_DATA> kept;
-		for (FILESYSTEM_FIND_DATA& fd : files)
-		{
-			const std::string_view build = TFXKeyFileBuild(Path::GetFileName(fd.FileName));
-			if (std::none_of(builds.begin(), builds.end(), [&build](const auto& b) { return b.first == build; }))
-				FileSystem::DeleteFilePath(fd.FileName.c_str());
-			else
-				kept.push_back(std::move(fd));
-		}
-
-		if (kept.size() <= MAX_TFX_KEY_FILES)
-			return;
-		std::sort(kept.begin(), kept.end(), [](const FILESYSTEM_FIND_DATA& a, const FILESYSTEM_FIND_DATA& b) {
-			return a.ModificationTime < b.ModificationTime;
-		});
-		for (size_t i = 0; i < kept.size() - MAX_TFX_KEY_FILES; i++)
-			FileSystem::DeleteFilePath(kept[i].FileName.c_str());
 	}
 } // namespace
 
@@ -8050,11 +7971,10 @@ void GSDeviceVK::SetGameIdentity(const std::string& serial, u32 crc)
 {
 	StopPipelinePrecompile();
 
-	if (!GSConfig.PrecompilePipelines || GSConfig.DisableShaderCache || serial.empty())
+	if (!g_vulkan_shader_cache)
 		return;
-
-	const std::string dir = Path::Combine(EmuFolders::Cache, "vulkan_pipeline_keys");
-	if (!FileSystem::EnsureDirectoryExists(dir.c_str(), false))
+	g_vulkan_shader_cache->SetGame(serial, crc);
+	if (!GSConfig.PrecompilePipelines || GSConfig.DisableShaderCache || serial.empty())
 		return;
 
 	// The build identity is in the stamp because what a key means is defined by this build's code:
@@ -8063,82 +7983,51 @@ void GSDeviceVK::SetGameIdentity(const std::string& serial, u32 crc)
 	// family or of a covered setting keeps both lists; the driver version is not, so a driver update
 	// keeps the list, which is the point of it.
 	const std::string fingerprint = GetTFXPipelineKeyFingerprint();
-	const GSCacheFile::Digest fingerprint_digest = GSCacheFile::Hash128(fingerprint.data(), fingerprint.size());
-	GSCacheFile::Stamp stamp;
-	stamp.Add("build", GSCacheFile::GetBuildId());
-	stamp.Add("device", fingerprint);
-
 	const std::string& build_id = GSCacheFile::GetBuildId();
-	const std::string build_token = GSCacheFile::ShortName(GSCacheFile::Hash128(build_id.data(), build_id.size()));
-	const std::string path = Path::Combine(dir,
-		Path::SanitizeFileName(fmt::format("{}_{:08X}_{:02x}{:02x}{:02x}{:02x}_{}{}.bin", serial, crc,
-			fingerprint_digest.bytes[0], fingerprint_digest.bytes[1], fingerprint_digest.bytes[2],
-			fingerprint_digest.bytes[3], build_token, GSConfig.UseDebugDevice ? "_debug" : "")));
-	GSCacheFile::CleanStaleTempFiles(dir);
+	GSCacheFile::Stamp stamp;
+	stamp.Add("build", build_id);
+	stamp.Add("device", fingerprint);
+	const std::string stem = fmt::format("vk_keys{}_{}_{}", GSConfig.UseDebugDevice ? "_debug" : "",
+		GSCacheFile::ShortName(GSCacheFile::Hash128(fingerprint.data(), fingerprint.size())),
+		GSCacheFile::ShortName(GSCacheFile::Hash128(build_id.data(), build_id.size())));
+	m_tfx_key_pack = g_vulkan_shader_cache->OpenGamePack(serial, crc, "vk_keys", stem, GSCacheFile::KIND_VK_PIPELINE_KEYS, stamp);
+	if (!m_tfx_key_pack)
+		return;
 
-	// Read what the last sessions recorded, drop what has gone stale, and write it back with this
-	// session's number. A record that fails its checksum, or a torn one at the end, is dropped here.
-	std::vector<TFXKeyFileRecord> records;
 	u32 session = 1;
-	if (std::optional<std::vector<u8>> data = FileSystem::ReadBinaryFile(path.c_str()); data.has_value())
+	if (std::vector<u8> value; m_tfx_key_pack->Get(KEY_TYPE_SESSION, nullptr, 0, &value) && value.size() == sizeof(u32))
 	{
-		u64 last_session = 0;
-		u32 dropped = 0;
-		std::vector<std::vector<u8>> raw;
-		const GSCacheFile::ReadResult res = GSCacheFile::ParseRecordFile(
-			*data, GSCacheFile::KIND_VK_PIPELINE_KEYS, stamp, TFX_KEY_RECORD_SIZE, &last_session, &raw, &dropped);
-		if (res != GSCacheFile::ReadResult::Ok)
-		{
-			INFO_LOG("Vulkan: discarding the pipeline key list '{}': {}", Path::GetFileName(path),
-				GSCacheFile::ReadResultString(res));
-		}
-		else
-		{
-			if (dropped > 0)
-				WARNING_LOG("Vulkan: {} damaged records in the pipeline key list '{}'", dropped, Path::GetFileName(path));
-			session = static_cast<u32>(last_session) + 1;
-			records.reserve(raw.size());
-			for (const std::vector<u8>& bytes : raw)
-			{
-				TFXKeyFileRecord rec;
-				std::memcpy(&rec, bytes.data(), sizeof(rec));
-				if (rec.last_session >= session || session - rec.last_session > KEEP_SESSIONS ||
-					!IsLoadableTFXKey(rec.key) || m_recorded_tfx_keys.find(rec.key) != m_recorded_tfx_keys.end())
-				{
-					continue;
-				}
-				m_recorded_tfx_keys.emplace(rec.key, RecordedTFXKey{static_cast<u32>(records.size()), rec.last_session});
-				records.push_back(rec);
-			}
-		}
+		std::memcpy(&session, value.data(), sizeof(session));
+		session++;
 	}
 	m_tfx_key_session = session;
+	m_tfx_key_pack->Put(KEY_TYPE_SESSION, nullptr, 0, &session, sizeof(session));
 
+	// What the last sessions recorded, in the order the game first drew with them. What has gone
+	// stale is dropped from the list.
+	struct RecordedKey
 	{
-		std::vector<u8> out = GSCacheFile::MakeRecordFileHeader(
-			GSCacheFile::KIND_VK_PIPELINE_KEYS, stamp, TFX_KEY_RECORD_SIZE, session);
-		const size_t header_size = out.size();
-		out.resize(header_size + records.size() * sizeof(TFXKeyFileRecord));
-		if (!records.empty())
-			std::memcpy(out.data() + header_size, records.data(), records.size() * sizeof(TFXKeyFileRecord));
-		if (!GSCacheFile::WriteFileAtomic(path, out.data(), out.size()))
-		{
-			m_recorded_tfx_keys.clear();
-			ERROR_LOG("Vulkan: could not write the pipeline key file '{}'", path);
+		PipelineSelector key;
+		u32 last_session;
+	};
+	std::vector<RecordedKey> records;
+	std::vector<PipelineSelector> stale;
+	m_tfx_key_pack->ForEach(KEY_TYPE_PIPELINE, [&](const u8* key, u32 key_size, const std::vector<u8>& value, u32) {
+		if (key_size != sizeof(PipelineSelector) || value.size() != sizeof(u32))
 			return;
-		}
-	}
-	m_tfx_key_file = FileSystem::OpenCFile(path.c_str(), "r+b");
-	if (!m_tfx_key_file)
-	{
-		m_recorded_tfx_keys.clear();
-		ERROR_LOG("Vulkan: could not open the pipeline key file '{}'", path);
-		return;
-	}
-	PruneTFXKeyFiles(dir, build_token);
+		RecordedKey rec;
+		std::memcpy(&rec.key, key, sizeof(rec.key));
+		std::memcpy(&rec.last_session, value.data(), sizeof(rec.last_session));
+		if (rec.last_session >= session || session - rec.last_session > KEEP_SESSIONS || !IsLoadableTFXKey(rec.key))
+			stale.push_back(rec.key);
+		else
+			records.push_back(rec);
+	});
+	for (const PipelineSelector& key : stale)
+		m_tfx_key_pack->Erase(KEY_TYPE_PIPELINE, &key, sizeof(key));
 
 	const size_t max_jobs = GetMaxPrecompiledTFXPipelines();
-	for (const TFXKeyFileRecord& rec : records)
+	for (const RecordedKey& rec : records)
 	{
 		if (m_precompile_jobs.size() >= max_jobs)
 			break;
@@ -8274,47 +8163,19 @@ void GSDeviceVK::StopPipelinePrecompile()
 	m_precompile_jobs.clear();
 	m_precompile_active = false;
 
-	m_recorded_tfx_keys.clear();
-	if (m_tfx_key_file)
-	{
-		std::fclose(m_tfx_key_file);
-		m_tfx_key_file = nullptr;
-	}
+	// Written once more by the cache's writer, then let go.
+	if (m_tfx_key_pack && g_vulkan_shader_cache)
+		g_vulkan_shader_cache->ReleasePack(std::move(m_tfx_key_pack));
+	m_tfx_key_pack.reset();
 }
 
 void GSDeviceVK::RecordTFXPipelineKey(const PipelineSelector& p)
 {
-	if (!m_tfx_key_file)
-		return;
-
-	// A key already in the file gets this session's number; a new one is appended.
-	const auto it = m_recorded_tfx_keys.find(p);
-	if (it != m_recorded_tfx_keys.end() && it->second.last_session == m_tfx_key_session)
-		return;
-
-	const u32 index = (it != m_recorded_tfx_keys.end()) ? it->second.index : static_cast<u32>(m_recorded_tfx_keys.size());
-	// Copied byte for byte into a zeroed record. A member-wise copy leaves the selector's tail padding
-	// undefined, the maps compare selectors with memcmp, and a key read back with stray padding would
-	// never match a draw: its precompiled pipeline would go unused and the key be recorded again.
-	TFXKeyFileRecord rec;
-	std::memset(&rec, 0, sizeof(rec));
-	std::memcpy(&rec.key, &p, sizeof(p));
-	rec.last_session = m_tfx_key_session;
-	GSCacheFile::SealRecord(&rec, TFX_KEY_RECORD_SIZE);
-	if (FileSystem::FSeek64(m_tfx_key_file,
-			static_cast<s64>(GSCacheFile::GetRecordFileHeaderSize()) + static_cast<s64>(index) * sizeof(rec), SEEK_SET) != 0 ||
-		std::fwrite(&rec, sizeof(rec), 1, m_tfx_key_file) != 1 || std::fflush(m_tfx_key_file) != 0)
-	{
-		Console.Error("Vulkan: failed to write to the pipeline key file, recording stopped");
-		std::fclose(m_tfx_key_file);
-		m_tfx_key_file = nullptr;
-		return;
-	}
-
-	if (it != m_recorded_tfx_keys.end())
-		it->second.last_session = m_tfx_key_session;
-	else
-		m_recorded_tfx_keys.emplace(p, RecordedTFXKey{index, m_tfx_key_session});
+	// RAM only; the pack leaves an entry that already holds this session alone. The key is stored
+	// byte for byte, padding included: the maps compare selectors with memcmp, and a key read back
+	// with other padding would never match a draw.
+	if (m_tfx_key_pack)
+		m_tfx_key_pack->Put(KEY_TYPE_PIPELINE, &p, sizeof(p), &m_tfx_key_session, sizeof(m_tfx_key_session));
 }
 
 bool GSDeviceVK::BindDrawPipeline(const PipelineSelector& p)
@@ -8451,9 +8312,18 @@ void GSDeviceVK::ExecuteCommandBufferAndRestartRenderPass(bool wait_for_completi
 	GSTexture* const current_rt = m_current_render_target;
 	GSTexture* const current_ds = m_current_depth_target;
 	const FeedbackLoopFlag current_feedback_loop = m_current_framebuffer_feedback_loop;
+	// Callers restart in the middle of a draw whose textures are already bound, then re-apply its
+	// state. Moving to the next command buffer resets every texture slot to the null texture, which
+	// would draw the rest of that draw untextured, so carry the bindings across. They stay valid:
+	// a texture unbinds itself when destroyed.
+	const std::array<GSTextureVK*, NUM_TFX_TEXTURES> tfx_textures = m_tfx_textures;
+	const GSTextureVK* const utility_texture = m_utility_texture;
 
 	EndRenderPass();
 	ExecuteCommandBuffer(GetWaitType(wait_for_completion, GSConfig.HWSpinCPUForReadbacks));
+
+	m_tfx_textures = tfx_textures;
+	m_utility_texture = utility_texture;
 
 	if (render_pass != VK_NULL_HANDLE)
 	{
@@ -9380,6 +9250,26 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	GSTextureVK* draw_rt_clone = nullptr;
 	GSTextureVK* colclip_rt = static_cast<GSTextureVK*>(g_gs_device->GetColorClipTexture());
 
+	// A counter draw the renderer asked to have drawn at native resolution (GSHWDrawConfig::colclip_native_scale):
+	// the colclip target, and a point-sampled copy of the depth buffer it tests against, are made at the target's
+	// size divided by its scale, and the resolve stretches the result back with point sampling. Only a fresh
+	// convert-and-resolve draw qualifies, since an existing colclip target already has the full size.
+	const bool native = config.colclip_native_scale > 1.0f && config.ps.colclip_hw && !colclip_rt &&
+	                    config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve && config.rt &&
+	                    config.rt->GetState() == GSTexture::State::Dirty;
+	const float native_div = native ? config.colclip_native_scale : 1.0f;
+	const GSVector2i draw_size = native ?
+		GSVector2i(static_cast<int>(std::ceil(rtsize.x / native_div)), static_cast<int>(std::ceil(rtsize.y / native_div))) :
+		rtsize;
+	const auto to_draw_size = [native, native_div](const GSVector4i& r) {
+		if (!native)
+			return r;
+		return GSVector4i(static_cast<int>(std::floor(r.x / native_div)), static_cast<int>(std::floor(r.y / native_div)),
+			static_cast<int>(std::ceil(r.z / native_div)), static_cast<int>(std::ceil(r.w / native_div)));
+	};
+	GSTextureVK* const full_ds = draw_ds;
+	GSTextureVK* native_ds = nullptr;
+
 	// stream buffer in first, in case we need to exec
 	SetVSConstantBuffer(config.cb_vs);
 	SetPSConstantBuffer(config.cb_ps);
@@ -9529,7 +9419,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		{
 			config.colclip_update_area = config.drawarea;
 			EndRenderPass();
-			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(rtsize.x, rtsize.y, GSTexture::Format::ColorClip, false));
+			colclip_rt = static_cast<GSTextureVK*>(CreateFeedbackTarget(draw_size.x, draw_size.y, GSTexture::Format::ColorClip, false));
 			if (!colclip_rt)
 			{
 				Console.Warning("VK: Failed to allocate ColorClip render target, aborting draw.");
@@ -9570,6 +9460,25 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 						   (config.ds && static_cast<GSTextureVK*>(config.ds) == m_tfx_textures[0])))
 	{
 		PSSetShaderResource(0, nullptr, false);
+	}
+
+	if (native && full_ds)
+	{
+		// DoStretchRect, not StretchRect: the latter flushes deferred draws, and this is one of them.
+		// The depth-output flag is what makes the copy write depth at all.
+		EndRenderPass();
+		native_ds = static_cast<GSTextureVK*>(CreateDepthStencil(draw_size, false, true));
+		if (!native_ds)
+		{
+			Console.Warning("VK: Failed to allocate native-resolution depth buffer, aborting draw.");
+			Recycle(colclip_rt);
+			g_gs_device->SetColorClipTexture(nullptr);
+			GL_POP();
+			return;
+		}
+		DoStretchRect(static_cast<GSTexture*>(full_ds), GSVector4(0, 0, 1, 1), static_cast<GSTexture*>(native_ds),
+			GSVector4(GSVector4i::loadh(draw_size)), ShaderConvertSelector(ShaderConvert::DEPTH_COPY, 0xf, true), Nearest);
+		draw_ds = native_ds;
 	}
 
 	// render pass restart optimizations
@@ -9693,7 +9602,7 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	
 	PSSetROVs(draw_rt_rov, draw_ds_rov, config.ps.HasColorOutput(), config.ps.HasDepthROVWrite());
 
-	OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), rtsize);
+	OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 
 	// Begin render pass if new target or out of the area.
 	if (!InRenderPass())
@@ -9723,8 +9632,8 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 		// microseconds per PASS, and a narrower area only forces more of them. Commit f9b5395855 has
 		// the mechanism this reverted, and the measurements behind these numbers.
 		const GSVector4i render_area = (pipe.ps.colclip_hw && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && ds_op != VK_ATTACHMENT_LOAD_OP_CLEAR)
-		                             ? config.drawarea
-		                             : GSVector4i::loadh(rtsize);
+		                             ? to_draw_size(config.drawarea)
+		                             : GSVector4i::loadh(draw_size);
 
 		if (is_clearing_rt)
 		{
@@ -9771,16 +9680,16 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	// rt -> colclip hw blit if enabled
 	if (colclip_rt && (config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly || config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertAndResolve) && config.rt->GetState() == GSTexture::State::Dirty)
 	{
-		OMSetRenderTargets(draw_rt, draw_ds, GSVector4i::loadh(rtsize), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags));
+		OMSetRenderTargets(draw_rt, draw_ds, GSVector4i::loadh(draw_size), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 		SetUtilityTexture(static_cast<GSTextureVK*>(config.rt), m_point_sampler);
 		SetPipeline(m_colclip_setup_pipelines[pipe.ds][pipe.IsRTFeedbackLoop()]);
 
 		const GSVector4 drawareaf = GSVector4((config.colclip_mode == GSHWDrawConfig::ColClipMode::ConvertOnly) ? GSVector4i::loadh(rtsize) : config.drawarea);
 		const GSVector4 sRect(drawareaf / GSVector4(rtsize).xyxy());
-		DrawStretchRect(sRect, drawareaf, rtsize);
+		DrawStretchRect(sRect, native ? GSVector4(to_draw_size(config.drawarea)) : drawareaf, draw_size);
 
 		GL_POP();
-		OMSetRenderTargets(draw_rt, draw_ds, config.scissor, static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags));
+		OMSetRenderTargets(draw_rt, draw_ds, to_draw_size(config.scissor), static_cast<FeedbackLoopFlag>(pipe.feedback_loop_flags), draw_size);
 	}
 
 	// VB/IB upload, if we did DATE setup and it's not colclip hw this has already been done
@@ -9868,7 +9777,15 @@ void GSDeviceVK::DoRenderHW(GSHWDrawConfig& config)
 	if (date_image)
 		Recycle(date_image);
 
-	// now blit the colclip texture back to the original target
+	if (native_ds)
+	{
+		EndRenderPass();
+		draw_ds = full_ds;
+		Recycle(native_ds);
+	}
+
+	// now blit the colclip texture back to the original target. The source rectangle is normalised, so a
+	// native-resolution colclip target needs nothing different here.
 	if (colclip_rt)
 	{
 		config.colclip_update_area = config.colclip_update_area.runion(config.drawarea);

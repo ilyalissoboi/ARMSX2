@@ -7,12 +7,18 @@
 #include "GS/Renderers/Common/GSFastList.h"
 #include "GS/Renderers/Common/GSDirtyRect.h"
 #include "GS/Renderers/HW/GSAlphaKnownBits.h"
+#include "GS/Renderers/HW/GSExactDirtyMapping.h"
 
 #include <array>
 #include <deque>
 #include <unordered_set>
 #include <utility>
 #include <limits>
+
+namespace GSTargetRebase
+{
+struct Plan;
+}
 
 class GSHwHack;
 
@@ -321,6 +327,12 @@ public:
 		bool m_used = false;
 		float OffsetHack_modxy = 0.0f;
 		GSDirtyRectList m_dirty;
+		/// Rectangles AddDirtyRectTarget has pushed onto m_dirty, and the count FullRectDirtyByUnion last
+		/// tested the list at: the list gets one union test per change, not one per call.
+		u32 m_dirty_adds = 0;
+		u32 m_dirty_cover_checked = 0;
+		/// A pixel the last union test found in none of the rectangles; tried first by the next one.
+		GSVector2i m_dirty_hole = GSVector2i(-1, -1);
 		GSVector4i m_valid{};
 		GSVector4i m_drawn_since_read{};
 		int readbacks_since_draw = 0;
@@ -771,6 +783,30 @@ public:
 	void ResizeTarget(Target* t, GSVector4i rect, u32 tbp, u32 psm, u32 tbw);
 	static bool FullRectDirty(Target* target, u32 rgba_mask);
 	static bool FullRectDirty(Target* target);
+
+	/// Whether the rectangles of `list` that name every channel of `rgba_mask`, in format `psm` at buffer width
+	/// `bw`, together cover every pixel of `area`. Rectangles in another format or width, and ones that leave
+	/// out a channel of the mask, are not counted, so a list with only those is never reported covering.
+	/// FullRectDirty's test is the case of one rectangle. `hole`, if given, is a pixel of an earlier answer: it
+	/// is tried first, a list that still misses it is answered at once, and a list that does not cover the area
+	/// leaves in it a pixel of the area that no rectangle holds (when it found one), for the next call.
+	static bool DirtyRectsCover(const GSDirtyRectList& list, u32 psm, u32 bw, u32 rgba_mask, const GSVector4i& area, GSVector2i* hole = nullptr);
+	/// FullRectDirty for a list of several rectangles: the target's own channels are dirty in every pixel of
+	/// its valid rectangle, so no pixel of it is newer than local memory. Tests the list once per change to
+	/// it (Target::m_dirty_adds), so a caller may ask after every call that can have changed it.
+	static bool FullRectDirtyByUnion(Target* target);
+	/// Retire a target by FullRectDirtyByUnion (on by default). Off is the same-binary control of an A/B
+	/// (pcsx2-gsrunner -union-retire) and the other arm of a differential test.
+	static void SetUnionRetire(bool enable);
+	static bool GetUnionRetire();
+	struct UnionRetireStats
+	{
+		u64 tests = 0; ///< lists tested (a list of two or more rectangles, changed since its last test)
+		u64 sweeps = 0; ///< of those, the ones whose rectangles' areas could add up to the target's
+		u64 retired = 0; ///< targets retired because their rectangles together cover them
+	};
+	static UnionRetireStats GetUnionRetireStats();
+	static void ResetUnionRetireStats();
 	bool CanTranslate(u32 bp, u32 bw, u32 spsm, GSVector4i r, u32 dbp, u32 dpsm, u32 dbw);
 	GSVector4i TranslateAlignedRectByPage(u32 tbp, u32 tebp, u32 tbw, u32 tpsm, GSVector4i t_r, u32 sbp, u32 spsm, u32 sbw, GSVector4i src_r, bool is_invalidation = false);
 	GSVector4i TranslateAlignedRectByPage(Target* t, u32 sbp, u32 spsm, u32 sbw, GSVector4i src_r, bool is_invalidation = false);
@@ -786,6 +822,14 @@ public:
 	void CombineAlignedInsideTargets(Target* target, GSTextureCache::Source* src = nullptr);
 
 private:
+	// This set depends only on its source layout and rect, never GS memory contents, so it cannot go stale.
+	GSExactDirtyMapping::WrittenPages m_written_c32_blocks;
+
+	bool TryDirtyRectByC32Blocks(u32 sbp, u32 spsm, u32 sbw, Target* target, const GSVector4i& rect);
+	bool TryRebaseTargetForOverwrite(Target* target, const GIFRegTEX0& incoming, const GSVector4i& draw_rect,
+		const Source* source, const Target* depth, u32 width_page_offset, bool is_shuffle);
+	void CommitTargetRebase(Target* target, GSTexture* texture, const GSTargetRebase::Plan& plan);
+
 	Target* ProcessTargetAfterLookup(RescaleHelper& rescaler, Target* dst, GIFRegTEX0 TEX0, const GSVector2i& size, int type,
 		bool used, u32 fbmask, bool is_frame, bool preload, bool preserve_rgb = true, bool preserve_alpha = true,
 		const GSVector4i draw_rc = GSVector4i::zero(), bool is_shuffle = false, bool possible_clear = false,

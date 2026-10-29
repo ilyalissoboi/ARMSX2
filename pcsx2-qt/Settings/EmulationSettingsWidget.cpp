@@ -44,7 +44,7 @@ EmulationSettingsWidget::EmulationSettingsWidget(SettingsWindow* settings_dialog
 
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.MTVU, "EmuCore/Speedhacks", "vuThread", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.iopThread, "EmuCore/Speedhacks", "iopThread", false);
-	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.autoTune, "EmuCore", "AutoTune", true);
+	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.autoTune, "EmuCore", "AutoTune", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.threadPinning, "EmuCore", "EnableThreadPinning", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.fastCDVD, "EmuCore/Speedhacks", "fastCDVD", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.precacheCDVD, "EmuCore", "CdvdPrecache", false);
@@ -79,6 +79,9 @@ EmulationSettingsWidget::EmulationSettingsWidget(SettingsWindow* settings_dialog
 		m_ui.cheats->hide();
 
 		connect(m_ui.resetAutoTune, &QPushButton::clicked, this, &EmulationSettingsWidget::onResetAutoTuneClicked);
+		// Changing the IOP thread turns auto-tune off for the game (QtHost::NoteGameSettingEdited), and its switch is on this page.
+		// The binder's own handler is connected first, so the file has the change by the time this runs.
+		connect(m_ui.iopThread, &QCheckBox::checkStateChanged, this, &EmulationSettingsWidget::refreshAutoTuneToggle);
 		updateAutoTuneSummary();
 	}
 	else
@@ -137,7 +140,7 @@ EmulationSettingsWidget::EmulationSettingsWidget(SettingsWindow* settings_dialog
 		tr("Runs the PS2's I/O processor (sound, disc, controllers and memory cards) on its own thread. "
 		   "A speedup on CPUs with at least four fast cores. It turns itself off on CPUs without spare cores, "
 		   "and for PS1 games, arcade games and while an IOP breakpoint is set."));
-	dialog()->registerWidgetHelp(m_ui.autoTune, tr("Automatic Performance Tuning"), tr("Checked"),
+	dialog()->registerWidgetHelp(m_ui.autoTune, tr("Automatic Performance Tuning"), tr("Unchecked"),
 		tr("When a game keeps missing frames, tries performance settings one at a time and keeps the ones that help, saved per game. "
 		   "What it changed is listed in the game's properties, where it can also be reset."));
 	dialog()->registerWidgetHelp(m_ui.fastCDVD, tr("Enable Fast CDVD"), tr("Unchecked"),
@@ -192,8 +195,32 @@ EmulationSettingsWidget::EmulationSettingsWidget(SettingsWindow* settings_dialog
 
 EmulationSettingsWidget::~EmulationSettingsWidget() = default;
 
+void EmulationSettingsWidget::showEvent(QShowEvent* event)
+{
+	SettingsWidget::showEvent(event);
+
+	// A change on another page (the resolution, say) can have turned auto-tune off for this game since this page was last shown.
+	if (dialog()->isPerGameSettings())
+		refreshAutoTuneToggle();
+}
+
+void EmulationSettingsWidget::refreshAutoTuneToggle()
+{
+	SettingsInterface* sif = dialog()->getSettingsInterface();
+	if (!sif)
+		return;
+
+	// What the binder did when it set the box up, again, without the box saving what it is told.
+	const QSignalBlocker blocker(m_ui.autoTune);
+	bool value = false;
+	SettingWidgetBinder::SettingAccessor<QCheckBox>::setNullableBoolValue(
+		m_ui.autoTune, sif->GetBoolValue("EmuCore", "AutoTune", &value) ? std::optional<bool>(value) : std::nullopt);
+}
+
 void EmulationSettingsWidget::updateAutoTuneSummary()
 {
+	refreshAutoTuneToggle();
+
 	const std::vector<std::string> lines = AutoTune::DescribeForGame(dialog()->getSerial(), dialog()->getDiscCRC());
 
 	QString text;

@@ -10,6 +10,17 @@ struct ControllerAccessibilityDirectionalLink: Equatable {
     static let scrollBoundary = "controller.scroll-boundary"
     static let firstContent = "controller.first-content"
     static let navigationBoundary = "controller.navigation-boundary"
+    private static let nearestPrefix = "controller.nearest:"
+
+    /// The target among `labels` that the spatial lookup ranks first in the link's direction.
+    static func nearest(of labels: [String]) -> String {
+        nearestPrefix + labels.joined(separator: "\n")
+    }
+
+    static func nearestLabels(_ label: String) -> [String]? {
+        guard label.hasPrefix(nearestPrefix) else { return nil }
+        return label.dropFirst(nearestPrefix.count).split(separator: "\n").map(String.init)
+    }
 
     let fromLabel: String
     let direction: MenuControllerCommand
@@ -2018,6 +2029,12 @@ final class ControllerAccessibilityNavigationSession {
         if label == ControllerAccessibilityDirectionalLink.scrollBoundary {
             return direction == .up ? keys.first : keys.last
         }
+        if let labels = ControllerAccessibilityDirectionalLink.nearestLabels(label) {
+            let candidates = keys.filter { key in
+                targets[key].map { target in labels.contains { matches($0, target: target) } } ?? false
+            }
+            return spatialDestination(from: sourceKey, direction: direction, keys: candidates)
+        }
         return keyMatching(label, in: keys)
     }
 
@@ -3173,6 +3190,8 @@ private struct ControllerAccessibilityFocusOverlay: View {
             )
             .allowsHitTesting(false)
             .accessibilityHidden(true)
+            // The frame is in physical points; right-to-left would mirror the ring off its row.
+            .environment(\.layoutDirection, .leftToRight)
             .zIndex(90_000)
         }
     }
@@ -3223,6 +3242,7 @@ private struct ControllerAccessibilityWindowFocusOverlay: View {
         .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+        .environment(\.layoutDirection, .leftToRight)
     }
 }
 
