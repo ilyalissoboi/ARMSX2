@@ -1109,8 +1109,10 @@ public class NativeApp {
 	/**
 	 * Read enough of a PS2 disc image to extract its serial (e.g.
 	 * "SLUS-20312"). Walks the ISO9660 directory to find SYSTEM.CNF and
-	 * parses the BOOT2 line. Handles flat ISO/raw-sector images and CHDs;
-	 * CSO/ZSO/GZ still return null and the caller falls back to filename
+	 * parses the BOOT2 line. Handles flat ISO/raw-sector images, CHDs and
+	 * gzip images; gzip has no random access, so reaching a SYSTEM.CNF far
+	 * into the image inflates everything before it and can take seconds.
+	 * CSO/ZSO still return null and the caller falls back to filename
 	 * parsing. fd is consumed (closed by native).
 	 */
 	public static native String getGameSerialFromFd(int fd);
@@ -1156,6 +1158,8 @@ public class NativeApp {
 	/** One line about the last sync, for the settings screen; empty when nothing happened yet. */
 	public static native String memcardSyncStatus();
 	public static native boolean loadStateFromSlot(int slot);
+	/** 1 = loaded, 0 = transient refusal (retry), -1 = permanent failure. */
+	public static native int loadStateFromFile(String path);
 	public static native String getGamePathSlot(int slot);
 	public static native byte[] getImageSlot(int slot);
 	public static native byte[] getSaveStateImage(String path);

@@ -124,12 +124,54 @@ namespace R5900
 			static const int CopDefault = 7;
 
 			static const int Mult = 2*8;
-			static const int Div = 14*8;
+
+			// DIV, DIVU, DIV1 and DIVU1: 37 cycles, measured on an SCPH-30001.
+			// A loop of DIV then MFLO costs 37 cycles per pair, and DIV, DIV1,
+			// MFLO, MFLO1 costs 37 per group: each pipeline has its own
+			// divider, the two run at once, and the divider runs on while
+			// other instructions issue until MFLO or MFHI waits for it.
+			// DIVU and DIVU1 take the same 37, and so does every operand
+			// tried: divide by zero, INT_MIN / -1, signs, a quotient of zero
+			// or one. A divide issued while the same pipeline's divider is
+			// busy waits for it.
+			//
+			// The whole 37 is charged at issue. Charging the wait at the first
+			// read of LO or HI instead would be closer when independent work
+			// sits between the divide and the read, or when DIV1 issues while
+			// DIV is still running. In game code it makes almost no difference:
+			// the read follows within a few instructions, and on the
+			// instruction mix of ten games the two ways of charging differ by
+			// under 0.06% of a frame's cycles. It would also need state carried
+			// from block to block, because a third of those divides have a
+			// branch (the divide-by-zero check) before the read.
+			static const int Div = 37*8;
 			static const int MMI_Mult = 3*8;
-			static const int MMI_Div = 22*8;
-			static const int MMI_Default = 14;
+
+			// PDIVW, PDIVUW and PDIVBW: 37 cycles, measured on an SCPH-30001,
+			// the same as DIV. A PDIVW then PMFLO costs 37 per pair, as does
+			// a PDIVW repeated with nothing reading it, on every operand
+			// tried (zero divisor, overflow, signs, quotient zero), and
+			// PDIVBW's four quotients take no longer than PDIVW's two. They
+			// use both pipelines' dividers: a DIV issued after a PDIVW waits
+			// for it (74 cycles for the pair).
+			static const int MMI_Div = 37*8;
+
+			// The MMI ALU, shift, pack, compare and move ops: 1 cycle, measured
+			// on an SCPH-30001 for every op charged as MMI_Default. A chain of
+			// them through one register costs 1 per op and independent ones
+			// cost 1 per op too: two never issue together, nor beside an
+			// integer ALU op (only beside a load or store). The table charged
+			// 1.75.
+			static const int MMI_Default = 1*8;
 
 			static const int FPU_Mult = 4*8;
+
+			// The FPU ops that write the accumulator (ADDA.S, SUBA.S, MULA.S,
+			// MADDA.S, MSUBA.S): 1 cycle, measured on an SCPH-30001. A chain
+			// through ACC costs 1 per op, independent ones 1 per op, and MULA.S
+			// then a MADD.S reading ACC 2 per pair. The table charged MULA.S,
+			// MADDA.S and MSUBA.S as multiplies (4) and ADDA.S, SUBA.S 0.875.
+			static const int FPU_Acc = 1*8;
 
 			static const int Store = 14;
 			static const int Load = 14;
@@ -375,8 +417,12 @@ namespace R5900
 		MakeOpcodeM( PMULTH, MMI_Mult, 0 );
 		MakeOpcodeM( PMADDW, MMI_Mult, 0 );
 		MakeOpcodeM( PMSUBW, MMI_Mult, 0 );
-		MakeOpcodeM( PMFHI, MMI_Mult, 0 );
-		MakeOpcodeM( PMFLO, MMI_Mult, 0 );
+		// PMFHI, PMFLO: 1 cycle on an SCPH-30001, like any MMI move; after a
+		// parallel multiply the read waits, and PMULTH then PMFLO costs 4,
+		// which the multiply's 3 plus this 1 already charges. (They were
+		// charged as multiplies, 3.)
+		MakeOpcodeM( PMFHI, MMI_Default, 0 );
+		MakeOpcodeM( PMFLO, MMI_Default, 0 );
 		MakeOpcodeM( PMULTW, MMI_Mult, 0 );
 		MakeOpcodeM( PMADDUW, MMI_Mult, 0 );
 		MakeOpcodeM( PMULTUW, MMI_Mult, 0 );
@@ -410,7 +456,9 @@ namespace R5900
 		MakeOpcodeClass( COP0_C0 );
 		MakeOpcodeClass( COP0_BC0 );
 
-		MakeOpcode0( MFC0, CopDefault, 0 );
+		// MFC0: 1 cycle on an SCPH-30001, for every register tried (Count,
+		// Status, Cause, EPC, PRId, Config, BadVAddr, Compare). It was 0.875.
+		MakeOpcode0( MFC0, 1*8, 0 );
 		MakeOpcode0( MTC0, CopDefault, 0 );
 
 		MakeOpcode0(BC0F, Branch, IS_BRANCH | BRANCHTYPE_BC0 | CONDTYPE_EQ);
@@ -421,10 +469,10 @@ namespace R5900
 		MakeOpcode0( TLBR, CopDefault, 0 );
 		MakeOpcode0( TLBWI, CopDefault, 0 );
 		MakeOpcode0( TLBWR, CopDefault, 0 );
-		MakeOpcode0( TLBP, CopDefault, 0 );
+		MakeOpcode0( TLBP, 3*8, 0 ); // 3 cycles on an SCPH-30001; was 0.875
 		MakeOpcode0( ERET, CopDefault, IS_BRANCH|BRANCHTYPE_ERET );
 		MakeOpcode0( EI, CopDefault, 0 );
-		MakeOpcode0( DI, CopDefault, 0 );
+		MakeOpcode0( DI, 1*8, 0 );   // 1 cycle on an SCPH-30001; was 0.875
 
 		//////////////////////////////////////////////////////////
 		// COP1 Instructions!
@@ -444,9 +492,9 @@ namespace R5900
 		MakeOpcode1( BC1TL, Branch, IS_BRANCH|BRANCHTYPE_BC1|CONDTYPE_NE|IS_LIKELY );
 
 		MakeOpcode1( ADD_S, CopDefault, 0 );
-		MakeOpcode1( ADDA_S, CopDefault, 0 );
+		MakeOpcode1( ADDA_S, FPU_Acc, 0 );
 		MakeOpcode1( SUB_S, CopDefault, 0 );
-		MakeOpcode1( SUBA_S, CopDefault, 0 );
+		MakeOpcode1( SUBA_S, FPU_Acc, 0 );
 
 		MakeOpcode1( ABS_S, CopDefault, 0 );
 		MakeOpcode1( MOV_S, CopDefault, 0 );
@@ -476,21 +524,24 @@ namespace R5900
 		// non-terminating quotients, denormals, zero, divide by zero, overflow
 		// to the EE maximum -- so there is no early termination anywhere.
 		//
-		// The three entries below say 6, 6 and 8.  They are LEFT AS THEY ARE
-		// deliberately: this is a compatibility-sensitive timing table, not a
-		// correctness one, and nothing has measured what moving it does to
-		// games.  The numbers above are recorded here so that the next person to
-		// wonder does not have to take the console run again.  (FPU_Mult's 4
-		// does match the measured multiply latency.)
+		// An SCPH-30001 gives the same 7 for dependent DIV.S and SQRT.S chains
+		// (and 4 for MUL.S), so DIV.S and SQRT.S are charged 7; they used to
+		// be 6.  The charge is the whole latency at issue, which overcharges
+		// an FPU add or multiply that runs inside the divide by its own small
+		// charge.  (FPU_Mult's 4 does match the measured multiply latency.)
+		// RSQRT.S is charged the 13 above; it used to be 8.  The SCPH-30001
+		// gives 13 as well, on every operand class tried, and its mixes
+		// add up the same way (DIV.S with SQRT.S 14 per pair, with
+		// RSQRT.S 20).
 		MakeOpcode1( MUL_S, FPU_Mult, 0 );
-		MakeOpcode1( DIV_S, 6*8, 0 );
-		MakeOpcode1( SQRT_S, 6*8, 0 );
-		MakeOpcode1( RSQRT_S, 8*8, 0 );
-		MakeOpcode1( MULA_S, FPU_Mult, 0 );
+		MakeOpcode1( DIV_S, 7*8, 0 );
+		MakeOpcode1( SQRT_S, 7*8, 0 );
+		MakeOpcode1( RSQRT_S, 13*8, 0 );
+		MakeOpcode1( MULA_S, FPU_Acc, 0 );
 		MakeOpcode1( MADD_S, FPU_Mult, 0 );
 		MakeOpcode1( MSUB_S, FPU_Mult, 0 );
-		MakeOpcode1( MADDA_S, FPU_Mult, 0 );
-		MakeOpcode1( MSUBA_S, FPU_Mult, 0 );
+		MakeOpcode1( MADDA_S, FPU_Acc, 0 );
+		MakeOpcode1( MSUBA_S, FPU_Acc, 0 );
 
 		MakeOpcode1( C_F, CopDefault, 0 );
 		MakeOpcode1( C_EQ, CopDefault, 0 );

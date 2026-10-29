@@ -65,6 +65,10 @@ struct VirtualControllerView: View {
     var layoutSnapshot: PadLayoutSnapshot? = nil
     var skinDescriptor: VPadSkinDescriptor? = nil
     var touchActionSession: VirtualPadTouchActionSession? = nil
+    var largeLayout = false
+    /// The scale of a layout fitted to the portrait deck, which keeps skins and touch areas inside it.
+    /// Sticks get it through their layout scale, the L3/R3 badge from here.
+    var fitScale: CGFloat? = nil
 
     @State private var v2Layout: SkinManifestRuntimeLayout? = nil
 
@@ -100,9 +104,12 @@ struct VirtualControllerView: View {
     }
 
     private func v2Transform(mappingWidth: CGFloat, mappingHeight: CGFloat, canvasW: CGFloat, canvasH: CGFloat) -> V2CanvasTransform {
-        let cover = max(canvasW / mappingWidth, canvasH / mappingHeight)
-        let sx = mappingWidth * cover
-        let sy = mappingHeight * cover
+        let fitsDeck = fitScale != nil && !isLandscape
+        let scale = fitsDeck
+            ? min(canvasW / mappingWidth, canvasH / mappingHeight)
+            : max(canvasW / mappingWidth, canvasH / mappingHeight)
+        let sx = mappingWidth * scale
+        let sy = mappingHeight * scale
         return V2CanvasTransform(originX: (canvasW - sx) / 2, originY: (canvasH - sy) / 2, scaleX: sx, scaleY: sy)
     }
 
@@ -113,7 +120,7 @@ struct VirtualControllerView: View {
     }
 
     private var v2CacheKey: String {
-        "\(effectiveSkinDescriptor.id)|\(isLandscape ? "l" : "p")"
+        "\(effectiveSkinDescriptor.id)|\(isLandscape ? "l" : "p")|\(largeLayout ? "L" : "c")"
     }
 
     private func v2VisualRect(_ control: SkinManifestRuntimeLayout.Control, transform: V2CanvasTransform) -> CGRect {
@@ -356,10 +363,12 @@ struct VirtualControllerView: View {
             v2Layout = SkinManifestRuntimeLayout.make(
                 for: effectiveSkinDescriptor,
                 isLandscape: isLandscape,
-                device: SkinManifestRuntimeLayout.currentDevice(),
+                device: largeLayout ? .ipad : .iphone,
                 screenClass: SkinManifestRuntimeLayout.currentScreenClass()
             )
         }
+        // A fold moves the pad to the other screen and its touches never end.
+        .onChange(of: largeLayout) { resetDynamicInputs() }
 
     }
 
@@ -374,6 +383,12 @@ struct VirtualControllerView: View {
 
     private func isVisible(_ id: String) -> Bool {
         layoutSnapshot?.isControlVisible(id) ?? layout.isControlVisible(id)
+    }
+
+    /// The widest circle around `center` that stays below a fitted portrait deck's top edge, which borders the game.
+    private func deckCaptureLimit(_ center: CGPoint, landscape: Bool) -> CGFloat? {
+        guard fitScale != nil && !landscape else { return nil }
+        return 2 * max(0, center.y)
     }
 
     @ViewBuilder
@@ -433,7 +448,7 @@ struct VirtualControllerView: View {
         return CompositeDPadView(
             faces: faces,
             centroid: centroid,
-            captureDiameter: captureRadius * 2,
+            captureDiameter: min(captureRadius * 2, deckCaptureLimit(centroid, landscape: landscape) ?? .infinity),
             deadzone: deadzone
         )
     }
@@ -483,7 +498,7 @@ struct VirtualControllerView: View {
         return CompositeFaceView(
             faces: faces,
             centroid: centroid,
-            captureDiameter: captureRadius * 2
+            captureDiameter: min(captureRadius * 2, deckCaptureLimit(centroid, landscape: landscape) ?? .infinity)
         )
     }
 
@@ -513,9 +528,16 @@ struct VirtualControllerView: View {
     ) -> some View {
         let p = pos(id, landscape: landscape)
         if dynamicSettings.legacyThumbsticks && !(!isLeft && dynamicSettings.swipeCamera) {
-            StickView(isLeft: isLeft, sizeScale: analogStickScale, layoutScale: p.scale)
-                .position(x: p.x * areaW, y: p.y * areaH)
-                .id(inputSessionGeneration)
+            let center = CGPoint(x: p.x * areaW, y: p.y * areaH)
+            StickView(
+                isLeft: isLeft,
+                sizeScale: analogStickScale,
+                layoutScale: p.scale,
+                captureLimit: deckCaptureLimit(center, landscape: landscape),
+                badgeScale: fitScale ?? 1
+            )
+            .position(center)
+            .id(inputSessionGeneration)
         }
     }
 

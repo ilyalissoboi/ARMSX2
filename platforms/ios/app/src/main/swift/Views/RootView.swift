@@ -352,8 +352,10 @@ struct GameplayControllerShortcutHelpOverlay: View {
     let controllerInput: MenuControllerInputRouter?
     /// Clear glass reads as part of the game; under the pause card it needs the card's frost.
     var overPauseMenu = false
+    /// Just the tiles, for a footer row inside the pause card.
+    var inCard = false
 
-    private static let height: CGFloat = 52
+    static let height: CGFloat = 52
     private static let bottomPadding: CGFloat = 6
     /// What the pause card keeps free above the safe area: the bar and a gap.
     static let pauseCardReserve = bottomPadding + height + 11
@@ -365,74 +367,93 @@ struct GameplayControllerShortcutHelpOverlay: View {
     var body: some View {
         if controllerInput?.hasConnectedController == true,
            ControllerButtonGlyph.connectedGamepad != nil {
-            shortcutContent
+            Group {
+                if inCard {
+                    tiles.frame(height: Self.height)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(spokenHints)
+                } else {
+                    shortcutContent
+                }
+            }
+            .allowsHitTesting(false)
         }
+    }
+
+    private var spokenHints: String {
+        [
+            "Press \(settings.controllerMacroQuickMenu.title) to open the Quick Menu.",
+            "Press \(settings.controllerMacroIncreaseSpeed.title) to increase emulation speed.",
+            "Press \(settings.controllerMacroSaveGameState.title) to save a game state.",
+            "Press \(settings.controllerMacroLoadGameState.title) to load a game state.",
+        ].joined(separator: " ")
+    }
+
+    private var tiles: some View {
+        HStack(spacing: 0) {
+            shortcutTile(
+                title: settings.localized("Menu")
+            ) {
+                macroBadge(settings.controllerMacroQuickMenu)
+            }
+
+            shortcutTile(
+                title: settings.localized("Speed")
+            ) {
+                macroBadge(settings.controllerMacroIncreaseSpeed)
+            }
+
+            shortcutTile(
+                title: settings.localized("State")
+            ) {
+                macroBadge(settings.controllerMacroSaveGameState)
+            }
+        }
+        .padding(4)
     }
 
     private var shortcutContent: some View {
         GeometryReader { geometry in
             let accent = themedAccentColor
-            HStack(spacing: 0) {
-                shortcutTile(
-                    title: settings.localized("Menu")
-                ) {
-                    macroBadge(settings.controllerMacroQuickMenu)
-                }
-
-                shortcutTile(
-                    title: settings.localized("Speed")
-                ) {
-                    macroBadge(settings.controllerMacroIncreaseSpeed)
-                }
-
-                shortcutTile(
-                    title: settings.localized("State")
-                ) {
-                    macroBadge(settings.controllerMacroSaveGameState)
-                }
-            }
-            .padding(4)
-            .frame(height: Self.height)
-            .frame(
-                maxWidth: min(
-                    420,
-                    max(
-                        0,
-                        geometry.size.width
-                            - geometry.safeAreaInsets.leading
-                            - geometry.safeAreaInsets.trailing
-                            - 20
+            // In book pose the bar fits inside the leading pane.
+            let paneWidth = geometry.activeFold(book: true).map { $0.minX - 32 }
+            tiles
+                .frame(height: Self.height)
+                .frame(
+                    maxWidth: min(
+                        420,
+                        paneWidth ?? .infinity,
+                        max(
+                            0,
+                            geometry.size.width
+                                - geometry.safeAreaInsets.leading
+                                - geometry.safeAreaInsets.trailing
+                                - 20
+                        )
                     )
                 )
-            )
-            .glassSurface(
-                tint: accent.opacity(0.05),
-                clear: !overPauseMenu,
-                forceClear: !overPauseMenu,
-                materializeTransition: true,
-                cornerRadius: 28
-            )
-            .overlay {
-                Capsule(style: .continuous)
-                    .stroke(
-                        Color.primary.opacity(0.13),
-                        lineWidth: 0.65
-                    )
-            }
-            .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
-            .padding(.bottom, geometry.safeAreaInsets.bottom - Self.homeIndicatorSink(geometry.safeAreaInsets.bottom) + Self.bottomPadding)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .glassSurface(
+                    tint: accent.opacity(0.05),
+                    clear: !overPauseMenu,
+                    forceClear: !overPauseMenu,
+                    materializeTransition: true,
+                    cornerRadius: 28
+                )
+                .overlay {
+                    Capsule(style: .continuous)
+                        .stroke(
+                            Color.primary.opacity(0.13),
+                            lineWidth: 0.65
+                        )
+                }
+                .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
+                // On the bar itself, so VoiceOver frames the bar rather than the whole screen.
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(spokenHints)
+                .padding(.bottom, geometry.safeAreaInsets.bottom - Self.homeIndicatorSink(geometry.safeAreaInsets.bottom) + Self.bottomPadding)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .centredInLeadingPaneOnFold()
         }
-        .allowsHitTesting(false)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            [
-                "Press \(settings.controllerMacroQuickMenu.title) to open the Quick Menu.",
-                "Press \(settings.controllerMacroIncreaseSpeed.title) to increase emulation speed.",
-                "Press \(settings.controllerMacroSaveGameState.title) to save a game state.",
-                "Press \(settings.controllerMacroLoadGameState.title) to load a game state.",
-            ].joined(separator: " ")
-        )
     }
 
     private var themedAccentColor: Color {
@@ -2189,6 +2210,7 @@ struct MenuTabView: View {
                         }
                     )
                     .frame(maxWidth: .infinity)
+                    .centredInLeadingPaneOnFold()
                     .opacity(gameRenamePresented ? 0 : 1)
                     .allowsHitTesting(!gameRenamePresented)
                     .accessibilityHidden(gameRenamePresented)
@@ -2223,6 +2245,8 @@ struct MenuTabView: View {
                         menuViewportSize = size
                     }
             }
+            // Otherwise a keyboard shortens the menu and portrait gets the landscape layout.
+            .ignoresSafeArea(.keyboard)
         }
         // One foreground field owns every controller-focus anchor in this
         // presentation, including cards, toolbars, alerts, and the tab bar.
@@ -2499,7 +2523,7 @@ private struct ControllerTabBarOrbOverlay: View {
     /// extending beyond the Games and Settings button surfaces.
     private func compactOrbitFrame(_ frame: CGRect) -> CGRect {
         let maximumWidth: CGFloat =
-            UIDevice.current.userInterfaceIdiom == .pad ? 112 : 96
+            usesLargeLayout() ? 112 : 96
         let width = min(frame.width, maximumWidth)
         let height = min(frame.height, 40)
         return CGRect(
@@ -2628,7 +2652,7 @@ private struct LegacyGlassMenuTabBar: View {
     ]
 
     private var barWidth: CGFloat {
-        UIDevice.current.userInterfaceIdiom == .pad ? 360 : 276
+        usesLargeLayout() ? 360 : 276
     }
 
     var body: some View {
@@ -2846,6 +2870,13 @@ private struct LegacyGlassTabButtonStyle: ButtonStyle {
 #endif
 
 #if !targetEnvironment(macCatalyst)
+private extension UIWindow {
+    /// Leaves out a one-sided inset such as iPhone Duo's status column; mirrored insets cancel.
+    var symmetricSafeWidth: CGFloat {
+        bounds.width - abs(safeAreaInsets.left - safeAreaInsets.right)
+    }
+}
+
 /// A real UIKit tab bar kept outside every page's GlassEffectContainer.
 /// This gives the bar its native system appearance while guaranteeing that it
 /// remains a foreground sibling rather than being composited below tab content.
@@ -2961,7 +2992,7 @@ private struct NativeMenuTabBar: UIViewRepresentable {
         // portrait; trusting a transient SwiftUI proposal first caused the bar
         // to squeeze while retained tabs swapped.
         let width = uiView.resolvedMeasurementWidth(
-            windowWidth: uiView.window?.bounds.width ?? 0,
+            windowWidth: uiView.window?.symmetricSafeWidth ?? 0,
             containerWidth: uiView.superview?.bounds.width ?? 0,
             boundsWidth: uiView.bounds.width,
             proposalWidth: proposal.width ?? 0
@@ -3158,8 +3189,8 @@ private struct NativeMenuTabBar: UIViewRepresentable {
             // UIKit cache titles such as "G", "B", and "S". Start from a
             // complete compact bar until the UIWindow supplies its exact size.
             let minimumBarWidth = min(
-                UIScreen.main.bounds.width,
-                UIDevice.current.userInterfaceIdiom == .pad ? 360 : 276
+                UIApplication.shared.appScreen.bounds.width,
+                usesLargeLayout(windowSize: window?.bounds.size) ? 360 : 276
             )
             let initialWidth = max(proposedInitialWidth, minimumBarWidth)
             stableMeasurementWidth = initialWidth
@@ -3210,7 +3241,7 @@ private struct NativeMenuTabBar: UIViewRepresentable {
         override func didMoveToWindow() {
             super.didMoveToWindow()
             guard let window, window.bounds.width > 1 else { return }
-            stableMeasurementWidth = window.bounds.width
+            stableMeasurementWidth = window.symmetricSafeWidth
             invalidateIntrinsicContentSize()
             setNeedsLayout()
         }
@@ -3463,7 +3494,7 @@ private struct NativeMenuTabBar: UIViewRepresentable {
             let visualContentFrame = itemVisualContentFrame(in: itemControl)
             let centerX = visualContentFrame?.midX ?? itemFrame.midX
             let minimumWidth: CGFloat =
-                UIDevice.current.userInterfaceIdiom == .pad ? 120 : 0
+                usesLargeLayout(windowSize: window?.bounds.size) ? 120 : 0
             let focusWidth = max(itemFrame.width + 8, minimumWidth)
             let proposedFrame = CGRect(
                 x: centerX - (focusWidth / 2),
@@ -3540,7 +3571,7 @@ private struct NativeMenuTabBar: UIViewRepresentable {
             focusFrame: CGRect
         ) -> CGRect {
             let maximumWidth: CGFloat =
-                UIDevice.current.userInterfaceIdiom == .pad ? 112 : 96
+                usesLargeLayout(windowSize: window?.bounds.size) ? 112 : 96
             let contentWidth = (visualContentFrame?.width ?? 64) + 24
             let width = min(
                 focusFrame.width,
@@ -4321,7 +4352,9 @@ private struct SafeAreaProtectedMenuTabContent<Content: View>: View {
         // GeometryReader destroys an active Settings NavigationStack and its controller
         // navigation session.
         GeometryReader { geometry in
-            let isLandscapePhone = geometry.size.width > geometry.size.height
+            // A keyboard shrinks the safe region, so landscape is judged from the window.
+            let isLandscapePhone = geometry.size.width + geometry.safeAreaInsets.leading + geometry.safeAreaInsets.trailing
+                > geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom
                 && UIDevice.current.userInterfaceIdiom == .phone
             let systemProvidesInset = geometry.safeAreaInsets.leading > 0
                 || geometry.safeAreaInsets.trailing > 0

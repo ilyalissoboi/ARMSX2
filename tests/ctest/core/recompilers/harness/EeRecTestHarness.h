@@ -198,6 +198,12 @@ public:
 	u32 GetAccBitsJit   () const;
 	u32 GetCp0Interp(u32 reg_idx) const;
 	u32 GetCp0Jit   (u32 reg_idx) const;
+	// Cycles each engine charged over the run: cpuRegs.cycle after it, minus
+	// cpuRegs.cycle in the pre-state both runs start from. The diff ignores the
+	// cycle counter, because the two engines advance it at different points;
+	// a test that is about the charge reads it here.
+	u64 GetCycleDeltaInterp() const;
+	u64 GetCycleDeltaJit   () const;
 
 	// ---- Expect helpers (paired-side architectural assertions) ----
 	//
@@ -347,7 +353,12 @@ public:
 	const VuSnapshot& Vu1InterpSnapshot() const { return vu1_interp_snapshot_; }
 
 private:
-	static constexpr s32 kCycleBudget = 1024;
+	// The JIT leg runs until it parks or has charged this many cycles; the
+	// interpreter leg runs until it parks or has run kMaxInstructions. The
+	// budget must outlast every program the interpreter leg finishes, or the
+	// two legs stop at different points. The fuzzer's counted loops of integer
+	// divides (37 cycles each) need more than 1024.
+	static constexpr s32 kCycleBudget = 8192;
 	static constexpr u32 kMaxInstructions = 2048;
 
 	void LoadProgramImpl(std::initializer_list<u32> instructions, bool append_term);

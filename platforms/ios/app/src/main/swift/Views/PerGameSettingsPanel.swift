@@ -203,6 +203,7 @@ struct PerGameSettingsPanel: View {
     let controllerInput: MenuControllerInputRouter?
     let onDone: (() -> Void)?
     let savesToRunningGame: Bool
+    private let initiallySelectsGameController: Bool
     private let initiallySelectsShaders: Bool
 
     /// Zero in the library, where this is a sheet and the system does its own avoidance.
@@ -356,6 +357,7 @@ struct PerGameSettingsPanel: View {
         self.controllerInput = controllerInput
         self.onDone = onDone
         self.savesToRunningGame = savesToRunningGame
+        self.initiallySelectsGameController = initiallySelectsGameController
         self.initiallySelectsShaders = initiallySelectsShaders
         self.livePreviewDismissRequest = livePreviewDismissRequest
         self.onLivePreviewPresentationChange =
@@ -374,11 +376,6 @@ struct PerGameSettingsPanel: View {
             initialValue: initiallySelectsGameController
                 ? .gameController
                 : (initiallySelectsShaders ? .graphics : .general)
-        )
-        _selectedControllerDetail = State(
-            initialValue: initiallySelectsGameController
-                ? .gameController
-                : nil
         )
         let inheritedVolume = Self.clampedVolume(Self.intValue(info["globalVolumePercent"], defaultValue: SettingsStore.defaultEmulatorVolumePercent))
         let loadedVolume = Self.clampedVolume(Self.intValue(info["volumePercent"], defaultValue: inheritedVolume))
@@ -719,8 +716,16 @@ struct PerGameSettingsPanel: View {
             // Recreate probes and the navigation scope atomically at rotation
             // so Cross can never activate a retained control from the old tree.
             .id(layout)
-            .onChange(of: layout) { _, _ in
+            .onChange(of: layout) { _, newLayout in
+                guard AppState.shared.hingePresent else {
+                    selectedControllerDetail = nil
+                    return
+                }
+                // The split always shows openCategory, so a fold's stack pushes it again.
+                guard !initiallySelectsShaders else { return }
                 selectedControllerDetail = nil
+                guard !newLayout.usesSplitView else { return }
+                pushOpenCategoryAfterLayout()
             }
             .controllerAccessibilityTargetOrder(
                 perGameControllerTargetOrder
@@ -818,6 +823,8 @@ struct PerGameSettingsPanel: View {
         }
         .allowsHitTesting(!livePreviewSessionIsFinishing)
         .tint(accentColour)
+        .accessibilityElement(children: .contain)
+        .accessibilityAction(.escape) { _ = handleSharedControllerBack() }
         .onChange(of: hasPendingChanges) { _, pending in
             if pending {
                 saveFeedbackVisible = false
@@ -829,6 +836,7 @@ struct PerGameSettingsPanel: View {
         }
         .onAppear {
             beginLivePreviewSessionIfNeeded()
+            if initiallySelectsGameController { pushOpenCategoryAfterLayout() }
         }
         .onChange(of: perGameLivePreviewFingerprint()) { _, fingerprint in
             if suppressNextLivePreviewChange {
@@ -1928,6 +1936,17 @@ struct PerGameSettingsPanel: View {
 
     private var controllerColumn: PerGameControllerColumn {
         selectedControllerDetail == nil ? .categories : .detail
+    }
+
+    // A page pushed before the stack's first layout draws its rows without the trailing margin.
+    private func pushOpenCategoryAfterLayout() {
+        DispatchQueue.main.async {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                selectedControllerDetail = openCategory
+            }
+        }
     }
 
     private var portraitNavigationPath: Binding<[PerGameSettingsCategory]> {

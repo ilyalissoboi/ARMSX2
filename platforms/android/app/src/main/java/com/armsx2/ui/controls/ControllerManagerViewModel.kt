@@ -65,9 +65,10 @@ class ControllerManagerViewModel(application: Application) : AndroidViewModel(ap
 
     // The running game, when it has its own map for [player]. That map shadows the global one
     // key by key, so a profile loaded globally would change nothing in this game.
+    // Keyed like every per-game setting, by settingsKey (the filename stem when there is no serial).
     private fun gameTier(player: Int): String? =
-        MainActivityRuntime.currentGame.value?.serial
-            ?.takeIf { it.isNotEmpty() && ControllerMappings.hasGameOverrides(it, player) }
+        MainActivityRuntime.currentGame.value?.settingsKey
+            ?.takeIf { ControllerMappings.hasGameOverrides(it, player) }
 
     /** Load [name] into the player being edited, at once and mid-game: into the global map,
      *  or into the running game's own map when it has one. */
@@ -110,7 +111,7 @@ class ControllerManagerViewModel(application: Application) : AndroidViewModel(ap
 
     fun captureKey(keyCode: Int): Boolean {
         val action = state.value.capturingAction ?: return false
-        ControllerMappings.bind(action, keyCode, state.value.player)
+        ControllerMappings.bind(action, keyCode, state.value.player, gameTier(state.value.player))
         ControllerMappings.padCapturing.value = false
         ControllerMappings.capturePadAction.value = null
         state.value = state.value.copy(capturingAction = null, tick = state.value.tick + 1, loadedProfile = null)
@@ -124,13 +125,16 @@ class ControllerManagerViewModel(application: Application) : AndroidViewModel(ap
     }
 
     fun clear(action: ControllerMappings.Action) {
-        ControllerMappings.clearAction(action, state.value.player)
+        ControllerMappings.clearAction(action, state.value.player, gameTier(state.value.player))
         state.value = state.value.copy(loadedProfile = null)
         refresh()
     }
 
     fun resetPlayer() {
-        ControllerMappings.reset(state.value.player)
+        val player = state.value.player
+        val serial = gameTier(player)
+        if (serial != null) ControllerMappings.clearGameOverrides(serial, player)
+        else ControllerMappings.reset(player)
         state.value = state.value.copy(loadedProfile = null)
         refresh()
     }
@@ -156,7 +160,7 @@ class ControllerManagerViewModel(application: Application) : AndroidViewModel(ap
     }
 
     fun setDpadAsStick(value: Boolean) {
-        ControllerMappings.setDpadAsLeftStick(value)
+        ControllerMappings.setDpadAsLeftStickForRunningGame(value)
         refresh()
     }
 

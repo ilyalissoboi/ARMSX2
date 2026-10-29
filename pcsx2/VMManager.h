@@ -17,6 +17,11 @@
 
 enum class CDVD_SourceType : uint8_t;
 
+namespace IopThread
+{
+	struct PrimeLoad;
+}
+
 namespace Threading
 {
 	class ThreadHandle;
@@ -420,6 +425,14 @@ namespace VMManager
 		/// scheduler decides, and there is nothing to say) and on platforms with no placement.
 		bool GSBackThreadWouldShareBusyCore();
 
+		/// Called about twice a second from the GS thread with each emulation thread's share of a processor over the
+		/// last window. While the GS back thread runs and the placement left the threads to the scheduler, the busiest
+		/// thread gets the prime core alone (see the prime core block in VMManager.cpp). A no-op everywhere else.
+		void UpdatePrimeCorePlacement(const IopThread::PrimeLoad& load);
+
+		/// For a host that places the threads itself (pcsx2-gsrunner -gspin / -gsbackpin): the arbiter steps aside.
+		void DisablePrimeCorePlacement();
+
 		/// Returns a list of processors in the system, suitable for pinning for the software renderer.
 		const std::vector<u32>& GetSoftwareRendererProcessorList();
 
@@ -430,6 +443,11 @@ namespace VMManager
 
 		/// How many of them there are. The IOP thread's ResolveMode wants it (design 10.2).
 		u32 GetPerformanceCoreCount();
+
+		/// Whether this host can run the GS back thread beside the EE, VU1 and GS front threads: at least four performance-tier
+		/// processors (five when the IOP thread is asked for) and a slower tier beside them. False where the cores cannot be
+		/// told apart (no capacity source).
+		bool CanSplitGS();
 
 		/// Diagnostic (OSD): where the EE/VU/GS threads, and the IOP thread while it runs, are actually
 		/// running (current core + affinity mask) plus the cpuinfo cluster/frequency topology. Used to see whether the

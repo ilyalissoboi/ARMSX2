@@ -69,6 +69,7 @@
 #include "BuildVersion.h"
 #include "native-lib.h"
 #include "libchdr/chd.h"
+#include <zlib.h>
 #include <algorithm>
 #include <cmath>
 
@@ -83,6 +84,7 @@
 #include <thread>
 #include <regex>
 #include <tuple>
+#include <utility>
 #include <map>
 #include <vector>
 
@@ -631,7 +633,20 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loginAchievements(JNIEnv *env, jclass clazz
     const std::string user = GetJavaString(env, p_user);
     const std::string pass = GetJavaString(env, p_pass);
     Error error;
-    const bool ok = Achievements::Login(user.c_str(), pass.c_str(), &error);
+    bool ok = false;
+    // Live achievement clients require the CPU thread.
+    bool temporary_client = !Achievements::IsActive();
+    if (!temporary_client)
+    {
+        // Recheck on the CPU thread: a queued settings apply may have disabled achievements.
+        Host::RunOnCPUThread([user, pass, &error, &ok, &temporary_client]() {
+            temporary_client = !Achievements::IsActive();
+            if (!temporary_client)
+                ok = Achievements::Login(user.c_str(), pass.c_str(), &error);
+        }, /*block=*/true);
+    }
+    if (temporary_client)
+        ok = Achievements::Login(user.c_str(), pass.c_str(), &error);
     if (!ok)
     {
         const std::string msg = error.GetDescription();
@@ -666,7 +681,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loginAchievements(JNIEnv *env, jclass clazz
 extern "C"
 JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_logoutAchievements(JNIEnv *env, jclass clazz) {
-    Achievements::Logout();
+    Host::RunOnCPUThread([]() { Achievements::Logout(); }, /*block=*/true);
     // Achievements::Logout clears Token from SECRETS but leaves the
     // Username we co-stored there. Drop it too so a fresh launch doesn't
     // re-mirror a stale username back to BASE.
@@ -834,13 +849,15 @@ static void RestartAchievementsForHostChange() {
     Achievements::Initialize();
 }
 
-static void PersistAndApplyAchievementsSettings() {
+static void PersistAndApplyAchievementsHostChange() {
     SaveBaseSettingsIfDirty();
-    // ApplySettings owns EmuConfig and resets the JIT caches, so it is the CPU thread's to run;
-    // see the assert at the top of VMManager::ApplySettings().
+    // Not blocking: callers run on the UI thread and read nothing back, and the CPU thread does
+    // not run queued tasks while VMManager::Initialize boots a game, so a wait would stall the UI
+    // for the whole boot.
     Host::RunOnCPUThread([]() {
         if (VMManager::HasValidVM())
             VMManager::ApplySettings();
+        RestartAchievementsForHostChange();
     });
 }
 
@@ -879,8 +896,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAchievementsHostOverride(JNIEnv *env, jc
             Host::SetBaseBoolSettingValue("Achievements", "ChallengeMode", false);
     }
 
-    PersistAndApplyAchievementsSettings();
-    RestartAchievementsForHostChange();
+    PersistAndApplyAchievementsHostChange();
 }
 
 extern "C"
@@ -899,8 +915,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_clearAchievementsHostOverride(JNIEnv *env, 
         Host::SetBaseBoolSettingValue("Achievements", "ChallengeMode", saved);
     }
 
-    PersistAndApplyAchievementsSettings();
-    RestartAchievementsForHostChange();
+    PersistAndApplyAchievementsHostChange();
 }
 
 // Live HW/SW state from the GS thread's POV. The in-game overlay's renderer
@@ -1736,17 +1751,20 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setNominalSpeed(JNIEnv *env, jclass clazz,
     // slider in-game did nothing (the string round-trip through ApplySettings
     // didn't re-pace reliably). Clamp matches EmulationSpeedOptions::SanityCheck.
     float scalar = std::clamp(static_cast<float>(p_percent) / 100.0f, 0.05f, 10.0f);
-    // RetroAchievements hardcore forbids slowdown. This direct-apply path skips
-    // VMManager::ApplySettings (so EnforceAchievementsChallengeModeSettings,
-    // which clamps NominalScalar to >=1.0, never runs) — enforce it here.
-    // Fast-forward (>1.0) stays allowed.
-    if (Achievements::IsHardcoreModeActive() && scalar < 1.0f)
-        scalar = 1.0f;
-    Host::SetBaseFloatSettingValue("Framerate", "NominalScalar", scalar);
-    EmuConfig.EmulationSpeed.NominalScalar = scalar;
-    if (VMManager::HasValidVM())
-        VMManager::UpdateTargetSpeed();
-    Console.WriteLnFmt("@@ANDROID_SPEED@@ nominal_scalar={}", scalar);
+    // EmuConfig and UpdateTargetSpeed's MTGS/SPU2 notifications belong to the CPU thread.
+    Host::RunOnCPUThread([scalar]() mutable {
+        // RetroAchievements hardcore forbids slowdown. This direct-apply path skips
+        // VMManager::ApplySettings (so EnforceAchievementsChallengeModeSettings,
+        // which clamps NominalScalar to >=1.0, never runs) — enforce it here.
+        // Fast-forward (>1.0) stays allowed.
+        if (Achievements::IsHardcoreModeActive() && scalar < 1.0f)
+            scalar = 1.0f;
+        Host::SetBaseFloatSettingValue("Framerate", "NominalScalar", scalar);
+        EmuConfig.EmulationSpeed.NominalScalar = scalar;
+        if (VMManager::HasValidVM())
+            VMManager::UpdateTargetSpeed();
+        Console.WriteLnFmt("@@ANDROID_SPEED@@ nominal_scalar={}", scalar);
+    });
 }
 
 extern "C"
@@ -1994,8 +2012,17 @@ public:
     }
     ~ScopedVMPause() {
         if (m_was_running && m_resume_on_destroy && !s_stop_requested.load(std::memory_order_acquire))
-            VMManager::SetPaused(false);
-        if (m_audio_pause_suppressed)
+        {
+            // Resuming resets CPU-owned code caches.
+            Host::RunOnCPUThread([audio_pause_suppressed = m_audio_pause_suppressed]() {
+                if (!s_stop_requested.load(std::memory_order_acquire) &&
+                    VMManager::HasValidVM() && VMManager::GetState() == VMState::Paused)
+                    VMManager::SetPaused(false);
+                if (audio_pause_suppressed)
+                    SPU2::SetOutputPauseSuppressed(false);
+            }, /*block=*/m_parked);
+        }
+        else if (m_audio_pause_suppressed)
             SPU2::SetOutputPauseSuppressed(false);
     }
     ScopedVMPause(const ScopedVMPause&) = delete;
@@ -4078,33 +4105,19 @@ JNIEXPORT void JNICALL
 Java_kr_co_iefriends_pcsx2_NativeApp_flushShaderCache(JNIEnv *env, jclass clazz) {
     // Persist the Vulkan pipeline cache so cold restarts don't re-compile every
     // pipeline. Hooked from onPause so the typical background-then-swipe-kill
-    // sequence on Android still writes the cache. The destructor in
-    // VKShaderCache also flushes, but we can't rely on onDestroy running before
-    // Android reaps the process. No-op for the OpenGL backend (GL backend
-    // manages its own cache via GLShaderCache; this is Vulkan-specific).
+    // sequence on Android still writes the cache. No-op for the OpenGL backend.
     //
-    // ★ MUST run on the GS thread. This used to call FlushPipelineCache() straight from the UI
-    // thread (onPause), which means vkGetPipelineCacheData() on the same VkPipelineCache that the
-    // GS thread passes to vkCreateGraphicsPipelines. Vulkan requires host access to a pipeline
-    // cache to be externally synchronised, and nothing here synchronised it — so backgrounding the
-    // app while the GS thread happened to be compiling a pipeline was a data race inside the
-    // driver. Being a spec violation rather than a driver quirk, it crashed on Adreno and Xclipse
-    // alike, intermittently, which matches the field reports. Routed via the CPU thread because
-    // MTGS::RunOnGSThread writes the EE-owned MTGS ring and must not be posted from the UI thread.
+    // This only asks the shader cache's background writer to save now rather than at its next pass;
+    // the serialisation and the write happen on that thread, never on the UI or GS thread. The request
+    // is still posted to the GS thread, through the CPU thread (MTGS::RunOnGSThread writes the EE-owned
+    // MTGS ring and must not be posted from the UI thread), because the GS thread owns the cache's
+    // lifetime: from here it could be destroyed underneath us.
     //
-    // Fire-and-forget: we deliberately do NOT block the UI thread waiting for the GS thread (that
-    // risks an ANR, and onPause is on a deadline). If the process is reaped before it lands we
-    // lose only this one flush — GetTFXPipeline's threshold flush already persists incrementally.
+    // Fire-and-forget: the UI thread never waits (onPause is on a deadline). Rate-limited, since each
+    // save serialises the whole cache, and while that runs the driver holds the cache's lock against
+    // new pipelines.
     if (!VMManager::HasValidVM() || !MTGS::IsOpen())
         return;
-    // ★ Rate-limited. Measured on a Retroid Pocket 6: backgrounding wrote 777 KB of pipeline cache,
-    // synchronously on the GS thread, at the exact moment Android is also tearing the surface down
-    // and we are about to rebuild the swapchain. Every background paid it, because active play
-    // keeps compiling pipelines so the dirty flag is essentially always set — turning a quick
-    // alt-tab into a visible multi-second "FPS N/A" stall on return. The flush only exists to
-    // survive a swipe-kill, which is rare and cheap to lose (the pipelines just recompile), so one
-    // flush per interval is plenty. GetTFXPipeline's own threshold flush still persists
-    // incrementally during play, so nothing here is the sole path to durability.
     static std::atomic<s64> s_last_flush_time{0};
     const s64 now = static_cast<s64>(
         std::chrono::duration_cast<std::chrono::seconds>(
@@ -4123,7 +4136,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_flushShaderCache(JNIEnv *env, jclass clazz)
             return;
         MTGS::RunOnGSThread([]() {
             if (g_vulkan_shader_cache)
-                g_vulkan_shader_cache->FlushPipelineCache();
+                g_vulkan_shader_cache->RequestFlush();
         });
     });
 }
@@ -4150,7 +4163,6 @@ Java_kr_co_iefriends_pcsx2_NativeApp_shutdown(JNIEnv *env, jclass clazz) {
     Console.WriteLn("@@STOP_LATCH_SET@@ val=%d",
         s_stop_requested.load(std::memory_order_acquire) ? 1 : 0);
 
-    VMManager::SetLimiterMode(LimiterModeType::Nominal);
     if (VMManager::GetState() != VMState::Stopping)
         VMManager::SetState(VMState::Stopping);
     if (!s_execute_exit.load(std::memory_order_acquire) && Cpu)
@@ -4338,6 +4350,71 @@ Java_kr_co_iefriends_pcsx2_NativeApp_loadStateFromSlot(JNIEnv *env, jclass clazz
             MTGS::PresentCurrentFrame();
     }, /*block=*/true);
     return loaded;
+}
+
+static bool SaveStatePathMatchesCurrentGame(std::string_view path) {
+    const std::string_view name = Path::GetFileName(path);
+    const std::string_view suffix = name.size() >= 7 ? name.substr(name.size() - 7) : std::string_view();
+    if (suffix.size() != 7 || suffix[0] != '.' || suffix[1] < '0' || suffix[1] > '9' ||
+        suffix[2] < '0' || suffix[2] > '9' || suffix.substr(3) != ".p2s")
+        return false;
+    const s32 slot = (suffix[1] - '0') * 10 + (suffix[2] - '0');
+    const std::string expected = VMManager::GetSaveStateFileName(
+        VMManager::GetDiscSerial().c_str(), VMManager::GetDiscCRC(), slot);
+    return !expected.empty() && name == Path::GetFileName(expected);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_kr_co_iefriends_pcsx2_NativeApp_loadStateFromFile(JNIEnv *env, jclass clazz, jstring p_path) {
+    const std::string path = GetJavaString(env, p_path);
+    const auto fail = [&path](const char* reason, jint status) -> jint {
+        Console.Error("@@ANDROID_LOADSTATE@@ path=%s ok=0 reason=%s crc=%08X serial=%s", path.c_str(),
+            reason, VMManager::GetDiscCRC(), VMManager::GetDiscSerial().c_str());
+        return status;
+    };
+    if (!VMManager::HasValidVM())
+        return fail("no_vm", 0);
+    if (!FileSystem::FileExists(path.c_str()))
+        return fail("no_file", -1);
+    const ScopedVMPause pause_guard;
+    if (!pause_guard.parked())
+        return fail("cpu_thread_not_parked", 0);
+    // Loading and presenting both push to CPU-owned rings, before the pause guard resumes the VM.
+    jint status = 0;
+    Host::RunOnCPUThread([&path, &status, &fail]() {
+        if (!VMManager::HasValidVM()) {
+            status = fail("no_vm", 0);
+            return;
+        }
+        if (!SaveStatesHaveName()) {
+            status = fail("crc_zero", 0);
+            return;
+        }
+        if (!SaveStatePathMatchesCurrentGame(path)) {
+            status = fail("wrong_game", -1);
+            return;
+        }
+        if (!FileSystem::FileExists(path.c_str())) {
+            status = fail("no_file", -1);
+            return;
+        }
+        if (MemcardBusy::IsBusy()) {
+            status = fail("memcard_busy", 0);
+            return;
+        }
+        Error error;
+        if (!VMManager::LoadState(path.c_str(), &error)) {
+            Console.Error(fmt::format("loadStateFromFile: {}", error.GetDescription()));
+            status = fail("load_failed", -1);
+            return;
+        }
+        MTGS::PresentCurrentFrame();
+        status = 1;
+    }, /*block=*/true);
+    if (status == 1)
+        Console.WriteLn("@@ANDROID_LOADSTATE@@ path=%s ok=1", path.c_str());
+    return status;
 }
 
 extern "C"
@@ -4953,6 +5030,8 @@ void Host::RequestVMShutdown(bool allow_confirm, bool allow_save_state, bool def
     // the 2nd launch). If we're already shut down, there's nothing left to stop.
     if (VMManager::GetState() == VMState::Shutdown)
         return;
+    // No limiter reset here: the core calls this from whichever thread powers the console off,
+    // and every boot sets the limiter back to Nominal anyway (VMManager::Initialize).
     VMManager::SetState(VMState::Stopping);
     if (!s_execute_exit.load(std::memory_order_acquire) && Cpu)
         Cpu->ExitExecution();
@@ -6237,9 +6316,11 @@ Java_kr_co_iefriends_pcsx2_NativeApp_gameDbClaimingKeys(JNIEnv* env, jclass) {
 //   2048 / 0    plain ISO — every byte is data
 //   2352 / 16   Mode 1 raw — 12 byte sync, 4 byte header, 2048 data, 288 ECC
 //   2352 / 24   Mode 2 Form 1 raw — 16 sync+header, 8 subheader, 2048 data, 280 ECC
+//   2448 / 24   raw with subchannel, data at +24
 //
 // We try them in order and the first one that finds a valid PVD wins. CSO/ZSO
-// and GZ still fall back to filename parsing on the Kotlin side.
+// still fall back to filename parsing on the Kotlin side. Gzip streams use
+// the same layouts after decompression.
 //
 // fd ownership: consumed (closed via fclose on the wrapping FILE*),
 // matching the IsBIOSFromFd contract.
@@ -6247,19 +6328,18 @@ Java_kr_co_iefriends_pcsx2_NativeApp_gameDbClaimingKeys(JNIEnv* env, jclass) {
 
 namespace {
 // Reader abstraction so the SYSTEM.CNF probe is independent of the
-// underlying container (flat ISO/BIN via FILE*, CHD via libchdr). Each
+// underlying container (flat ISO/BIN, gzip, or CHD). Each
 // implementation knows how to fetch up to 2048 bytes of cooked data
 // starting at a given LBA + intra-sector offset.
 using DiscReader = std::function<bool(std::uint32_t lba, std::uint32_t skip, void* buf, std::size_t size)>;
+using OffsetReader = std::function<bool(std::uint64_t offset, void* buf, std::size_t size)>;
 
-// FILE*-backed reader for plain ISO (2048/0) and raw .bin (2352/16, 2352/24).
-static DiscReader MakeFileReader(std::FILE* fp, std::uint32_t sectorSize,
-    std::uint32_t dataOffset, std::uint64_t byteBase = 0)
+static DiscReader MakeOffsetReader(const OffsetReader& read, std::uint32_t sectorSize,
+    std::uint32_t dataOffset, std::uint64_t byteBase)
 {
-    return [fp, sectorSize, dataOffset, byteBase](std::uint32_t lba, std::uint32_t skip, void* buf, std::size_t size) -> bool {
+    return [read, sectorSize, dataOffset, byteBase](std::uint32_t lba, std::uint32_t skip, void* buf, std::size_t size) -> bool {
         const std::uint64_t off = byteBase + static_cast<std::uint64_t>(lba) * sectorSize + dataOffset + skip;
-        if (std::fseek(fp, static_cast<long>(off), SEEK_SET) != 0) return false;
-        return std::fread(buf, 1, size, fp) == size;
+        return read(off, buf, size);
     };
 }
 
@@ -6439,6 +6519,25 @@ static std::string ProbeSerialWithLeadIns(std::uint32_t sectorSize, const Reader
     return {};
 }
 
+// Layouts in likelihood order: .iso is 2048/0, .bin usually 2352/16;
+// 2352/24 and 2448/24 are rare but cheap. Each is tried with the
+// 150-sector/Nero lead-ins, which otherwise hide some CD PVDs.
+static std::string ProbeSerialWithOffsets(const OffsetReader& read)
+{
+    const std::pair<std::uint32_t, std::uint32_t> layouts[] = {
+        {2048, 0}, {2352, 16}, {2352, 24}, {2448, 24},
+    };
+    for (const auto& [sectorSize, dataOffset] : layouts)
+    {
+        std::string serial = ProbeSerialWithLeadIns(sectorSize, [&](std::uint64_t byteBase) {
+            return MakeOffsetReader(read, sectorSize, dataOffset, byteBase);
+        });
+        if (!serial.empty())
+            return serial;
+    }
+    return {};
+}
+
 // Minimal core_file wrapper around an existing FILE*. libchdr only needs
 // fsize/fread/fseek/fclose; we hand-roll them to avoid bringing in the
 // emulator's heavyweight ChdCoreFileWrapper (which deals with parents and
@@ -6482,6 +6581,16 @@ static bool IsChdMagic(std::FILE* fp)
     if (std::fread(hdr, 1, 8, fp) != 8) return false;
     std::fseek(fp, 0, SEEK_SET);
     return std::memcmp(hdr, "MComprHD", 8) == 0;
+}
+
+static bool IsGzipMagic(std::FILE* fp)
+{
+    std::uint8_t hdr[2];
+    if (std::fseek(fp, 0, SEEK_SET) != 0) return false;
+    const bool gzip = std::fread(hdr, 1, sizeof(hdr), fp) == sizeof(hdr) &&
+        hdr[0] == 0x1f && hdr[1] == 0x8b;
+    std::fseek(fp, 0, SEEK_SET);
+    return gzip;
 }
 
 // Open a CHD on top of `fp` (ownership transferred on success — libchdr
@@ -6574,25 +6683,33 @@ Java_kr_co_iefriends_pcsx2_NativeApp_getGameSerialFromFd(JNIEnv* env, jclass, ji
             // wrapper. Don't double-close.
         }
     }
+    else if (IsGzipMagic(fp))
+    {
+        const int gzipFd = dup(fileno(fp));
+        // fseek may rewind only the stdio buffer, leaving the descriptor ahead.
+        gzFile gz = nullptr;
+        if (gzipFd >= 0 && lseek(gzipFd, 0, SEEK_SET) == 0)
+            gz = gzdopen(gzipFd, "rb");
+        if (gz)
+        {
+            serial = ProbeSerialWithOffsets([gz](std::uint64_t offset, void* buf, std::size_t size) {
+                const auto off = static_cast<z_off_t>(offset);
+                return gzseek(gz, off, SEEK_SET) == off &&
+                    gzread(gz, buf, static_cast<unsigned int>(size)) == static_cast<int>(size);
+            });
+            gzclose(gz);
+        }
+        else if (gzipFd >= 0)
+        {
+            close(gzipFd);
+        }
+        std::fclose(fp);
+    }
     else
     {
-        // Plain ISO / raw .bin path. .iso files are virtually always
-        // 2048/0; .bin files are usually 2352/16 (Mode 1 raw); 2352/24
-        // (Mode 2 Form 1) is rare on PS2 but cheap to try as a last
-        // resort. Try PCSX2's 150-sector/Nero-style lead-in variants too,
-        // since some CD-format games otherwise hide their PVD from the
-        // lightweight scanner.
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2048, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2048, 0, byteBase);
-        });
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2352, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2352, 16, byteBase);
-        });
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2352, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2352, 24, byteBase);
-        });
-        if (serial.empty()) serial = ProbeSerialWithLeadIns(2448, [&](std::uint64_t byteBase) {
-            return MakeFileReader(fp, 2448, 24, byteBase);
+        serial = ProbeSerialWithOffsets([fp](std::uint64_t offset, void* buf, std::size_t size) {
+            if (std::fseek(fp, static_cast<long>(offset), SEEK_SET) != 0) return false;
+            return std::fread(buf, 1, size, fp) == size;
         });
         std::fclose(fp);
     }

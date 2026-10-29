@@ -386,6 +386,32 @@ static void recComputeAddr(s32 imm)
 
 static void recComputeAddr() { recComputeAddr(_Imm_); }
 
+// The address as a fastmem index register. With a zero offset that is the
+// register the base already lives in (a pin or an allocator slot) and nothing
+// is emitted; otherwise the address is formed in w9 as recComputeAddr does.
+// The same contract as _eeGetGPRSourceReg: consume the register in the access
+// that follows, before anything can move pins or allocator slots.
+static a64::Register recAddrOperand()
+{
+	if (_Imm_ == 0 && !GPR_IS_CONST1(_Rs_))
+		return _eeGetGPRSourceReg(a64::w9, _Rs_);
+	recComputeAddr();
+	return a64::w9;
+}
+
+// w9 = (Rs + imm) & mask, read from wherever Rs lives (a constant base folds
+// the mask at compile time). Same flush ordering rule as recComputeAddr.
+static void recComputeAddrMasked(u32 mask)
+{
+	if (GPR_IS_CONST1(_Rs_))
+	{
+		armAsm->Mov(a64::w9, (g_cpuConstRegs[_Rs_].UL[0] + _Imm_) & mask);
+		return;
+	}
+	const a64::Register base = (_Imm_ == 0) ? _eeGetGPRSourceReg(a64::w9, _Rs_) : (recComputeAddr(), a64::w9);
+	armAsm->And(a64::w9, base, mask);
+}
+
 // Prepare store value in w10/x10.
 // Does NOT flush — reads from wherever the value currently lives.
 static void recPrepStoreValue(u32 bits)
@@ -602,7 +628,10 @@ static void recLoad(u32 bits, bool sign)
 			}
 			else
 			{
-				recComputeAddr();
+				// A resident base is the index itself (nothing between here and
+				// the access moves an allocator slot: the x0 free and the Rt quad
+				// retirement below touch neither).
+				addr_reg = static_cast<unsigned>(recAddrOperand().GetCode());
 			}
 		}
 	}
@@ -755,6 +784,31 @@ static void recStore(u32 bits)
 		// outside the pool).
 		_flushConstRegs(false);
 
+		// Both write-backs first (mappings kept), then the two operands from
+		// where the values live: a pin or an allocator slot is used as it is,
+		// so nothing can move between reading them and the access.
+		if (!GPR_IS_CONST1(_Rt_))
+			_flushEEreg(_Rt_, false);
+		if (!GPR_IS_CONST1(_Rs_))
+			_flushEEreg(_Rs_, false);
+
+		unsigned addr_reg = 9;
+		if (GPR_IS_CONST1(_Rs_))
+		{
+			armAsm->Mov(a64::w9, g_cpuConstRegs[_Rs_].UL[0] + _Imm_);
+		}
+		else if (const a64::Register* pin = armEEPinForGPR(_Rs_))
+		{
+			if (_Imm_ != 0)
+				armAsm->Add(a64::w9, pin->W(), _Imm_);
+			else
+				addr_reg = static_cast<unsigned>(pin->GetCode());
+		}
+		else
+		{
+			addr_reg = static_cast<unsigned>(recAddrOperand().GetCode());
+		}
+
 		unsigned value_reg = 10;
 		if (GPR_IS_CONST1(_Rt_))
 		{
@@ -763,34 +817,13 @@ static void recStore(u32 bits)
 			else
 				armAsm->Mov(a64::x10, g_cpuConstRegs[_Rt_].UD[0]);
 		}
-		else
+		else if (const a64::Register* vpin = armEEPinForGPR(_Rt_))
 		{
-			_flushEEreg(_Rt_, false);
-			if (const a64::Register* vpin = armEEPinForGPR(_Rt_))
-				value_reg = static_cast<unsigned>(vpin->GetCode());
-			else
-				_eeMoveGPRtoR(bits <= 32 ? a64::w10 : a64::x10, _Rt_);
-		}
-
-		unsigned addr_reg = 9;
-		if (GPR_IS_CONST1(_Rs_))
-		{
-			armAsm->Mov(a64::w9, g_cpuConstRegs[_Rs_].UL[0] + _Imm_);
+			value_reg = static_cast<unsigned>(vpin->GetCode());
 		}
 		else
 		{
-			_flushEEreg(_Rs_, false);
-			if (const a64::Register* pin = armEEPinForGPR(_Rs_))
-			{
-				if (_Imm_ != 0)
-					armAsm->Add(a64::w9, pin->W(), _Imm_);
-				else
-					addr_reg = static_cast<unsigned>(pin->GetCode());
-			}
-			else
-			{
-				recComputeAddr();
-			}
+			value_reg = static_cast<unsigned>(_eeGetGPRSourceReg(bits <= 32 ? a64::w10 : a64::x10, _Rt_).GetCode());
 		}
 
 		vtlbFastmemWrite(addr_reg, value_reg, bits);
@@ -946,8 +979,7 @@ void recLQ()
 		// alloc invalidates rt's prior GPR/const residency).
 		// w9 is immune to both: the flush materializes into pins/RXSCRATCH and
 		// the alloc's evictions are NEON stores.
-		recComputeAddr();
-		armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+		recComputeAddrMasked(~0xFu);
 		_flushConstRegs(false);
 
 		const int qd = _allocGPRtoNEONreg(_Rt_, MODE_WRITE);
@@ -957,8 +989,7 @@ void recLQ()
 	}
 
 	// addr = (rs + imm) & ~0xF — compute from live registers, then flush
-	recComputeAddr();
-	armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+	recComputeAddrMasked(~0xFu);
 	iFlushCall(FLUSH_VTLB);
 
 	if (useFastmem)
@@ -991,8 +1022,7 @@ void recSQ()
 	{
 		// Address first (w9 is immune to the flush and alloc emissions — see
 		// recLQ).
-		recComputeAddr();
-		armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+		recComputeAddrMasked(~0xFu);
 		_flushConstRegs(false);
 		const int qs = _allocGPRtoNEONreg(_Rt_, MODE_READ);
 		_validateRegs();
@@ -1014,8 +1044,7 @@ void recSQ()
 
 	// Rs address read must hit its resident slot: FLUSH_CONSTANT_REGS does NOT
 	// free the callee-saved x28 pool slot, so a raw memory load could go stale.
-	recComputeAddr();
-	armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+	recComputeAddrMasked(~0xFu);
 
 	vtlbSoftmemWrite128(9);
 }
@@ -1033,9 +1062,6 @@ void recLWC1()
 	// fallback.
 	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
 
-	// Compute address into w9 from live registers.
-	recComputeAddr();
-
 	if (useFastmem)
 	{
 		// GE-10: the inline LDR targets ft's allocated S register directly —
@@ -1048,7 +1074,8 @@ void recLWC1()
 		// the live-mask snapshot taken inside the emitter (where the thunk's
 		// is-load-dest skip excludes it from the save set).
 		const int ftreg = _allocFPtoNEONreg(_Rt_, MODE_WRITE);
-		vtlbFastmemReadFPR32(9, ftreg);
+		// The address after the alloc, read from wherever the base lives.
+		vtlbFastmemReadFPR32(recAddrOperand().GetCode(), ftreg);
 		if (CHECK_FPU_FULL)
 		{
 			// The load lands the architectural word; on the double tier the
@@ -1060,6 +1087,8 @@ void recLWC1()
 	}
 	else
 	{
+		// Compute address into w9 from live registers.
+		recComputeAddr();
 		iFlushCall(FLUSH_VTLB);
 		vtlbSoftmemRead(9, 32, false);
 
@@ -1090,15 +1119,15 @@ void recSWC1()
 	// fallback otherwise.
 	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
 
-	// Compute address from live registers.
-	recComputeAddr();
-
 	if (useFastmem)
 	{
-		vtlbFastmemWrite(9, 10, 32);
+		// Address from wherever the base lives.
+		vtlbFastmemWrite(recAddrOperand().GetCode(), 10, 32);
 	}
 	else
 	{
+		// Compute address from live registers.
+		recComputeAddr();
 		iFlushCall(FLUSH_VTLB);
 		vtlbSoftmemWrite(9, 10, 32);
 	}
@@ -1471,8 +1500,10 @@ static void recUnalignedLoadDouble(bool is_ldl)
 //   SDL: mem64(aligned) = (Rt >> (56 - shift8)) | (mem & (~0 << (shift8 + 8)))  [s==7: store Rt]
 //   SDR: mem64(aligned) = (Rt <<       shift8 ) | (mem & (~0 >> (64 - shift8))) [s==0: store Rt]
 //
-// aligned, s and Rt all live in callee-saved temps across the read. The
-// degenerate alignment (SDL s==7 / SDR s==0) stores Rt whole and skips the read.
+// Fastmem compiles use one branch-free form for every alignment (below).
+// Softmem compiles keep the address in a callee-saved temp across the read,
+// and the degenerate alignment (SDL s==7 / SDR s==0) stores Rt whole and skips
+// the read.
 static void recUnalignedStoreDouble(bool is_sdl)
 {
 	// --- SDL/SDR pair fusion -------------------------------------------------
@@ -1537,9 +1568,62 @@ static void recUnalignedStoreDouble(bool is_sdl)
 
 	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
 
-	recComputeAddr();
+	// A pinned base with no offset is read after the flush, from the pin (the
+	// flush is what writes a dirty 128-bit copy back into it; see recLoad), and
+	// used as it is. Any other base is formed in w9 before the flush, while its
+	// slot is still allocated.
+	const a64::Register* basePin = (useFastmem && _Imm_ == 0 && !GPR_IS_CONST1(_Rs_)) ? armEEPinForGPR(_Rs_) : nullptr;
+	if (!basePin)
+		recComputeAddr();
 	iFlushCall(FLUSH_VTLB);
 
+	// Fastmem: one branch-free merge for every alignment, with the shift as a
+	// register operand.
+	//   SDR: mem = (mem & ~(~0 << s)) | (Rt << s),  s = (addr & 7) * 8
+	//   SDL: mem = (mem & ~(~0 >> s)) | (Rt >> s),  s = (7 - (addr & 7)) * 8
+	// s == 0 is the degenerate alignment and gives Rt whole, as the two-path
+	// form below does; unlike it, the doubleword is read in that case too,
+	// which is what the interpreter does. A read of RAM has no effect, and an
+	// address that is not RAM faults on its first access, after which the PC
+	// compiles softmem, below, with the read skipped as before.
+	// w10 holds s across the read: the inline access touches nothing, and the
+	// load backpatch thunk touches only w9 (the address, unchanged), x8, x17
+	// and x0, with its slow call preserve_most (x9-x15 spared). w9 keeps the
+	// aligned address for the write the same way.
+	if (useFastmem)
+	{
+		const a64::Register addr = basePin ? basePin->W() : a64::w9;
+		if (is_sdl)
+		{
+			armAsm->Mvn(a64::w10, addr);
+			armAsm->Ubfiz(a64::w10, a64::w10, 3, 3);                // s = (~addr & 7) * 8
+		}
+		else
+		{
+			armAsm->Ubfiz(a64::w10, addr, 3, 3);                    // s = (addr & 7) * 8
+		}
+		armAsm->And(a64::w9, addr, ~7u);                            // aligned
+		vtlbFastmemRead(9, 0, 64, false);                          // mem -> x0
+		const a64::Register rt = _eeGetGPRSourceReg(a64::x1, _Rt_); // handles Rt == 0
+		if (is_sdl)
+		{
+			armAsm->Lsr(a64::x1, rt, a64::x10);
+			armAsm->Mov(RXSCRATCH, UINT64_C(0xFFFFFFFFFFFFFFFF));
+			armAsm->Lsr(RXSCRATCH, RXSCRATCH, a64::x10);
+		}
+		else
+		{
+			armAsm->Lsl(a64::x1, rt, a64::x10);
+			armAsm->Mov(RXSCRATCH, UINT64_C(0xFFFFFFFFFFFFFFFF));
+			armAsm->Lsl(RXSCRATCH, RXSCRATCH, a64::x10);
+		}
+		armAsm->Bic(a64::x0, a64::x0, RXSCRATCH);
+		armAsm->Orr(a64::x0, a64::x0, a64::x1);
+		vtlbFastmemWrite(9, 0, 64);
+		return;
+	}
+
+	// Softmem (a PC that has faulted: the address is not RAM).
 	// EE-SRA 3 Arm B: only the full effective address must survive the read's
 	// slow-path C call (it re-addresses the write-back), so it is the sole
 	// callee-saved temp. s = addr & 7 drives the degenerate-alignment branch and
@@ -1557,10 +1641,7 @@ static void recUnalignedStoreDouble(bool is_sdl)
 
 	// General path: read aligned word, merge with Rt.
 	armAsm->And(a64::w9, armWRegister(addrCS), ~7u);                  // aligned
-	if (useFastmem)
-		vtlbFastmemRead(9, 0, 64, false);                            // mem -> x0
-	else
-		vtlbSoftmemRead(9, 64, false);
+	vtlbSoftmemRead(9, 64, false);                                    // mem -> x0
 
 	_eeMoveGPRtoR(a64::x1, _Rt_);                                     // Rt (post-read), handles Rt==0
 	armAsm->And(RWSCRATCH, armWRegister(addrCS), 7);                  // s, recomputed post-read
@@ -1598,10 +1679,7 @@ static void recUnalignedStoreDouble(bool is_sdl)
 
 	armAsm->Bind(&merged);
 	armAsm->And(a64::w9, armWRegister(addrCS), ~7u);                  // aligned (write)
-	if (useFastmem)
-		vtlbFastmemWrite(9, 0, 64);
-	else
-		vtlbSoftmemWrite(9, 0, 64);
+	vtlbSoftmemWrite(9, 0, 64);
 
 	_freeArm64GPR(addrCS);
 }
@@ -1645,8 +1723,7 @@ void recLQC2()
 	// before this emitter ran, and VF regs are never EE-allocator-tracked).
 	if (useFastmem)
 	{
-		recComputeAddr();
-		armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+		recComputeAddrMasked(~0xFu);
 		_flushConstRegs(false);
 		vtlbFastmemRead128(9, RQSCRATCH.GetCode());
 		if (_Rt_)
@@ -1656,8 +1733,7 @@ void recLQC2()
 
 	// Softmem: addr = (rs + imm) & ~0xF, then the legacy full-flush + q0
 	// shape (the C call clobbers caller-saved state anyway).
-	recComputeAddr();
-	armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+	recComputeAddrMasked(~0xFu);
 	iFlushCall(FLUSH_VTLB);
 	vtlbSoftmemRead128(9);
 
@@ -1679,8 +1755,7 @@ void recSQC2()
 	// flushed (dirty writebacks emitted) before this emitter ran.
 	if (useFastmem)
 	{
-		recComputeAddr();
-		armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+		recComputeAddrMasked(~0xFu);
 		_flushConstRegs(false);
 		armAsm->Ldr(RQSCRATCH, armVU0Mem(&VU0.VF[_Rt_]));
 		vtlbFastmemWrite128(9, RQSCRATCH.GetCode());
@@ -1689,8 +1764,7 @@ void recSQC2()
 
 	// Softmem: addr = (rs + imm) & ~0xF — allocator-aware (rs may still be
 	// live in a host reg if the sync above emitted nothing).
-	recComputeAddr();
-	armAsm->And(a64::w9, a64::w9, (u32)~0xF);
+	recComputeAddrMasked(~0xFu);
 
 	// Flush before the q0 load. iFlushCall unconditionally evicts all NEON
 	// (iR5900-arm64.cpp:765-769) and writes back any dirty cache; after
