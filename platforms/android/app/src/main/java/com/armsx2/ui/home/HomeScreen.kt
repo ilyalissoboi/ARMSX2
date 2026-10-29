@@ -836,8 +836,11 @@ fun HomeScreen(
                         // Resolve against the games actually in the library, so a category
                         // holding a game the user has since deleted simply shows fewer, rather
                         // than an empty shelf with a title over it.
+                        // A collapsed multi-disc game is in a category when any of its discs is,
+                        // as in the List filter (HomeViewModel.buildState).
                         val categoryGames = state.visibleGames.filter { g ->
-                            g.settingsKey?.let { it in members } == true
+                            (viewModel.discsOf(g)?.map { it.game } ?: listOf(g))
+                                .any { disc -> disc.settingsKey?.let { it in members } == true }
                         }
                         if (categoryGames.isEmpty()) return@forEach
                         item(span = { GridItemSpan(maxLineSpan) }, key = "category-$categoryName") {

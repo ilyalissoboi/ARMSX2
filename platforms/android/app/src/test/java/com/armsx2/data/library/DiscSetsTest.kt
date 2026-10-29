@@ -223,6 +223,22 @@ class DiscSetsTest {
     }
 
     @Test
+    fun explicitIdsKeepTheDiscsSortKey() {
+        val discs = (1..2).map { n ->
+            disc(
+                "北方謙三 三国志 [Disc $n]", "$n.iso", region = "Japan", serial = "SLPM-6503${3 + n}",
+                titleSort = "きたかたけんぞう さんごくし [Disc $n]", set = info("SLPM-65034", "北方謙三 三国志", n),
+            )
+        }
+        val sets = DiscSets.build(discs)
+        assertEquals(1, sets.size)
+        assertEquals("北方謙三 三国志", sets[0].title)
+        assertEquals("きたかたけんぞう さんごくし", sets[0].titleSort)
+        // No sort key of its own: the entry sorts by its title.
+        assertEquals("", DiscSets.build(discs.map { it.copy(titleSort = "") })[0].titleSort)
+    }
+
+    @Test
     fun explicitIdsKeepSameNamedReleasesSeparate() {
         val discs = buildList {
             for (release in 0..1) for (number in 1..2) {

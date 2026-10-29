@@ -246,6 +246,20 @@ TEST(GameListDiscSets, ExplicitIdsIgnoreRenamedTitlesAndDifferentSerialFamilies)
 	EXPECT_EQ(sets[0].entries.size(), 2u);
 }
 
+TEST(GameListDiscSets, ExplicitIdsKeepTheDiscsSortKey)
+{
+	std::vector entries = {MakeDisc("北方謙三 三国志 [Disc 1]", "one.iso", GameList::Region::NTSC_J, "SLPM-65034"),
+		MakeDisc("北方謙三 三国志 [Disc 2]", "two.iso", GameList::Region::NTSC_J, "SLPM-65035")};
+	entries[0].title_sort = "きたかたけんぞう さんごくし [Disc 1]";
+	entries[1].title_sort = "きたかたけんぞう さんごくし [Disc 2]";
+	for (u32 i = 0; i < 2; i++)
+		entries[i].disc_set = GameDatabaseSchema::DiscSetInfo{"SLPM-65034", "北方謙三 三国志", "", i + 1};
+	const auto sets = GameList::BuildDiscSets(entries);
+	ASSERT_EQ(sets.size(), 1u);
+	EXPECT_EQ(sets[0].title, "北方謙三 三国志");
+	EXPECT_EQ(sets[0].title_sort, "きたかたけんぞう さんごくし");
+}
+
 TEST(GameListDiscSets, ExplicitIdsKeepSameNamedReleasesSeparate)
 {
 	std::vector<GameList::Entry> entries;

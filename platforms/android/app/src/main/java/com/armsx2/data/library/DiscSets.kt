@@ -167,7 +167,9 @@ object DiscSets {
                 val set = disc.set
                 if (title.isEmpty()) title = set?.name ?: setTitle(disc.title)
                 if (titleEn.isEmpty()) titleEn = set?.nameEn ?: setTitle(disc.titleEn)
-                if (titleSort.isEmpty()) titleSort = set?.name ?: setTitle(disc.titleSort)
+                // The disc's own sort key, label removed: a set's name is no sort key for a
+                // Japanese title ("北方謙三 三国志" files under きたかたけんぞう). Empty sorts by title.
+                if (titleSort.isEmpty()) titleSort = setTitle(disc.titleSort)
             }
             sets += Group(title, titleEn, titleSort, sorted, sorted.map { numbers[it] })
         }

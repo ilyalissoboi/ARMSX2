@@ -561,7 +561,7 @@ std::vector<GameList::DiscSet> GameList::BuildDiscSets(std::span<const Entry> en
 			if (set.title_en.empty())
 				set.title_en = entry.disc_set ? entry.disc_set->name_en : GetDiscSetTitle(entry.title_en);
 			if (set.title_sort.empty())
-				set.title_sort = entry.disc_set ? entry.disc_set->name : GetDiscSetTitle(entry.title_sort);
+				set.title_sort = GetDiscSetTitle(entry.title_sort); // A set name is no kana sort key; empty sorts by title.
 		}
 		sets.push_back(std::move(set));
 	}
