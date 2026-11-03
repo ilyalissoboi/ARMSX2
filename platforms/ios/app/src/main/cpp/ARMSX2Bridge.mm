@@ -5804,6 +5804,7 @@ static void ARMSX2WithSaveStateSlotPath(NSInteger slot, ARMSX2SaveStateCompletio
         @"notifications": @(EmuConfig.Achievements.Notifications),
         @"leaderboardNotifications": @(EmuConfig.Achievements.LeaderboardNotifications),
         @"overlays": @(EmuConfig.Achievements.Overlays),
+        @"offlineQueue": @(EmuConfig.Achievements.OfflineQueue),
         @"hasActiveGame": @(hasGame),
         @"gameTitle": ARMSX2NSStringFromStdString(gameTitle),
         @"richPresence": ARMSX2NSStringFromStdString(richPresence),
@@ -5942,6 +5943,16 @@ static void ARMSX2WithSaveStateSlotPath(NSInteger slot, ARMSX2SaveStateCompletio
         ARMSX2UpdateAchievementsSettings(^{
             EmuConfig.Achievements.Overlays = enable;
             ARMSX2SaveBaseSettingBool("Achievements", "Overlays", enable);
+        });
+    });
+}
+
++ (void)setRetroAchievementsOfflineQueue:(BOOL)enabled {
+    const bool enable = enabled ? true : false;
+    dispatch_async(ARMSX2RetroAchievementsQueue(), ^{
+        ARMSX2UpdateAchievementsSettings(^{
+            EmuConfig.Achievements.OfflineQueue = enable;
+            ARMSX2SaveBaseSettingBool("Achievements", "OfflineQueue", enable);
         });
     });
 }

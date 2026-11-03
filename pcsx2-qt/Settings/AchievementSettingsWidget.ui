@@ -146,6 +146,13 @@ Login token generated at:</string>
         </property>
        </widget>
       </item>
+      <item row="3" column="1">
+       <widget class="QCheckBox" name="offlineQueue">
+        <property name="text">
+         <string>Save Unlocks While Offline</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
@@ -540,6 +547,7 @@ Login token generated at:</string>
   <tabstop>spectatorMode</tabstop>
   <tabstop>encoreMode</tabstop>
   <tabstop>unofficialAchievements</tabstop>
+  <tabstop>offlineQueue</tabstop>
   <tabstop>achievementNotifications</tabstop>
   <tabstop>achievementNotificationsDuration</tabstop>
   <tabstop>leaderboardNotifications</tabstop>

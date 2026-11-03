@@ -1646,7 +1646,8 @@ struct Pcsx2Config
 			UnlockSound : 1,
 			LBSubmitSound : 1,
 			Overlays : 1,
-			LBOverlays : 1;
+			LBOverlays : 1,
+			OfflineQueue : 1;
 		BITFIELD_END
 
 		u32 NotificationsDuration = DEFAULT_NOTIFICATION_DURATION;

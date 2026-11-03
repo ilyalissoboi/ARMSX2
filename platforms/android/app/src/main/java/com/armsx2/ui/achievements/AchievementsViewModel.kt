@@ -89,6 +89,8 @@ data class AchievementsUiState(
     val encoreMode: Boolean = false,
     val spectatorMode: Boolean = false,
     val unofficialTestMode: Boolean = false,
+    // Keep unlocks made without a connection and send them later (default on).
+    val offlineQueue: Boolean = true,
     // Display name of the user's custom achievement-unlock sound, or null for the default.
     val unlockSoundName: String? = null,
     // Volume of the unlock sound effect, 0..100 % (app-side, applied in NativeApp.playSound).
@@ -194,6 +196,7 @@ class AchievementsViewModel(application: Application) : AndroidViewModel(applica
                 "encoreMode" -> it.copy(emuCore = it.emuCore.copy(achievements = it.emuCore.achievements.copy(encoreMode = enabled)))
                 "spectatorMode" -> it.copy(emuCore = it.emuCore.copy(achievements = it.emuCore.achievements.copy(spectatorMode = enabled)))
                 "unofficialTestMode" -> it.copy(emuCore = it.emuCore.copy(achievements = it.emuCore.achievements.copy(unofficialTestMode = enabled)))
+                "offlineQueue" -> it.copy(emuCore = it.emuCore.copy(achievements = it.emuCore.achievements.copy(offlineQueue = enabled)))
                 else -> it
             }
         }
@@ -206,6 +209,7 @@ class AchievementsViewModel(application: Application) : AndroidViewModel(applica
             "encoreMode" -> state.value.copy(encoreMode = enabled)
             "spectatorMode" -> state.value.copy(spectatorMode = enabled)
             "unofficialTestMode" -> state.value.copy(unofficialTestMode = enabled)
+            "offlineQueue" -> state.value.copy(offlineQueue = enabled)
             else -> state.value
         }
     }
@@ -335,6 +339,7 @@ class AchievementsViewModel(application: Application) : AndroidViewModel(applica
             encoreMode = cfg.emuCore.achievements.encoreMode,
             spectatorMode = cfg.emuCore.achievements.spectatorMode,
             unofficialTestMode = cfg.emuCore.achievements.unofficialTestMode,
+            offlineQueue = cfg.emuCore.achievements.offlineQueue,
             unlockSoundName = MainActivityRuntime.prefs.getString(UNLOCK_SOUND_PREF, null),
             soundVolume = MainActivityRuntime.prefs.getInt(SOUND_VOLUME_PREF, 100),
         )

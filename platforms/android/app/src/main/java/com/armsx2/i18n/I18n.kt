@@ -1526,6 +1526,8 @@ private val BASE_EN: Map<String, String> = mapOf(
     "ra.options.soundEffects" to "Sound Effects",
     "ra.options.soundVolume" to "Sound Volume",
     "ra.options.soundVolume.desc" to "Volume of the achievement unlock sound.",
+    "ra.options.offlineQueue" to "Save Unlocks While Offline",
+    "ra.options.offlineQueue.desc" to "When RetroAchievements can't be reached, unlocks and leaderboard entries are saved and sent once you're back online. Games you've played online before can still load their achievements.",
     "ra.options.spectatorMode" to "Spectator Mode",
     "ra.options.spectatorMode.desc" to "Track achievements without sending any unlocks to the server; nothing is recorded to your account.",
     "ra.options.unofficialTestMode" to "Test Unofficial Achievements",

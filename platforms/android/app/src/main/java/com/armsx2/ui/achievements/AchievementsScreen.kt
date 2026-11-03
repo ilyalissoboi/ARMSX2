@@ -363,6 +363,16 @@ private fun AchievementAccount(
                     onConfirm = { viewModel.setOption("unofficialTestMode", !state.unofficialTestMode) },
                 ),
             )
+            SettingSwitchRow(
+                title = str("ra.options.offlineQueue"),
+                description = str("ra.options.offlineQueue.desc"),
+                checked = state.offlineQueue,
+                onCheckedChange = { viewModel.setOption("offlineQueue", it) },
+                modifier = Modifier.controllerFocusable(
+                    "ra.offlineQueue",
+                    onConfirm = { viewModel.setOption("offlineQueue", !state.offlineQueue) },
+                ),
+            )
             Surface(
                 onClick = { soundPicker.launch(arrayOf("audio/*")) },
                 modifier = Modifier.fillMaxWidth().controllerFocusable(
