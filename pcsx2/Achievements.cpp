@@ -197,7 +197,7 @@ namespace Achievements
 	static void ClearOfflineResponseCache();
 	static std::string GetOfflineQueuePath();
 	static void LoadOfflineQueue();
-	static void SaveOfflineQueue();
+	static bool SaveOfflineQueue();
 	static bool QueueOfflineRequest(std::string_view method, std::string_view post_data);
 	static std::string GetOfflineAwardAchievementResponse(rc_client_t* client, std::string_view post_data);
 	static std::string GetOfflineSubmitLeaderboardEntryResponse(std::string_view post_data);
@@ -2213,15 +2213,11 @@ void Achievements::LoadOfflineQueue()
 		Console.WriteLn("Achievements: %zu requests recorded while offline are waiting to be submitted.", s_offline_queue.size());
 }
 
-void Achievements::SaveOfflineQueue()
+bool Achievements::SaveOfflineQueue()
 {
 	const std::string path = GetOfflineQueuePath();
 	if (s_offline_queue.empty())
-	{
-		if (FileSystem::FileExists(path.c_str()))
-			FileSystem::DeleteFilePath(path.c_str());
-		return;
-	}
+		return (!FileSystem::FileExists(path.c_str()) || FileSystem::DeleteFilePath(path.c_str()));
 
 	rapidjson::Document doc(rapidjson::kObjectType);
 	auto& alloc = doc.GetAllocator();
@@ -2251,7 +2247,12 @@ void Achievements::SaveOfflineQueue()
 
 	Error error;
 	if (!Catalog::WriteJsonFileAtomic(path, doc, &error))
+	{
 		Console.Error("Achievements: Failed to save '%s': %s", path.c_str(), error.GetDescription().c_str());
+		return false;
+	}
+
+	return true;
 }
 
 bool Achievements::QueueOfflineRequest(std::string_view method, std::string_view post_data)
@@ -2300,9 +2301,16 @@ bool Achievements::QueueOfflineRequest(std::string_view method, std::string_view
 		{
 			if (request.hardcore && !existing->hardcore)
 			{
+				// A new serial, so a softcore submission of the old entry still in flight can't remove it.
+				const OfflineRequest previous = *existing;
 				existing->hardcore = true;
 				existing->timestamp = request.timestamp;
-				SaveOfflineQueue();
+				existing->serial = s_next_offline_request_serial++;
+				if (!SaveOfflineQueue())
+				{
+					*existing = previous;
+					return false;
+				}
 			}
 
 			return true;
@@ -2315,10 +2323,17 @@ bool Achievements::QueueOfflineRequest(std::string_view method, std::string_view
 		return false;
 	}
 
-	Console.Warning("Achievements: Server unreachable, queued %s %u to submit later.", is_unlock ? "achievement" : "leaderboard entry", request.id);
+	// Only tell rc_client it went through once it's on disk, otherwise it would be lost when we exit.
+	const u32 request_id = request.id;
 	request.serial = s_next_offline_request_serial++;
 	s_offline_queue.push_back(std::move(request));
-	SaveOfflineQueue();
+	if (!SaveOfflineQueue())
+	{
+		s_offline_queue.pop_back();
+		return false;
+	}
+
+	Console.Warning("Achievements: Server unreachable, queued %s %u to submit later.", is_unlock ? "achievement" : "leaderboard entry", request_id);
 
 	// Check back for the connection soon, even if the last flush pushed the retry well out.
 	if (!s_offline_flush_in_progress)
@@ -2508,14 +2523,10 @@ Achievements::OfflineSubmitResult Achievements::GetOfflineSubmitResult(
 		return OfflineSubmitResult::Unauthorized;
 	}
 
-	// Nothing we can act on, so try again later rather than lose it.
-	if (data.empty() || status_code >= 500)
-		return OfflineSubmitResult::Unreachable;
-
-	if (error_message->empty())
-		*error_message = rc_error_str(result);
-
-	return OfflineSubmitResult::Rejected;
+	// Only an error from RetroAchievements itself drops the entry. Anything else, such as a captive portal's page,
+	// leaves it queued for later.
+	const bool server_answered = (result == RC_OK && !error_message->empty());
+	return (server_answered && status_code < 500) ? OfflineSubmitResult::Rejected : OfflineSubmitResult::Unreachable;
 }
 
 void Achievements::OnOfflineRequestSubmitted(u64 serial, u32 generation, OfflineSubmitResult result)
