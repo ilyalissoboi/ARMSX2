@@ -3,6 +3,7 @@
 
 #include "Achievements.h"
 #include "BuildVersion.h"
+#include "Catalog/Json.h"
 #include "CDVD/CDVD.h"
 #include "CDVD/CDVDcommon.h"
 #include "Elfheader.h"
@@ -34,6 +35,7 @@
 
 #include "IconsPromptFont.h"
 #include "fmt/format.h"
+#include "rc_api_runtime.h"
 #include "rc_client.h"
 
 #include <algorithm>
@@ -41,6 +43,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
 #include <limits>
 #include <map>
@@ -80,6 +83,20 @@ namespace Achievements
 	// Chrome uses 10 server calls per domain, seems reasonable.
 	static constexpr u32 MAX_CONCURRENT_SERVER_CALLS = 10;
 
+	// Unlocks and leaderboard entries which couldn't reach the server are kept here until they can be sent.
+	static constexpr const char* OFFLINE_QUEUE_FILENAME = "achievements_offline_queue.json";
+	static constexpr u32 OFFLINE_QUEUE_VERSION = 1;
+	static constexpr size_t MAX_OFFLINE_QUEUE_SIZE = 2000;
+
+	// How long to wait before probing the server again while requests are queued. Doubles after each failure.
+	static constexpr float OFFLINE_RETRY_MIN_DELAY = 30.0f;
+	static constexpr float OFFLINE_RETRY_MAX_DELAY = 600.0f;
+
+	// Last good responses to the requests a session needs (login, game data, start session), served when the
+	// server can't be reached so achievements keep working offline. The token is never written to the cache.
+	static constexpr const char* OFFLINE_RESPONSE_CACHE_DIRECTORY = "achievement_offline";
+	static constexpr const char* OFFLINE_TOKEN_PLACEHOLDER = "__offline_token__";
+
 	namespace
 	{
 		struct LoginWithPasswordParameters
@@ -111,6 +128,32 @@ namespace Achievements
 			std::string badge_path;
 			Common::Timer show_hide_time;
 			bool active;
+		};
+
+		enum class OfflineRequestType : u8
+		{
+			Unlock,
+			LeaderboardEntry,
+		};
+
+		struct OfflineRequest
+		{
+			OfflineRequestType type;
+			bool hardcore; // unlocks only
+			u32 id; // achievement or leaderboard
+			s32 score; // leaderboard entries only
+			s64 timestamp; // wall clock time of the unlock/submission
+			std::string username;
+			std::string game_hash;
+			u64 serial; // identifies the entry while a submission is in flight, not saved
+		};
+
+		enum class OfflineSubmitResult : u8
+		{
+			Delivered,
+			Rejected,
+			Unreachable,
+			Unauthorized,
 		};
 	} // namespace
 
@@ -144,6 +187,28 @@ namespace Achievements
 	static uint32_t ClientReadMemory(uint32_t address, uint8_t* buffer, uint32_t num_bytes, rc_client_t* client);
 	static void ClientServerCall(
 		const rc_api_request_t* request, rc_client_server_callback_t callback, void* callback_data, rc_client_t* client);
+
+	static bool IsServerUnreachable(s32 status_code);
+	static std::optional<std::string> GetRequestParameter(std::string_view post_data, std::string_view name);
+	static std::string GetOfflineResponseCacheKey(std::string_view method, std::string_view post_data);
+	static std::string GetOfflineResponseCachePath(std::string_view cache_key);
+	static void StoreOfflineResponse(std::string_view cache_key, std::string_view method, const HTTPDownloader::Request::Data& data);
+	static std::optional<std::string> LoadOfflineResponse(std::string_view cache_key, std::string_view method, std::string_view post_data);
+	static void ClearOfflineResponseCache();
+	static std::string GetOfflineQueuePath();
+	static void LoadOfflineQueue();
+	static bool SaveOfflineQueue();
+	static bool QueueOfflineRequest(std::string_view method, std::string_view post_data);
+	static std::string GetOfflineAwardAchievementResponse(rc_client_t* client, std::string_view post_data);
+	static std::string GetOfflineSubmitLeaderboardEntryResponse(std::string_view post_data);
+	static void OnServerUnreachable();
+	static void OnServerReachable();
+	static void UpdateOfflineQueue();
+	static void SubmitNextOfflineRequest();
+	static OfflineSubmitResult GetOfflineSubmitResult(
+		OfflineRequestType type, s32 status_code, const HTTPDownloader::Request::Data& data, std::string* error_message);
+	static void OnOfflineRequestSubmitted(u64 serial, u32 generation, OfflineSubmitResult result);
+	static void FinishOfflineQueueFlush(bool server_reachable);
 
 	static void ClientEventHandler(const rc_client_event_t* event, rc_client_t* client);
 	static void HandleResetEvent(const rc_client_event_t* event);
@@ -247,6 +312,17 @@ namespace Achievements
 	static std::vector<LeaderboardTrackerIndicator> s_active_leaderboard_trackers;
 	static std::vector<AchievementChallengeIndicator> s_active_challenge_indicators;
 	static std::optional<AchievementProgressIndicator> s_active_progress_indicator;
+
+	static std::string s_custom_host;
+	static std::vector<OfflineRequest> s_offline_queue;
+	static u64 s_next_offline_request_serial = 1;
+	static bool s_offline_queue_loaded = false;
+	static bool s_offline_mode_notified = false;
+	static bool s_offline_flush_in_progress = false;
+	static u32 s_offline_flush_generation = 0;
+	static u32 s_offline_flush_delivered = 0;
+	static float s_offline_retry_delay = 0.0f;
+	static Common::Timer s_offline_retry_timer;
 } // namespace Achievements
 
 
@@ -795,6 +871,13 @@ bool Achievements::Initialize()
 	if (!CreateClient(&s_client, &s_http_downloader, custom_host))
 		return false;
 
+	// Anything left over from an earlier offline session gets sent once we're logged in.
+	s_custom_host = custom_host;
+	LoadOfflineQueue();
+	s_offline_mode_notified = false;
+	s_offline_retry_delay = 0.0f;
+	s_offline_retry_timer.Reset();
+
 	// Hardcore starts off. We enable it on first boot.
 	s_hardcore_mode = false;
 
@@ -1032,6 +1115,10 @@ bool Achievements::Shutdown(bool allow_cancel)
 		s_login_request = nullptr;
 	}
 
+	// Submissions still in flight finish while the downloader drains, but don't start any more.
+	s_offline_flush_in_progress = false;
+	s_offline_flush_generation++;
+
 	s_hardcore_mode = false;
 	DestroyClient(&s_client, &s_http_downloader);
 	return true;
@@ -1084,8 +1171,52 @@ uint32_t Achievements::ClientReadMemory(uint32_t address, uint8_t* buffer, uint3
 void Achievements::ClientServerCall(
 	const rc_api_request_t* request, rc_client_server_callback_t callback, void* callback_data, rc_client_t* client)
 {
-	HTTPDownloader::Request::Callback hd_callback = [callback, callback_data](s32 status_code, const std::string& content_type, HTTPDownloader::Request::Data data)
+	// Unlocks and leaderboard entries that can't reach the server are queued on disk and resent once it's back,
+	// and the responses a session needs are cached so a game can still load its achievements while offline.
+	std::string post_data = request->post_data ? std::string(request->post_data) : std::string();
+	std::string method = GetRequestParameter(post_data, "r").value_or(std::string());
+	std::string cache_key = GetOfflineResponseCacheKey(method, post_data);
+
+	HTTPDownloader::Request::Callback hd_callback = [callback, callback_data, client, post_data = std::move(post_data),
+														method = std::move(method), cache_key = std::move(cache_key)](
+														s32 status_code, const std::string& content_type, HTTPDownloader::Request::Data data)
 	{
+		if (IsServerUnreachable(status_code))
+		{
+			std::optional<std::string> offline_body;
+			if ((method == "awardachievement" || method == "submitlbentry") && QueueOfflineRequest(method, post_data))
+			{
+				offline_body = (method == "awardachievement") ? GetOfflineAwardAchievementResponse(client, post_data) :
+				                                                GetOfflineSubmitLeaderboardEntryResponse(post_data);
+			}
+			else if (!cache_key.empty())
+			{
+				offline_body = LoadOfflineResponse(cache_key, method, post_data);
+				if (offline_body.has_value())
+					Console.Warning("Achievements: Server unreachable, using cached '%s' response.", method.c_str());
+			}
+
+			if (offline_body.has_value())
+			{
+				if (client == s_client)
+					OnServerUnreachable();
+
+				rc_api_server_response_t rr;
+				rr.http_status_code = HTTPDownloader::HTTP_STATUS_OK;
+				rr.body_length = offline_body->size();
+				rr.body = offline_body->c_str();
+				callback(&rr, callback_data);
+				return;
+			}
+		}
+		else
+		{
+			if (status_code == HTTPDownloader::HTTP_STATUS_OK && !cache_key.empty())
+				StoreOfflineResponse(cache_key, method, data);
+			if (client == s_client)
+				OnServerReachable();
+		}
+
 		const bool is_error = (status_code <= 0);
 		const bool is_retryable =
 			is_error && (status_code == HTTPDownloader::HTTP_STATUS_TIMEOUT);
@@ -1134,6 +1265,7 @@ void Achievements::IdleUpdate()
 
 	s_http_downloader->PollRequests();
 	rc_client_idle(s_client);
+	UpdateOfflineQueue();
 }
 
 void Achievements::FrameUpdate()
@@ -1159,6 +1291,7 @@ void Achievements::FrameUpdate()
 	else
 		rc_client_idle(s_client);
 
+	UpdateOfflineQueue();
 	UpdateRichPresence(lock);
 }
 
@@ -1689,11 +1822,15 @@ void Achievements::HandleLeaderboardScoreboardEvent(const rc_client_event_t* eve
 		};
 
 		std::string title = event->leaderboard->title;
-		std::string message = fmt::format(TRANSLATE_FS("Achievements", "{0}\nLeaderboard Position: {1} of {2}"),
-			fmt::format(fmt::runtime(Host::TranslateToStringView("Achievements",
-							value_strings[std::min<u8>(event->leaderboard->format, NUM_RC_CLIENT_LEADERBOARD_FORMATS - 1)])),
-				event->leaderboard_scoreboard->submitted_score, event->leaderboard_scoreboard->best_score),
-			event->leaderboard_scoreboard->new_rank, event->leaderboard_scoreboard->num_entries);
+		std::string score = fmt::format(fmt::runtime(Host::TranslateToStringView("Achievements",
+											value_strings[std::min<u8>(event->leaderboard->format, NUM_RC_CLIENT_LEADERBOARD_FORMATS - 1)])),
+			event->leaderboard_scoreboard->submitted_score, event->leaderboard_scoreboard->best_score);
+
+		// The server never ranks an entry 0, that's the placeholder scoreboard for an entry queued offline.
+		std::string message = (event->leaderboard_scoreboard->new_rank == 0) ?
+		                          fmt::format(TRANSLATE_FS("Achievements", "{0}\nSaved offline, it will be submitted once reconnected."), score) :
+		                          fmt::format(TRANSLATE_FS("Achievements", "{0}\nLeaderboard Position: {1} of {2}"), score,
+									  event->leaderboard_scoreboard->new_rank, event->leaderboard_scoreboard->num_entries);
 
 		PostAchievementNotification(fmt::format("leaderboard_{}", event->leaderboard->id),
 			EmuConfig.Achievements.LeaderboardsDuration, std::move(title), std::move(message), s_game_icon);
@@ -1831,6 +1968,631 @@ void Achievements::HandleServerReconnectedEvent(const rc_client_event_t* event)
 		TRANSLATE_STR("Achievements", "Achievements Reconnected"),
 		TRANSLATE_STR("Achievements", "All pending unlock requests have completed."),
 		s_game_icon);
+}
+
+bool Achievements::IsServerUnreachable(s32 status_code)
+{
+	// No response at all, or one from the gateway in front of a server that's down.
+	if (status_code <= 0)
+		return true;
+
+	switch (status_code)
+	{
+		case 502: // Bad Gateway
+		case 503: // Service Unavailable
+		case 504: // Gateway Timeout
+		case 521: // Web Server is Down
+		case 522: // Connection Timed Out
+		case 523: // Origin is Unreachable
+		case 524: // A Timeout Occurred
+		case 525: // SSL Handshake Failed
+			return true;
+
+		default:
+			return false;
+	}
+}
+
+std::optional<std::string> Achievements::GetRequestParameter(std::string_view post_data, std::string_view name)
+{
+	for (const std::string_view param : StringUtil::SplitString(post_data, '&'))
+	{
+		const std::string_view::size_type separator = param.find('=');
+		if (separator == std::string_view::npos || param.substr(0, separator) != name)
+			continue;
+
+		const std::string_view encoded = param.substr(separator + 1);
+		std::string value;
+		value.reserve(encoded.size());
+		for (size_t i = 0; i < encoded.size(); i++)
+		{
+			if (encoded[i] == '+')
+			{
+				value.push_back(' ');
+			}
+			else if (encoded[i] == '%' && (i + 2) < encoded.size())
+			{
+				const std::optional<u8> byte = StringUtil::FromChars<u8>(encoded.substr(i + 1, 2), 16);
+				if (byte.has_value())
+				{
+					value.push_back(static_cast<char>(byte.value()));
+					i += 2;
+				}
+				else
+				{
+					value.push_back('%');
+				}
+			}
+			else
+			{
+				value.push_back(encoded[i]);
+			}
+		}
+
+		return value;
+	}
+
+	return std::nullopt;
+}
+
+std::string Achievements::GetOfflineResponseCacheKey(std::string_view method, std::string_view post_data)
+{
+	// Only what's needed to start a session. A password login is never cached.
+	if (method == "login2")
+	{
+		if (!GetRequestParameter(post_data, "t").has_value() || GetRequestParameter(post_data, "p").has_value())
+			return {};
+	}
+	else if (method != "achievementsets" && method != "startsession")
+	{
+		return {};
+	}
+
+	// Leave out what doesn't change the response: the token, so a cached response outlives it being reissued,
+	// and startsession's hardcore flag and rcheevos version.
+	std::string key;
+	for (const std::string_view param : StringUtil::SplitString(post_data, '&'))
+	{
+		if (param.starts_with("t=") || param.starts_with("h=") || param.starts_with("l="))
+			continue;
+
+		if (!key.empty())
+			key.push_back('&');
+		key.append(param);
+	}
+
+	return key;
+}
+
+std::string Achievements::GetOfflineResponseCachePath(std::string_view cache_key)
+{
+	MD5Digest digest;
+	digest.Update(cache_key.data(), static_cast<u32>(cache_key.size()));
+	u8 hash[16];
+	digest.Final(hash);
+
+	return Path::Combine(Path::Combine(EmuFolders::Cache, OFFLINE_RESPONSE_CACHE_DIRECTORY),
+		fmt::format("{}.json", StringUtil::EncodeHex(hash, static_cast<int>(std::size(hash)))));
+}
+
+void Achievements::StoreOfflineResponse(std::string_view cache_key, std::string_view method, const HTTPDownloader::Request::Data& data)
+{
+	rapidjson::Document doc;
+	if (!Catalog::ParseJson(std::string_view(reinterpret_cast<const char*>(data.data()), data.size()), &doc) || !doc.IsObject())
+		return;
+
+	// Only keep responses the server accepted.
+	const auto success = doc.FindMember("Success");
+	if (success == doc.MemberEnd() || !success->value.IsBool() || !success->value.GetBool())
+		return;
+
+	if (method == "login2")
+	{
+		const auto token = doc.FindMember("Token");
+		if (token == doc.MemberEnd() || !token->value.IsString())
+			return;
+
+		token->value.SetString(rapidjson::StringRef(OFFLINE_TOKEN_PLACEHOLDER));
+	}
+
+	const std::string directory = Path::Combine(EmuFolders::Cache, OFFLINE_RESPONSE_CACHE_DIRECTORY);
+	if (!FileSystem::DirectoryExists(directory.c_str()) && !FileSystem::CreateDirectoryPath(directory.c_str(), false))
+		return;
+
+	Error error;
+	if (!Catalog::WriteJsonFileAtomic(GetOfflineResponseCachePath(cache_key), doc, &error))
+		Console.Warning("Achievements: Failed to cache '%.*s' response: %s", static_cast<int>(method.size()), method.data(),
+			error.GetDescription().c_str());
+}
+
+std::optional<std::string> Achievements::LoadOfflineResponse(std::string_view cache_key, std::string_view method, std::string_view post_data)
+{
+	std::optional<std::string> text = FileSystem::ReadFileToString(GetOfflineResponseCachePath(cache_key).c_str());
+	if (!text.has_value() || method != "login2")
+		return text;
+
+	// Put back the token the cache left out, it's the one this login was made with.
+	const std::optional<std::string> token = GetRequestParameter(post_data, "t");
+	rapidjson::Document doc;
+	if (!token.has_value() || !Catalog::ParseJson(text.value(), &doc) || !doc.IsObject())
+		return std::nullopt;
+
+	const auto token_member = doc.FindMember("Token");
+	if (token_member == doc.MemberEnd())
+		return std::nullopt;
+
+	token_member->value.SetString(token->c_str(), static_cast<rapidjson::SizeType>(token->size()), doc.GetAllocator());
+	return Catalog::JsonToString(doc);
+}
+
+void Achievements::ClearOfflineResponseCache()
+{
+	const std::string directory = Path::Combine(EmuFolders::Cache, OFFLINE_RESPONSE_CACHE_DIRECTORY);
+	if (FileSystem::DirectoryExists(directory.c_str()) && !FileSystem::RecursiveDeleteDirectory(directory.c_str()))
+		Console.Warning("Achievements: Failed to delete '%s'.", directory.c_str());
+}
+
+std::string Achievements::GetOfflineQueuePath()
+{
+	return Path::Combine(EmuFolders::DataRoot, OFFLINE_QUEUE_FILENAME);
+}
+
+void Achievements::LoadOfflineQueue()
+{
+	// The queue in memory stays authoritative for as long as we're running.
+	if (s_offline_queue_loaded)
+		return;
+
+	s_offline_queue_loaded = true;
+
+	const std::string path = GetOfflineQueuePath();
+	const std::optional<std::string> text = FileSystem::ReadFileToString(path.c_str());
+	if (!text.has_value())
+		return;
+
+	rapidjson::Document doc;
+	std::string parse_error;
+	if (!Catalog::ParseJson(text.value(), &doc, &parse_error) || !doc.IsObject())
+	{
+		Console.Error("Achievements: Failed to parse '%s': %s", path.c_str(), parse_error.c_str());
+		return;
+	}
+
+	const auto requests = doc.FindMember("requests");
+	if (requests == doc.MemberEnd() || !requests->value.IsArray())
+		return;
+
+	for (const rapidjson::Value& entry : requests->value.GetArray())
+	{
+		if (!entry.IsObject())
+			continue;
+
+		const auto type = entry.FindMember("type");
+		const auto user = entry.FindMember("user");
+		const auto id = entry.FindMember("id");
+		const auto timestamp = entry.FindMember("time");
+		if (type == entry.MemberEnd() || !type->value.IsString() || user == entry.MemberEnd() || !user->value.IsString() ||
+			id == entry.MemberEnd() || !id->value.IsUint() || timestamp == entry.MemberEnd() || !timestamp->value.IsInt64())
+		{
+			continue;
+		}
+
+		OfflineRequest request = {};
+		const std::string_view type_name = type->value.GetString();
+		if (type_name == "unlock")
+		{
+			request.type = OfflineRequestType::Unlock;
+			const auto hardcore = entry.FindMember("hardcore");
+			request.hardcore = (hardcore != entry.MemberEnd() && hardcore->value.IsBool() && hardcore->value.GetBool());
+		}
+		else if (type_name == "leaderboard")
+		{
+			const auto score = entry.FindMember("score");
+			if (score == entry.MemberEnd() || !score->value.IsInt())
+				continue;
+
+			request.type = OfflineRequestType::LeaderboardEntry;
+			request.score = score->value.GetInt();
+		}
+		else
+		{
+			continue;
+		}
+
+		request.id = id->value.GetUint();
+		request.timestamp = timestamp->value.GetInt64();
+		request.username = user->value.GetString();
+		const auto hash = entry.FindMember("hash");
+		if (hash != entry.MemberEnd() && hash->value.IsString())
+			request.game_hash = hash->value.GetString();
+		request.serial = s_next_offline_request_serial++;
+		s_offline_queue.push_back(std::move(request));
+	}
+
+	if (!s_offline_queue.empty())
+		Console.WriteLn("Achievements: %zu requests recorded while offline are waiting to be submitted.", s_offline_queue.size());
+}
+
+bool Achievements::SaveOfflineQueue()
+{
+	const std::string path = GetOfflineQueuePath();
+	if (s_offline_queue.empty())
+		return (!FileSystem::FileExists(path.c_str()) || FileSystem::DeleteFilePath(path.c_str()));
+
+	rapidjson::Document doc(rapidjson::kObjectType);
+	auto& alloc = doc.GetAllocator();
+	doc.AddMember("version", rapidjson::Value(OFFLINE_QUEUE_VERSION), alloc);
+
+	rapidjson::Value requests(rapidjson::kArrayType);
+	for (const OfflineRequest& request : s_offline_queue)
+	{
+		rapidjson::Value entry(rapidjson::kObjectType);
+		if (request.type == OfflineRequestType::Unlock)
+		{
+			entry.AddMember("type", "unlock", alloc);
+			entry.AddMember("hardcore", rapidjson::Value(request.hardcore), alloc);
+		}
+		else
+		{
+			entry.AddMember("type", "leaderboard", alloc);
+			entry.AddMember("score", rapidjson::Value(request.score), alloc);
+		}
+		entry.AddMember("id", rapidjson::Value(request.id), alloc);
+		entry.AddMember("time", rapidjson::Value(static_cast<int64_t>(request.timestamp)), alloc);
+		entry.AddMember("user", rapidjson::Value(request.username.c_str(), alloc), alloc);
+		entry.AddMember("hash", rapidjson::Value(request.game_hash.c_str(), alloc), alloc);
+		requests.PushBack(std::move(entry), alloc);
+	}
+	doc.AddMember("requests", std::move(requests), alloc);
+
+	Error error;
+	if (!Catalog::WriteJsonFileAtomic(path, doc, &error))
+	{
+		Console.Error("Achievements: Failed to save '%s': %s", path.c_str(), error.GetDescription().c_str());
+		return false;
+	}
+
+	return true;
+}
+
+bool Achievements::QueueOfflineRequest(std::string_view method, std::string_view post_data)
+{
+	LoadOfflineQueue();
+
+	const bool is_unlock = (method == "awardachievement");
+	const std::optional<std::string> username = GetRequestParameter(post_data, "u");
+	const std::optional<std::string> id_param = GetRequestParameter(post_data, is_unlock ? "a" : "i");
+	const std::optional<u32> id = id_param.has_value() ? StringUtil::FromChars<u32>(id_param.value()) : std::nullopt;
+	if (!username.has_value() || username->empty() || !id.has_value() || id.value() == 0)
+		return false;
+
+	OfflineRequest request = {};
+	request.type = is_unlock ? OfflineRequestType::Unlock : OfflineRequestType::LeaderboardEntry;
+	request.id = id.value();
+	request.username = username.value();
+	request.game_hash = GetRequestParameter(post_data, "m").value_or(std::string());
+
+	if (is_unlock)
+	{
+		request.hardcore = (GetRequestParameter(post_data, "h").value_or(std::string()) == "1");
+	}
+	else
+	{
+		const std::optional<std::string> score_param = GetRequestParameter(post_data, "s");
+		const std::optional<s32> score = score_param.has_value() ? StringUtil::FromChars<s32>(score_param.value()) : std::nullopt;
+		if (!score.has_value())
+			return false;
+		request.score = score.value();
+	}
+
+	// rc_client's own retries say how long ago it happened.
+	const std::optional<std::string> offset_param = GetRequestParameter(post_data, "o");
+	const u32 seconds_ago = offset_param.has_value() ? StringUtil::FromChars<u32>(offset_param.value()).value_or(0) : 0;
+	request.timestamp = static_cast<s64>(std::time(nullptr)) - seconds_ago;
+
+	if (is_unlock)
+	{
+		// A game reloaded offline doesn't know about unlocks still in the queue, and can award them again.
+		const auto existing = std::find_if(s_offline_queue.begin(), s_offline_queue.end(), [&request](const OfflineRequest& queued) {
+			return (queued.type == OfflineRequestType::Unlock && queued.id == request.id &&
+					StringUtil::compareNoCase(queued.username, request.username));
+		});
+		if (existing != s_offline_queue.end())
+		{
+			if (request.hardcore && !existing->hardcore)
+			{
+				// A new serial, so a softcore submission of the old entry still in flight can't remove it.
+				const OfflineRequest previous = *existing;
+				existing->hardcore = true;
+				existing->timestamp = request.timestamp;
+				existing->serial = s_next_offline_request_serial++;
+				if (!SaveOfflineQueue())
+				{
+					*existing = previous;
+					return false;
+				}
+			}
+
+			return true;
+		}
+	}
+
+	if (s_offline_queue.size() >= MAX_OFFLINE_QUEUE_SIZE)
+	{
+		Console.Error("Achievements: Offline queue is full, not queueing %s %u.", is_unlock ? "achievement" : "leaderboard entry", request.id);
+		return false;
+	}
+
+	// Only tell rc_client it went through once it's on disk, otherwise it would be lost when we exit.
+	const u32 request_id = request.id;
+	request.serial = s_next_offline_request_serial++;
+	s_offline_queue.push_back(std::move(request));
+	if (!SaveOfflineQueue())
+	{
+		s_offline_queue.pop_back();
+		return false;
+	}
+
+	Console.Warning("Achievements: Server unreachable, queued %s %u to submit later.", is_unlock ? "achievement" : "leaderboard entry", request_id);
+
+	// Check back for the connection soon, even if the last flush pushed the retry well out.
+	if (!s_offline_flush_in_progress)
+	{
+		s_offline_retry_delay = OFFLINE_RETRY_MIN_DELAY;
+		s_offline_retry_timer.Reset();
+	}
+
+	return true;
+}
+
+std::string Achievements::GetOfflineAwardAchievementResponse(rc_client_t* client, std::string_view post_data)
+{
+	// rc_client already added the points when it unlocked the achievement, so give it back its own totals.
+	// AchievementsRemaining is left out, which rc_client reads as unknown, so mastery waits for the server.
+	const rc_client_user_t* user = rc_client_get_user_info(client);
+	return fmt::format("{{\"Success\":true,\"Score\":{},\"SoftcoreScore\":{},\"AchievementID\":{}}}", user ? user->score : 0,
+		user ? user->score_softcore : 0, GetRequestParameter(post_data, "a").value_or("0"));
+}
+
+std::string Achievements::GetOfflineSubmitLeaderboardEntryResponse(std::string_view post_data)
+{
+	// Rank 0 marks the scoreboard as a placeholder, HandleLeaderboardScoreboardEvent() says it was saved offline.
+	const std::optional<std::string> score_param = GetRequestParameter(post_data, "s");
+	const s32 score = score_param.has_value() ? StringUtil::FromChars<s32>(score_param.value()).value_or(0) : 0;
+	return fmt::format("{{\"Success\":true,\"Response\":{{\"Score\":{0},\"BestScore\":{0},"
+					   "\"RankInfo\":{{\"Rank\":0,\"NumEntries\":\"0\"}},\"TopEntries\":[]}}}}",
+		score);
+}
+
+void Achievements::OnServerUnreachable()
+{
+	// Tell the player once each time the connection drops, rather than for every request.
+	if (s_offline_mode_notified || !(Host::HasNativeAchievementNotifications() || MTGS::IsOpen()))
+		return;
+
+	s_offline_mode_notified = true;
+	PostAchievementNotification("achievements_offline", Host::OSD_ERROR_DURATION,
+		TRANSLATE_STR("Achievements", "Achievements Offline"),
+		TRANSLATE_STR("Achievements", "RetroAchievements can't be reached. Unlocks and leaderboard entries will be saved and "
+									  "submitted once the connection is restored."),
+		s_game_icon);
+}
+
+void Achievements::OnServerReachable()
+{
+	s_offline_mode_notified = false;
+
+	// The connection is back, so send whatever is queued now instead of waiting for the next retry.
+	if (!s_offline_flush_in_progress)
+		s_offline_retry_delay = 0.0f;
+}
+
+void Achievements::UpdateOfflineQueue()
+{
+	if (s_offline_flush_in_progress || s_offline_queue.empty() || s_offline_retry_timer.GetTimeSeconds() < s_offline_retry_delay)
+		return;
+
+	// Requests are sent with the token of the user they were made by, so wait for the login.
+	const rc_client_user_t* user = rc_client_get_user_info(s_client);
+	if (!user || !user->token)
+		return;
+
+	// The first submission doubles as the connection check: the rest follow it only once it gets through.
+	s_offline_flush_in_progress = true;
+	s_offline_flush_delivered = 0;
+	SubmitNextOfflineRequest();
+}
+
+void Achievements::SubmitNextOfflineRequest()
+{
+	const rc_client_user_t* user = rc_client_get_user_info(s_client);
+	const auto it = user ? std::find_if(s_offline_queue.begin(), s_offline_queue.end(),
+							   [user](const OfflineRequest& request) { return StringUtil::compareNoCase(request.username, user->username); }) :
+	                       s_offline_queue.end();
+	if (it == s_offline_queue.end())
+	{
+		// Anything left belongs to someone else, and waits for them to log in.
+		FinishOfflineQueueFlush(true);
+		return;
+	}
+
+	const OfflineRequest& queued = *it;
+	const u64 serial = queued.serial;
+	const OfflineRequestType type = queued.type;
+	const u32 id = queued.id;
+	const u32 generation = s_offline_flush_generation;
+
+	// rcheevos leaves the offset out when it's zero, and this one is always late, so it's at least a second.
+	const s64 elapsed = static_cast<s64>(std::time(nullptr)) - queued.timestamp;
+	const u32 seconds_since = static_cast<u32>(std::clamp<s64>(elapsed, 1, std::numeric_limits<u32>::max()));
+
+	rc_api_host_t host = {};
+	host.host = s_custom_host.empty() ? nullptr : s_custom_host.c_str();
+
+	rc_api_request_t request;
+	int result;
+	if (type == OfflineRequestType::Unlock)
+	{
+		rc_api_award_achievement_request_t params = {};
+		params.username = user->username;
+		params.api_token = user->token;
+		params.achievement_id = id;
+		params.hardcore = queued.hardcore ? 1 : 0;
+		params.game_hash = queued.game_hash.empty() ? nullptr : queued.game_hash.c_str();
+		params.seconds_since_unlock = seconds_since;
+		result = rc_api_init_award_achievement_request_hosted(&request, &params, &host);
+	}
+	else
+	{
+		rc_api_submit_lboard_entry_request_t params = {};
+		params.username = user->username;
+		params.api_token = user->token;
+		params.leaderboard_id = id;
+		params.score = queued.score;
+		params.game_hash = queued.game_hash.empty() ? nullptr : queued.game_hash.c_str();
+		params.seconds_since_completion = seconds_since;
+		result = rc_api_init_submit_lboard_entry_request_hosted(&request, &params, &host);
+	}
+
+	if (result != RC_OK)
+	{
+		Console.Error("Achievements: Failed to build offline request for %s %u: %s",
+			(type == OfflineRequestType::Unlock) ? "achievement" : "leaderboard", id, rc_error_str(result));
+		rc_api_destroy_request(&request);
+		OnOfflineRequestSubmitted(serial, generation, OfflineSubmitResult::Rejected);
+		return;
+	}
+
+	Console.WriteLn("Achievements: Submitting %s %u recorded offline %u seconds ago...",
+		(type == OfflineRequestType::Unlock) ? "achievement" : "leaderboard entry", id, seconds_since);
+
+	s_http_downloader->CreatePostRequest(request.url, request.post_data,
+		[serial, generation, type, id](s32 status_code, const std::string& content_type, HTTPDownloader::Request::Data data) {
+			std::string error_message;
+			const OfflineSubmitResult result = GetOfflineSubmitResult(type, status_code, data, &error_message);
+			if (result == OfflineSubmitResult::Rejected)
+			{
+				Console.Error("Achievements: Server rejected %s %u recorded offline, dropping it: %s",
+					(type == OfflineRequestType::Unlock) ? "achievement" : "leaderboard entry", id, error_message.c_str());
+			}
+
+			OnOfflineRequestSubmitted(serial, generation, result);
+		});
+
+	rc_api_destroy_request(&request);
+}
+
+Achievements::OfflineSubmitResult Achievements::GetOfflineSubmitResult(
+	OfflineRequestType type, s32 status_code, const HTTPDownloader::Request::Data& data, std::string* error_message)
+{
+	if (IsServerUnreachable(status_code) || status_code == 429)
+		return OfflineSubmitResult::Unreachable;
+
+	rc_api_server_response_t rr;
+	rr.http_status_code = status_code;
+	rr.body_length = data.size();
+	rr.body = reinterpret_cast<const char*>(data.data());
+
+	int result;
+	bool succeeded;
+	if (type == OfflineRequestType::Unlock)
+	{
+		rc_api_award_achievement_response_t response;
+		result = rc_api_process_award_achievement_server_response(&response, &rr);
+		succeeded = response.response.succeeded;
+		if (response.response.error_message)
+			*error_message = response.response.error_message;
+		rc_api_destroy_award_achievement_response(&response);
+	}
+	else
+	{
+		rc_api_submit_lboard_entry_response_t response;
+		result = rc_api_process_submit_lboard_entry_server_response(&response, &rr);
+		succeeded = response.response.succeeded;
+		if (response.response.error_message)
+			*error_message = response.response.error_message;
+		rc_api_destroy_submit_lboard_entry_response(&response);
+	}
+
+	if (result == RC_OK && succeeded)
+		return OfflineSubmitResult::Delivered;
+
+	if (status_code == 401 || status_code == 403 || result == RC_INVALID_CREDENTIALS || result == RC_EXPIRED_TOKEN ||
+		result == RC_ACCESS_DENIED)
+	{
+		return OfflineSubmitResult::Unauthorized;
+	}
+
+	// Only an error from RetroAchievements itself drops the entry. Anything else, such as a captive portal's page,
+	// leaves it queued for later.
+	const bool server_answered = (result == RC_OK && !error_message->empty());
+	return (server_answered && status_code < 500) ? OfflineSubmitResult::Rejected : OfflineSubmitResult::Unreachable;
+}
+
+void Achievements::OnOfflineRequestSubmitted(u64 serial, u32 generation, OfflineSubmitResult result)
+{
+	if (result == OfflineSubmitResult::Delivered || result == OfflineSubmitResult::Rejected)
+	{
+		const auto it = std::find_if(s_offline_queue.begin(), s_offline_queue.end(),
+			[serial](const OfflineRequest& request) { return request.serial == serial; });
+		if (it != s_offline_queue.end())
+		{
+			s_offline_queue.erase(it);
+			SaveOfflineQueue();
+		}
+	}
+
+	// Shutting down, keep whatever got through but don't send anything else.
+	if (generation != s_offline_flush_generation || !s_offline_flush_in_progress)
+		return;
+
+	switch (result)
+	{
+		case OfflineSubmitResult::Delivered:
+			s_offline_flush_delivered++;
+			SubmitNextOfflineRequest();
+			break;
+
+		case OfflineSubmitResult::Rejected:
+			SubmitNextOfflineRequest();
+			break;
+
+		case OfflineSubmitResult::Unreachable:
+			FinishOfflineQueueFlush(false);
+			break;
+
+		case OfflineSubmitResult::Unauthorized:
+			// The token doesn't work any more. Keep everything for once the user logs in again.
+			Console.Error("Achievements: Login was rejected, keeping offline requests until the next login.");
+			FinishOfflineQueueFlush(false);
+			s_offline_retry_delay = OFFLINE_RETRY_MAX_DELAY;
+			break;
+	}
+}
+
+void Achievements::FinishOfflineQueueFlush(bool server_reachable)
+{
+	s_offline_flush_in_progress = false;
+	s_offline_retry_timer.Reset();
+	s_offline_retry_delay = server_reachable ? OFFLINE_RETRY_MAX_DELAY :
+	                                           std::clamp(s_offline_retry_delay * 2.0f, OFFLINE_RETRY_MIN_DELAY, OFFLINE_RETRY_MAX_DELAY);
+	if (!server_reachable)
+		Console.Warning("Achievements: Server still unreachable, retrying offline requests in %.0f seconds.", s_offline_retry_delay);
+
+	if (s_offline_flush_delivered == 0)
+		return;
+
+	Console.WriteLn(Color_StrongGreen, "Achievements: Submitted %u requests recorded while offline.", s_offline_flush_delivered);
+	if (Host::HasNativeAchievementNotifications() || MTGS::IsOpen())
+	{
+		PostAchievementNotification("achievements_offline_submitted", Host::OSD_INFO_DURATION,
+			TRANSLATE_STR("Achievements", "Achievements Reconnected"),
+			TRANSLATE_PLURAL_STR("Achievements", "%n unlocks and leaderboard entries recorded offline have been submitted.",
+				"Offline queue popup", s_offline_flush_delivered),
+			s_game_icon);
+	}
+
+	s_offline_flush_delivered = 0;
 }
 
 
@@ -2304,6 +3066,9 @@ void Achievements::Logout()
 	SettingsInterface* secretsInterface = Host::Internal::GetSecretsSettingsLayer();
 	secretsInterface->DeleteValue("Achievements", "Token");
 	secretsInterface->Save();
+
+	// Queued unlocks stay, they're sent the next time this user logs in. The cached session data goes.
+	ClearOfflineResponseCache();
 }
 
 
