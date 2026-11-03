@@ -61,6 +61,8 @@ data class AchievementsSettings(
     val encoreMode: Boolean = false,
     val spectatorMode: Boolean = false,
     val unofficialTestMode: Boolean = false,
+    /** Achievements/OfflineQueue: keep unlocks made without a connection and send them later. */
+    val offlineQueue: Boolean = true,
     val notificationsDuration: Int = 5,
     val leaderboardsDuration: Int = 10,
     /** The positions are the core's enum values: OsdOverlayPos (TopLeft = 1) for notifications,
@@ -1043,6 +1045,7 @@ data class Settings(
         put("Achievements", "EncoreMode", "bool", emuCore.achievements.encoreMode.toString())
         put("Achievements", "SpectatorMode", "bool", emuCore.achievements.spectatorMode.toString())
         put("Achievements", "UnofficialTestMode", "bool", emuCore.achievements.unofficialTestMode.toString())
+        put("Achievements", "OfflineQueue", "bool", emuCore.achievements.offlineQueue.toString())
         put("Achievements", "NotificationsDuration", "int", emuCore.achievements.notificationsDuration.coerceIn(3, 30).toString())
         put("Achievements", "LeaderboardsDuration", "int", emuCore.achievements.leaderboardsDuration.coerceIn(3, 30).toString())
         put("Achievements", "NotificationPosition", "int", emuCore.achievements.notificationPosition.toString())
@@ -1320,6 +1323,7 @@ data class Settings(
                 encoreMode = boolAt("Achievements/EncoreMode") ?: this.emuCore.achievements.encoreMode,
                 spectatorMode = boolAt("Achievements/SpectatorMode") ?: this.emuCore.achievements.spectatorMode,
                 unofficialTestMode = boolAt("Achievements/UnofficialTestMode") ?: this.emuCore.achievements.unofficialTestMode,
+                offlineQueue = boolAt("Achievements/OfflineQueue") ?: this.emuCore.achievements.offlineQueue,
                 notificationsDuration = intAt("Achievements/NotificationsDuration") ?: this.emuCore.achievements.notificationsDuration,
                 leaderboardsDuration = intAt("Achievements/LeaderboardsDuration") ?: this.emuCore.achievements.leaderboardsDuration,
                 notificationPosition = intAt("Achievements/NotificationPosition") ?: this.emuCore.achievements.notificationPosition,
@@ -2026,6 +2030,7 @@ data class Settings(
         put("achievementsEncoreMode", emuCore.achievements.encoreMode)
         put("achievementsSpectatorMode", emuCore.achievements.spectatorMode)
         put("achievementsUnofficialTestMode", emuCore.achievements.unofficialTestMode)
+        put("achievementsOfflineQueue", emuCore.achievements.offlineQueue)
         put("achievementsNotificationsDuration", emuCore.achievements.notificationsDuration)
         put("achievementsLeaderboardsDuration", emuCore.achievements.leaderboardsDuration)
         put("achievementsNotificationPosition", emuCore.achievements.notificationPosition)
@@ -2241,7 +2246,7 @@ data class Settings(
 
         /** Every RetroAchievements field, by JSON key: what the RetroAchievements screen clears to
          *  put one game back on the global settings. */
-        val ACHIEVEMENTS_KEYS: List<String> = listOf("achievementsEnabled", "achievementsHardcore", "achievementsNotifications", "achievementsLeaderboardNotifications", "achievementsOverlays", "achievementsLbOverlays", "achievementsSoundEffects", "achievementsEncoreMode", "achievementsSpectatorMode", "achievementsUnofficialTestMode", "achievementsNotificationsDuration", "achievementsLeaderboardsDuration", "achievementsNotificationPosition", "achievementsOverlayPosition", "achievementsNotificationScale")
+        val ACHIEVEMENTS_KEYS: List<String> = listOf("achievementsEnabled", "achievementsHardcore", "achievementsNotifications", "achievementsLeaderboardNotifications", "achievementsOverlays", "achievementsLbOverlays", "achievementsSoundEffects", "achievementsEncoreMode", "achievementsSpectatorMode", "achievementsUnofficialTestMode", "achievementsOfflineQueue", "achievementsNotificationsDuration", "achievementsLeaderboardsDuration", "achievementsNotificationPosition", "achievementsOverlayPosition", "achievementsNotificationScale")
 
         /** One per-game INI export at a time. The native side streams it through a single
          *  begin/put/commit state, and a game launch stages one on the launch thread while the UI
@@ -2371,6 +2376,7 @@ data class Settings(
                     encoreMode = json.optBoolean("achievementsEncoreMode", def.emuCore.achievements.encoreMode),
                     spectatorMode = json.optBoolean("achievementsSpectatorMode", def.emuCore.achievements.spectatorMode),
                     unofficialTestMode = json.optBoolean("achievementsUnofficialTestMode", def.emuCore.achievements.unofficialTestMode),
+                    offlineQueue = json.optBoolean("achievementsOfflineQueue", def.emuCore.achievements.offlineQueue),
                     notificationsDuration = json.optInt("achievementsNotificationsDuration", def.emuCore.achievements.notificationsDuration),
                     leaderboardsDuration = json.optInt("achievementsLeaderboardsDuration", def.emuCore.achievements.leaderboardsDuration),
                     notificationPosition = json.optInt("achievementsNotificationPosition", def.emuCore.achievements.notificationPosition),
@@ -2666,6 +2672,7 @@ data class Settings(
             if (current.emuCore.achievements.encoreMode != base.emuCore.achievements.encoreMode) j.put("achievementsEncoreMode", current.emuCore.achievements.encoreMode)
             if (current.emuCore.achievements.spectatorMode != base.emuCore.achievements.spectatorMode) j.put("achievementsSpectatorMode", current.emuCore.achievements.spectatorMode)
             if (current.emuCore.achievements.unofficialTestMode != base.emuCore.achievements.unofficialTestMode) j.put("achievementsUnofficialTestMode", current.emuCore.achievements.unofficialTestMode)
+            if (current.emuCore.achievements.offlineQueue != base.emuCore.achievements.offlineQueue) j.put("achievementsOfflineQueue", current.emuCore.achievements.offlineQueue)
             if (current.emuCore.achievements.notificationsDuration != base.emuCore.achievements.notificationsDuration) j.put("achievementsNotificationsDuration", current.emuCore.achievements.notificationsDuration)
             if (current.emuCore.achievements.leaderboardsDuration != base.emuCore.achievements.leaderboardsDuration) j.put("achievementsLeaderboardsDuration", current.emuCore.achievements.leaderboardsDuration)
             if (current.emuCore.achievements.notificationPosition != base.emuCore.achievements.notificationPosition) j.put("achievementsNotificationPosition", current.emuCore.achievements.notificationPosition)
@@ -2938,6 +2945,7 @@ data class Settings(
                 encoreMode = if (overrides.has("achievementsEncoreMode")) overrides.getBoolean("achievementsEncoreMode") else base.emuCore.achievements.encoreMode,
                 spectatorMode = if (overrides.has("achievementsSpectatorMode")) overrides.getBoolean("achievementsSpectatorMode") else base.emuCore.achievements.spectatorMode,
                 unofficialTestMode = if (overrides.has("achievementsUnofficialTestMode")) overrides.getBoolean("achievementsUnofficialTestMode") else base.emuCore.achievements.unofficialTestMode,
+                offlineQueue = if (overrides.has("achievementsOfflineQueue")) overrides.getBoolean("achievementsOfflineQueue") else base.emuCore.achievements.offlineQueue,
                 notificationsDuration = if (overrides.has("achievementsNotificationsDuration")) overrides.getInt("achievementsNotificationsDuration") else base.emuCore.achievements.notificationsDuration,
                 leaderboardsDuration = if (overrides.has("achievementsLeaderboardsDuration")) overrides.getInt("achievementsLeaderboardsDuration") else base.emuCore.achievements.leaderboardsDuration,
                 notificationPosition = if (overrides.has("achievementsNotificationPosition")) overrides.getInt("achievementsNotificationPosition") else base.emuCore.achievements.notificationPosition,

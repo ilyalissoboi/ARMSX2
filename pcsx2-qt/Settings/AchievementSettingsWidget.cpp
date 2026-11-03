@@ -44,6 +44,7 @@ AchievementSettingsWidget::AchievementSettingsWidget(SettingsWindow* settings_di
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.encoreMode, "Achievements", "EncoreMode", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.spectatorMode, "Achievements", "SpectatorMode", false);
 	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.unofficialAchievements, "Achievements", "UnofficialTestMode", false);
+	SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.offlineQueue, "Achievements", "OfflineQueue", true);
 	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.achievementNotificationsDuration, "Achievements", "NotificationsDuration", Pcsx2Config::AchievementsOptions::DEFAULT_NOTIFICATION_DURATION);
 	SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.leaderboardNotificationsDuration, "Achievements", "LeaderboardsDuration", Pcsx2Config::AchievementsOptions::DEFAULT_LEADERBOARD_DURATION);
 
@@ -72,6 +73,7 @@ AchievementSettingsWidget::AchievementSettingsWidget(SettingsWindow* settings_di
 	dialog()->registerWidgetHelp(m_ui.encoreMode, tr("Enable Encore Mode"), tr("Unchecked"), tr("When enabled, each session will behave as if no achievements have been unlocked."));
 	dialog()->registerWidgetHelp(m_ui.spectatorMode, tr("Enable Spectator Mode"), tr("Unchecked"), tr("When enabled, ARMSX2 will assume all achievements are locked and not send any unlock notifications to the server."));
 	dialog()->registerWidgetHelp(m_ui.unofficialAchievements, tr("Test Unofficial Achievements"), tr("Unchecked"), tr("When enabled, ARMSX2 will list achievements from unofficial sets. Please note that these achievements are not tracked by RetroAchievements, so they unlock every time."));
+	dialog()->registerWidgetHelp(m_ui.offlineQueue, tr("Save Unlocks While Offline"), tr("Checked"), tr("When RetroAchievements can't be reached, unlocks and leaderboard entries are saved and submitted once the connection is restored, and games you've played online before can still load their achievements. Anything already saved is still submitted if this is turned off."));
 
 	connect(m_ui.enable, &QCheckBox::checkStateChanged, this, &AchievementSettingsWidget::updateEnableState);
 	connect(m_ui.hardcoreMode, &QCheckBox::checkStateChanged, this, &AchievementSettingsWidget::updateEnableState);
@@ -171,6 +173,7 @@ void AchievementSettingsWidget::updateEnableState()
 	m_ui.encoreMode->setEnabled(enabled);
 	m_ui.spectatorMode->setEnabled(enabled);
 	m_ui.unofficialAchievements->setEnabled(enabled);
+	m_ui.offlineQueue->setEnabled(enabled);
 }
 
 void AchievementSettingsWidget::onHardcoreModeStateChanged()

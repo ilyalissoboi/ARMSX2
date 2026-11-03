@@ -14,6 +14,7 @@ struct RetroAchievementsSettingsView: View {
     @State private var notificationsEnabled = true
     @State private var leaderboardNotificationsEnabled = true
     @State private var overlaysEnabled = true
+    @State private var offlineQueueEnabled = true
     @State private var username = ""
     @State private var password = ""
     @State private var showingLogin = false
@@ -41,6 +42,7 @@ struct RetroAchievementsSettingsView: View {
                 "settings.achievements.notifications",
                 "settings.achievements.leaderboards",
                 "settings.achievements.overlays",
+                "settings.achievements.offline-queue",
             ]
         } else {
             ids.append("settings.achievements.unavailable")
@@ -193,6 +195,16 @@ struct RetroAchievementsSettingsView: View {
                         }
                     ))
                     .controllerAccessibilityTargetID("settings.achievements.overlays")
+
+                    Toggle(settings.localized("Save Unlocks While Offline"), isOn: Binding(
+                        get: { offlineQueueEnabled },
+                        set: { newValue in
+                            offlineQueueEnabled = newValue
+                            ARMSX2Bridge.setRetroAchievementsOfflineQueue(newValue)
+                            refreshSoon()
+                        }
+                    ))
+                    .controllerAccessibilityTargetID("settings.achievements.offline-queue")
                 } header: {
                     Text(settings.localized("Modes"))
                 } footer: {
@@ -346,6 +358,7 @@ struct RetroAchievementsSettingsView: View {
         notificationsEnabled = bool("notifications", fallback: true)
         leaderboardNotificationsEnabled = bool("leaderboardNotifications", fallback: true)
         overlaysEnabled = bool("overlays", fallback: true)
+        offlineQueueEnabled = bool("offlineQueue", fallback: true)
     }
 
     private func refreshSoon() {

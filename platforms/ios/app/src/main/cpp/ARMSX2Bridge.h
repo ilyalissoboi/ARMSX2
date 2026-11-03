@@ -360,6 +360,7 @@ typedef void (^ARMSX2RetroAchievementsCompletion)(BOOL success, NSString * _Nonn
 + (void)setRetroAchievementsNotifications:(BOOL)enabled;
 + (void)setRetroAchievementsLeaderboards:(BOOL)enabled;
 + (void)setRetroAchievementsOverlays:(BOOL)enabled;
++ (void)setRetroAchievementsOfflineQueue:(BOOL)enabled;
 + (void)loginRetroAchievementsWithUsername:(nonnull NSString *)username password:(nonnull NSString *)password completion:(nullable ARMSX2RetroAchievementsCompletion)completion NS_SWIFT_NAME(loginRetroAchievements(username:password:completion:));
 + (void)logoutRetroAchievements;
 

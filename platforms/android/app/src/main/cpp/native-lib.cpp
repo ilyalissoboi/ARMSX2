@@ -777,6 +777,7 @@ Java_kr_co_iefriends_pcsx2_NativeApp_setAchievementsOption(JNIEnv *env, jclass c
     else if (key == "encoreMode") ini_key = "EncoreMode";
     else if (key == "spectatorMode") ini_key = "SpectatorMode";
     else if (key == "unofficialTestMode") ini_key = "UnofficialTestMode";
+    else if (key == "offlineQueue") ini_key = "OfflineQueue";
     if (!ini_key)
         return;
 

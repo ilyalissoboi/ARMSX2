@@ -1173,18 +1173,20 @@ void Achievements::ClientServerCall(
 {
 	// Unlocks and leaderboard entries that can't reach the server are queued on disk and resent once it's back,
 	// and the responses a session needs are cached so a game can still load its achievements while offline.
+	// With the option off, nothing new is queued or cached, but anything already queued is still sent.
+	const bool offline_queue = EmuConfig.Achievements.OfflineQueue;
 	std::string post_data = request->post_data ? std::string(request->post_data) : std::string();
 	std::string method = GetRequestParameter(post_data, "r").value_or(std::string());
-	std::string cache_key = GetOfflineResponseCacheKey(method, post_data);
+	std::string cache_key = offline_queue ? GetOfflineResponseCacheKey(method, post_data) : std::string();
 
-	HTTPDownloader::Request::Callback hd_callback = [callback, callback_data, client, post_data = std::move(post_data),
+	HTTPDownloader::Request::Callback hd_callback = [callback, callback_data, client, offline_queue, post_data = std::move(post_data),
 														method = std::move(method), cache_key = std::move(cache_key)](
 														s32 status_code, const std::string& content_type, HTTPDownloader::Request::Data data)
 	{
 		if (IsServerUnreachable(status_code))
 		{
 			std::optional<std::string> offline_body;
-			if ((method == "awardachievement" || method == "submitlbentry") && QueueOfflineRequest(method, post_data))
+			if (offline_queue && (method == "awardachievement" || method == "submitlbentry") && QueueOfflineRequest(method, post_data))
 			{
 				offline_body = (method == "awardachievement") ? GetOfflineAwardAchievementResponse(client, post_data) :
 				                                                GetOfflineSubmitLeaderboardEntryResponse(post_data);

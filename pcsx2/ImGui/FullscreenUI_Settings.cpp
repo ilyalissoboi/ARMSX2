@@ -5081,6 +5081,9 @@ void FullscreenUI::DrawAchievementsSettingsPage()
 		FSUI_CSTR(
 			"When enabled, ARMSX2 will list achievements from unofficial sets. These achievements are not tracked by RetroAchievements, so they unlock every time."),
 		"Achievements", "UnofficialTestMode", false, enabled);
+	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_WIFI, "Save Unlocks While Offline"),
+		FSUI_CSTR("When RetroAchievements can't be reached, unlocks and leaderboard entries are saved and submitted once the connection is restored."),
+		"Achievements", "OfflineQueue", true, enabled);
 
 	// Check for challenge mode just being enabled.
 	if (check_challenge_state && enabled && bsi->GetBoolValue("Achievements", "ChallengeMode", false) && VMManager::HasValidVM())

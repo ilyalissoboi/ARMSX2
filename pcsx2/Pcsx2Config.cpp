@@ -2139,6 +2139,7 @@ Pcsx2Config::AchievementsOptions::AchievementsOptions()
 	LBSubmitSound = true;
 	Overlays = true;
 	LBOverlays = true;
+	OfflineQueue = true;
 }
 
 void Pcsx2Config::ArcadeOptions::LoadSave(SettingsWrapper& wrap)
@@ -2177,6 +2178,7 @@ void Pcsx2Config::AchievementsOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapBitBool(LBSubmitSound);
 	SettingsWrapBitBool(Overlays);
 	SettingsWrapBitBool(LBOverlays);
+	SettingsWrapBitBool(OfflineQueue);
 	SettingsWrapEntry(NotificationsDuration);
 	SettingsWrapEntry(LeaderboardsDuration);
 	SettingsWrapEntry(NotificationScale);
