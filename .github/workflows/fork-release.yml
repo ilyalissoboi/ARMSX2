@@ -60,8 +60,11 @@ on:
 permissions:
   contents: read
 
+# Real releases share one group, so two of them can't take the same versionCode: the second
+# waits until the first has uploaded its APKs, then counts it (draft or not). GitHub keeps
+# only one waiting run per group, so push a third tag after the second has started.
 concurrency:
-  group: fork-release-${{ github.event_name == 'pull_request' && github.ref || inputs.version || github.ref_name }}
+  group: fork-release-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -121,23 +124,33 @@ jobs:
           esac
 
       # A versionCode at or below the installed one makes Android refuse the update, and
-      # nothing about the APK itself shows that. Read the last fork release's from its APK.
+      # nothing about the APK itself shows that. Read it from the newest other fork release
+      # that has a legacy APK, drafts included, so a release still waiting to be published
+      # keeps its versionCode. The notes' "previous release" is the newest published one.
       - name: Work out the versionCode
         id: vc
         env:
           VN: ${{ steps.version.outputs.vn }}
         run: |
-          PREV="$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases -L 100 \
-            --json tagName --jq '.[].tagName | select(test("-fork[.][0-9]+$"))' | grep -vxF "$VN" | head -1 || true)"
-          [ -n "$PREV" ] || { echo "::error::no earlier fork release to take the versionCode from"; exit 1; }
-          gh release download "$PREV" -R "$GITHUB_REPOSITORY" -p '*-sdk26.apk' -O last.apk
+          LIST="$(gh release list -R "$GITHUB_REPOSITORY" --exclude-pre-releases -L 100 --json tagName,isDraft \
+            --jq '.[] | select(.tagName | test("-fork[.][0-9]+$")) | "\(.tagName) \(.isDraft)"' | grep -v "^$VN " || true)"
+          PREV="$(awk '$2 == "false" { print $1; exit }' <<<"$LIST")"
+          [ -n "$PREV" ] || { echo "::error::no earlier published fork release"; exit 1; }
+          FROM=""
+          for tag in $(awk '{ print $1 }' <<<"$LIST"); do
+            if gh release download "$tag" -R "$GITHUB_REPOSITORY" -p '*-sdk26.apk' -O last.apk --clobber 2>/dev/null; then
+              FROM="$tag"; break
+            fi
+          done
+          [ -n "$FROM" ] || { echo "::error::no earlier fork release has a legacy APK to take the versionCode from"; exit 1; }
           AAPT="$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -1)"
           LAST_VC="$("$AAPT" dump badging last.apk | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)"
-          [[ "$LAST_VC" =~ ^[0-9]+$ ]] || { echo "::error::could not read the versionCode of $PREV"; exit 1; }
-          echo "$PREV has versionCode $LAST_VC"
+          [[ "$LAST_VC" =~ ^[0-9]+$ ]] || { echo "::error::could not read the versionCode of $FROM"; exit 1; }
+          echo "$FROM has versionCode $LAST_VC"
+          PREV_VC_TAG="$FROM"
           VC="${INPUT_VC:-$((LAST_VC + 1))}"
           [[ "$VC" =~ ^[0-9]+$ ]] || { echo "::error::version_code '$VC' is not a number"; exit 1; }
-          [ "$VC" -gt "$LAST_VC" ] || { echo "::error::version_code $VC must be higher than $PREV's $LAST_VC"; exit 1; }
+          [ "$VC" -gt "$LAST_VC" ] || { echo "::error::version_code $VC must be higher than $PREV_VC_TAG's $LAST_VC"; exit 1; }
           echo "Using versionCode $VC"
           echo "vc=$VC" >> "$GITHUB_OUTPUT"
           echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
